@@ -258,6 +258,22 @@ site:
   # Translates navbar labels, widget text, tooltips, and accessibility labels.
   lang: en
 
+# Quarto Passthrough
+# ------------------
+# Arbitrary `_quarto.yml` content, deep-merged into the generated config just
+# before Quarto renders, so it wins over everything great-docs writes. Mappings
+# merge key by key; lists and scalars replace; a `null` value removes the key.
+# A `_quarto.user.yml` file next to great-docs.yml, if present, merges last.
+# For example:
+#   quarto:
+#     format:
+#       html:
+#         theme:
+#           light: [flatly, custom.scss]
+#           dark: [darkly, custom.scss]
+#         mainfont: "Source Sans Pro"
+quarto: {}
+
 # Page Metadata
 # -------------
 # Show page timestamps in footer

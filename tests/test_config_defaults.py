@@ -55,6 +55,7 @@ FROZEN_DEFAULT_CONFIG: dict[str, Any] = {
         "html-math-method": "katex",
         "lang": "en",
     },
+    "quarto": {},
     "show_dates": False,
     "date_format": "%B %d, %Y",
     "show_author": True,

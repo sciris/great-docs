@@ -114,6 +114,37 @@ def write_quarto_yml(path: Path, config: dict) -> None:
         write_yaml(config, f)
 
 
+def merge_quarto_overrides(config: dict, overrides: dict) -> dict:
+    """
+    Deep merge user overrides into a Quarto configuration
+
+    Mappings present on both sides merge key by key; any other value (a list,
+    a scalar) replaces the original; a `None` value removes the key. Neither
+    argument is mutated.
+
+    Parameters
+    ----------
+    config
+        The generated Quarto configuration.
+    overrides
+        The user's settings, which take precedence.
+
+    Returns
+    -------
+    dict
+        The merged configuration.
+    """
+    result = dict(config)
+    for key, value in overrides.items():
+        if value is None:
+            result.pop(key, None)
+        elif isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = merge_quarto_overrides(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
 GITIGNORE_CONTENT = """# Great Docs build directory
 # This directory is ephemeral and regenerated on each build
 # Do not commit this directory to version control

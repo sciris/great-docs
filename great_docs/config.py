@@ -1049,6 +1049,17 @@ class Config:
         return site
 
     @property
+    def quarto(self) -> ConfigDict:
+        """Get the raw `_quarto.yml` overrides, merged in last before render."""
+        quarto = self["quarto"]
+        if not isinstance(quarto, dict):
+            raise ValueError(
+                f"`quarto` in great-docs.yml must be a mapping of `_quarto.yml` "
+                f"settings, not {type(quarto).__name__}"
+            )
+        return cast("ConfigDict", quarto)
+
+    @property
     def show_dates(self) -> bool:
         """Whether to show page metadata timestamps in the footer."""
         return bool(self["show_dates"])

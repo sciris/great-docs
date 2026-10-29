@@ -524,6 +524,54 @@ include_in_header:
 Your entries are merged with Great Docs' own head injections (Font Awesome, theme scripts, etc.) so
 everything cooperates automatically.
 
+## Raw Quarto Settings {#quarto-passthrough}
+
+Great Docs generates `_quarto.yml` for you, so you never edit it by hand. When you need a Quarto
+setting that Great Docs has no option for, or want to reproduce the look of an existing Quarto
+site, put it under a top-level `quarto` key. Its contents are merged into the generated
+`_quarto.yml` just before Quarto renders, so they take precedence over everything Great Docs
+writes:
+
+```{.yaml filename="docs/great-docs.yml"}
+quarto:
+  format:
+    html:
+      theme:
+        light: [flatly, assets/custom.scss]
+        dark: [darkly, assets/custom.scss]
+      mainfont: "Source Sans Pro"
+  website:
+    page-footer: null
+```
+
+The merge follows three rules:
+
+- mappings merge key by key, so `format.html.mainfont` leaves every other `format.html` key alone
+- lists and plain values replace what Great Docs generated
+- `null` removes the key altogether (above, it drops the generated page footer)
+
+Files you reference, such as `custom.scss`, are resolved from the build directory, so keep them in
+the `assets/` directory, which Great Docs copies in on every build.
+
+For larger customizations, you can keep the settings in a separate `_quarto.user.yml` file next to
+`great-docs.yml`. It uses the same format as `_quarto.yml`, Great Docs never modifies it, and it is
+merged last, after the `quarto` key:
+
+```{.yaml filename="docs/_quarto.user.yml"}
+format:
+  html:
+    toc-depth: 3
+    code-line-numbers: true
+```
+
+::: {.callout-warning}
+Replacing a list replaces Great Docs' own entries too. For example, setting `format.html.theme`
+drops `great-docs.scss`, the stylesheet behind most of Great Docs' styling, and setting
+`format.html.include-in-header` drops the scripts Great Docs injects. For everyday settings, prefer
+`site` (which merges into `format.html` before Great Docs adds its own entries), `include_in_header`,
+and the other dedicated options on this page.
+:::
+
 ## Logo
 
 Great Docs can display a logo in the navbar instead of the plain-text package name. Logos are

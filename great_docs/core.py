@@ -22,6 +22,7 @@ from ._typer_cli import is_cli_command, is_cli_group, param_kind, to_click_comma
 from ._utils import (
     GITIGNORE_CONTENT,
     is_great_docs_build_dir,
+    merge_quarto_overrides,
     recognised_build_dirs,
     record_site_ownership,
     validate_build_dir,
@@ -11352,6 +11353,44 @@ anchor-sections: true
         config = {"project": {"type": "website"}, "format": {"html": {"theme": "flatly"}}}
         self._write_quarto_yml(self.build_dir / "_quarto.yml", config)
 
+    def _apply_quarto_overrides(self) -> list[str]:
+        """
+        Merge the user's raw Quarto settings into the generated `_quarto.yml`
+
+        The `quarto` block of great-docs.yml merges first, then a
+        `_quarto.user.yml` file beside great-docs.yml, if present. This runs
+        after every other step has written the file, so the user's settings
+        win. The merge rules are those of `merge_quarto_overrides`.
+
+        Returns
+        -------
+        list[str]
+            The sources that were applied, for the build log.
+        """
+        layers: list[tuple[str, dict]] = []
+        if self._config.quarto:
+            layers.append(("great-docs.yml `quarto`", self._config.quarto))
+
+        user_yml = self.layout.config_path.parent / "_quarto.user.yml"
+        if user_yml.is_file():
+            with open(user_yml, "r", encoding="utf-8") as f:
+                overlay = read_yaml(f)
+            if overlay is not None and not isinstance(overlay, dict):
+                raise ValueError(f"{user_yml.name} must contain a mapping of `_quarto.yml` settings")
+            if overlay:
+                layers.append((user_yml.name, overlay))
+
+        if not layers:
+            return []
+
+        quarto_yml = self.build_dir / "_quarto.yml"
+        with open(quarto_yml, "r", encoding="utf-8") as f:
+            config = read_yaml(f) or {}
+        for _, overrides in layers:
+            config = merge_quarto_overrides(config, overrides)
+        write_quarto_yml(quarto_yml, config)
+        return [name for name, _ in layers]
+
     def _translate_navbar_labels(self, config: dict) -> None:
         """
         Translate known navbar text labels using the configured language.
@@ -16141,6 +16180,11 @@ anchor-sections: true
                     log.step_done("Freeze cache will be restored during render")
             else:
                 log.step_skip(step, "no frozen pages")
+
+            # Apply the user's raw Quarto settings last, so they win
+            applied = self._apply_quarto_overrides()
+            if applied:
+                log.detail("Applied Quarto overrides from " + " and ".join(applied))
 
             # Expand source-code: mock cells before Quarto sees them
             from great_docs._mock_code import process_directory as _expand_mock_cells
