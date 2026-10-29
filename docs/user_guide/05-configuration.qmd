@@ -322,6 +322,19 @@ the build.
 Your own site publishes `objects.inv` at its root, so other projects can point a source at
 your documentation in the same way.
 
+### Aliases for Your Own Package
+
+`interlinks.aliases` lists the module names your prose uses for your own package. With
+`aliases: [sc]` for Sciris, `` `sc.findinds()` `` and `` [](`sc.findinds`) `` both resolve as
+`sciris.findinds`:
+
+```yaml
+interlinks:
+  aliases: [sc]
+```
+
+If a source lists the same alias, yours wins.
+
 ### Parentheses on Function Links
 
 A function or method link displays a trailing `()`, so `[](`decode`)` renders as `decode()`. Class

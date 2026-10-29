@@ -65,7 +65,10 @@ def test_quarto_block_merges_into_generated_config(tmp_path):
     assert docs._apply_quarto_overrides() == ["great-docs.yml `quarto`"]
     result = _read(docs)
     assert result["format"]["html"] == {
-        "theme": {"light": ["flatly", "custom.scss"], "dark": ["darkly", "custom.scss"]},
+        "theme": {
+            "light": ["flatly", "great-docs.scss", "custom.scss"],
+            "dark": ["darkly", "great-docs.scss", "custom.scss"],
+        },
         "toc-depth": 2,
         "mainfont": "Source Sans Pro",
     }
@@ -104,3 +107,170 @@ def test_user_overlay_file_must_be_mapping(tmp_path):
     (tmp_path / "_quarto.user.yml").write_text("- a\n- b\n", encoding="utf-8")
     with pytest.raises(ValueError, match="must contain a mapping"):
         docs._apply_quarto_overrides()
+
+
+def test_quarto_theme_override_keeps_great_docs_scss(tmp_path):
+    docs = _make_docs(
+        tmp_path,
+        "quarto:\n  format:\n    html:\n      theme:\n        light: [cosmo, a.scss]\n        dark: cosmo\n",
+    )
+    docs._apply_quarto_overrides()
+    assert _read(docs)["format"]["html"]["theme"] == {
+        "light": ["cosmo", "great-docs.scss", "a.scss"],
+        "dark": ["cosmo", "great-docs.scss"],
+    }
+
+
+@pytest.mark.parametrize(
+    "theme, position, expected",
+    [
+        ("flatly", None, ["flatly", "great-docs.scss"]),
+        (["flatly", "a.scss"], None, ["flatly", "a.scss", "great-docs.scss"]),
+        (["flatly", "a.scss"], 1, ["flatly", "great-docs.scss", "a.scss"]),
+        (["flatly", "great-docs.scss"], 1, ["flatly", "great-docs.scss"]),
+        ({"light": "flatly", "dark": ["darkly"]}, None, {"light": ["flatly", "great-docs.scss"], "dark": ["darkly", "great-docs.scss"]}),
+    ],
+)
+def test_with_great_docs_scss(theme, position, expected):
+    from great_docs._utils import with_great_docs_scss
+
+    assert with_great_docs_scss(theme, position) == expected
+
+
+# --- quartodoc ---------------------------------------------------------------
+
+QUARTODOC_YML = (
+    "quartodoc:\n"
+    "  style: pkgdown\n"
+    "  sections:\n"
+    "    - title: Greetings\n"
+    "      desc: Ways to say hello\n"
+    "      contents:\n"
+    "        - hello\n"
+)
+
+
+def _make_quartodoc_docs(tmp_path: Path, gd_yml: str = QUARTODOC_YML) -> GreatDocs:
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        '"""Demo."""\n\n__all__ = ["hello"]\n\n\ndef hello(name: str) -> str:\n'
+        '    """Say hello.\n\n    Parameters\n    ----------\n'
+        '    name\n        Who to greet.\n    """\n    return name\n',
+        encoding="utf-8",
+    )
+    docs = _make_docs(tmp_path, gd_yml)
+    config = {
+        "project": {"type": "website"},
+        "website": {"navbar": {"left": []}, "sidebar": []},
+        "format": {"html": {"theme": "flatly"}},
+        "api-reference": {"package": "mypkg", "dir": "reference", "sections": []},
+    }
+    write_quarto_yml(docs.build_dir / "_quarto.yml", config)
+    return docs
+
+
+def test_add_quartodoc_config(tmp_path):
+    docs = _make_quartodoc_docs(tmp_path, QUARTODOC_YML + "  dir: api\n")
+    docs._add_quartodoc_config()
+
+    assert docs._uses_quartodoc
+    qd = _read(docs)["quartodoc"]
+    assert qd["package"] == "mypkg"
+    assert qd["dir"] == "api"
+    assert qd["sidebar"] == {"file": "_quartodoc-sidebar.yml", "id": "reference"}
+    assert qd["sections"][0]["title"] == "Greetings"
+
+
+def test_build_quartodoc(tmp_path, monkeypatch):
+    pytest.importorskip("quartodoc")
+    docs = _make_quartodoc_docs(tmp_path, QUARTODOC_YML + "  dir: api\n")
+    config = _read(docs)
+    config["website"]["navbar"]["left"] = [{"text": "Reference", "href": "reference/index.qmd"}]
+    config["website"]["sidebar"] = [{"id": "reference", "contents": ["reference/index.qmd"]}]
+    write_quarto_yml(docs.build_dir / "_quarto.yml", config)
+    docs._add_quartodoc_config()
+    monkeypatch.chdir(docs.build_dir)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    claims = docs._build_quartodoc()
+
+    assert "Say hello." in (docs.build_dir / "api" / "hello.qmd").read_text()
+    result = _read(docs)
+    assert result["website"]["navbar"]["left"] == [{"text": "Reference", "href": "api/index.qmd"}]
+    assert result["website"]["sidebar"] == [
+        {
+            "id": "reference",
+            "contents": ["api/index.qmd", {"section": "Greetings", "contents": ["api/hello.qmd"]}],
+        }
+    ]
+
+    # Interlinks and llms.txt use quartodoc's pages
+    from great_docs._interlinks.sphinx_inventory import decode
+
+    inventory = decode((docs.build_dir / "objects.inv").read_bytes())
+    assert any(e.name == "mypkg.hello" for e in inventory.entries)
+    assert ("hello", "mypkg.hello") in claims.claimed
+    assert docs._api_page_url("hello", "hello") == docs._quartodoc_uris["mypkg.hello"]
+    assert docs._api_page_url("hello.missing", "x") is None
+    assert docs._api_page_url("nothing", "x") is None
+
+
+def test_build_quartodoc_claims_reexported_names(tmp_path, monkeypatch):
+    """`mypkg.greet.Greeter` is also `mypkg.Greeter`, so a `pkg.` alias reaches it."""
+    pytest.importorskip("quartodoc")
+    docs = _make_quartodoc_docs(
+        tmp_path, "quartodoc:\n  sections:\n    - title: All\n      contents:\n        - greet\n"
+    )
+    pkg = tmp_path / "mypkg"
+    (pkg / "__init__.py").write_text(
+        '"""Demo."""\n\nfrom .greet import Greeter\n\n__all__ = ["Greeter"]\n', encoding="utf-8"
+    )
+    (pkg / "greet.py").write_text(
+        '"""Greetings."""\n\n\nclass Greeter:\n    """Greets."""\n\n'
+        '    def wave(self):\n        """Wave."""\n\n\ndef _private():\n    """No."""\n',
+        encoding="utf-8",
+    )
+    config = _read(docs)
+    config["website"]["sidebar"] = [{"id": "reference", "contents": ["reference/index.qmd"]}]
+    write_quarto_yml(docs.build_dir / "_quarto.yml", config)
+    docs._add_quartodoc_config()
+    monkeypatch.chdir(docs.build_dir)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    claims = docs._build_quartodoc()
+
+    assert ("mypkg.Greeter", "mypkg.greet.Greeter") in claims.claimed
+    assert ("mypkg.Greeter.wave", "mypkg.greet.Greeter.wave") in claims.claimed
+    assert ("Greeter.wave", "mypkg.greet.Greeter.wave") in claims.claimed
+
+
+def test_llms_txt_lists_only_what_quartodoc_documents(tmp_path):
+    docs = _make_quartodoc_docs(tmp_path)
+    config = _read(docs)
+    config["api-reference"]["sections"] = [
+        {"title": "Documented", "contents": ["hello"]},
+        {"title": "Left out", "contents": ["other"]},
+    ]
+    write_quarto_yml(docs.build_dir / "_quarto.yml", config)
+    docs._uses_quartodoc = True
+    docs._quartodoc_uris = {"mypkg.hello": "reference/hello.html#mypkg.hello"}
+    docs._get_package_metadata = lambda: {}
+    docs._get_docstring_summary = lambda package, name: ""
+    docs._generate_llms_txt()
+
+    llms = (docs.build_dir / "llms.txt").read_text()
+    assert "- [hello](reference/hello.html#mypkg.hello)" in llms
+    assert "other" not in llms
+    assert "Left out" not in llms
+
+
+@pytest.mark.parametrize("styles, flag", [("all", "true"), ("widgets", "false")])
+def test_styles_sets_the_content_styles_flag(tmp_path, styles, flag):
+    docs = _make_docs(tmp_path, f"styles: {styles}\n")
+    docs._prepare_build_directory()
+    scss = (docs.build_dir / "great-docs.scss").read_text()
+    assert f"$gd-content-styles: {flag} !default;" in scss
+
+
+def test_styles_must_be_all_or_widgets(tmp_path):
+    with pytest.raises(ValueError, match="must be"):
+        _ = _make_docs(tmp_path, "styles: none\n")._config.styles

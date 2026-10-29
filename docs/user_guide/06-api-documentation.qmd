@@ -728,6 +728,45 @@ Quarto rendering) but differ in where configuration lives and how much you need 
 5. **Build and preview.** Run `great-docs build` followed by `great-docs preview`. Your reference
    pages should render with the same content, now with Great Docs' enhanced styling and features.
 
+### Keeping quartodoc for the API Reference
+
+If you'd rather keep your quartodoc reference pages exactly as they are, Great Docs can run
+quartodoc for you instead of generating the reference itself. Install a quartodoc distribution,
+such as the maintained [quartopydoc](https://github.com/sciris/quartopydoc) fork:
+
+```bash
+pip install great-docs[quartodoc]
+```
+
+Then copy the `quartodoc:` block from your `_quarto.yml` into `great-docs.yml` unchanged:
+
+```{.yaml filename="docs/great-docs.yml"}
+quartodoc:
+  package: my_package
+  style: pkgdown
+  dir: api
+  sections:
+    - title: Core
+      desc: Primary interface
+      contents:
+        - MyClass
+        - helper_function
+```
+
+On each build, quartodoc writes the reference pages in place of Great Docs, and its sidebar
+(grouped by your sections) becomes the reference sidebar, with no `metadata-files` entry needed.
+Everything else about the API stays Great Docs': it still discovers your API (honoring `reference`
+and the other settings on this page) for `llms.txt`, `llms-full.txt`, and the agent skill, and
+cross-references across the site resolve to quartodoc's pages too. `llms.txt` links to quartodoc's
+pages, listing only the objects quartodoc documents.
+`package` defaults to your detected package and `dir` to `reference`; the navbar's Reference link
+follows `dir`. Any other quartodoc option works as it does in quartodoc, including `sidebar`
+options such as `collapse-level`.
+
+To also carry over your site's appearance, see [Raw Quarto Settings](theming.qmd#quarto-passthrough).
+If your docs write names with a module alias, such as `sc.findinds()` for `import sciris as sc`,
+set `interlinks.aliases` (see [Cross-Referencing](cross-referencing.qmd)) so they link too.
+
 ## Next Steps
 
 Great Docs handles the tedious parts of API documentation (discovery, classification, layout,

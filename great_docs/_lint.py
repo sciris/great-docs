@@ -237,6 +237,7 @@ def run_lint(
             create_inventory(importable_name, "", documented),
             AliasClaims.make(documented),
             sources.read,
+            aliases=docs._config.interlinks_aliases,
         )
         _check_cross_references(
             pkg, importable_name, exports, documented, index, sources.unread, result

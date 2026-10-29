@@ -64,6 +64,7 @@ def build_project_index(
         local,
         claims,
         sources.read,
+        aliases=config.interlinks_aliases,
         add_function_parentheses=config.interlinks_add_function_parentheses,
     )
     write_index(index, project_path / "_inv" / "index.lua")

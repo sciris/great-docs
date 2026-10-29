@@ -145,6 +145,39 @@ def merge_quarto_overrides(config: dict, overrides: dict) -> dict:
     return result
 
 
+GREAT_DOCS_SCSS = "great-docs.scss"
+
+
+def with_great_docs_scss(theme: str | list | dict, position: int | None = None) -> str | list | dict:
+    """
+    Add great-docs' stylesheet to a Quarto `theme` value
+
+    Handles each form `theme` takes: a theme name, a list of themes and SCSS
+    files, or a mapping of such values by mode (`light`, `dark`). A value that
+    already includes the stylesheet is returned unchanged.
+
+    Parameters
+    ----------
+    theme
+        The `format.html.theme` value.
+    position
+        Where to insert the stylesheet in each list; `None` appends it, so it
+        overrides the rest, while `1` puts it right after the base theme, so
+        the user's own SCSS files override it.
+
+    Returns
+    -------
+    str | list | dict
+        The theme value with the stylesheet added.
+    """
+    if isinstance(theme, dict):
+        return {mode: with_great_docs_scss(value, position) for mode, value in theme.items()}
+    themes = [theme] if isinstance(theme, str) else list(theme)
+    if GREAT_DOCS_SCSS not in themes:
+        themes.insert(len(themes) if position is None else position, GREAT_DOCS_SCSS)
+    return themes
+
+
 GITIGNORE_CONTENT = """# Great Docs build directory
 # This directory is ephemeral and regenerated on each build
 # Do not commit this directory to version control

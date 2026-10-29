@@ -933,6 +933,20 @@ class Config:
         return True
 
     @property
+    def quartodoc(self) -> ConfigDict:
+        """Get the quartodoc settings that replace great-docs' own API reference.
+
+        Empty unless the user asked for quartodoc to build the API reference.
+        """
+        quartodoc = self["quartodoc"]
+        if not isinstance(quartodoc, dict):
+            raise ValueError(
+                f"`quartodoc` in great-docs.yml must be a mapping of quartodoc settings, "
+                f"not {type(quartodoc).__name__}"
+            )
+        return cast("ConfigDict", quartodoc)
+
+    @property
     def reference(self) -> list[ConfigDict]:
         """Get the API reference configuration (explicit section ordering).
 
@@ -1060,6 +1074,14 @@ class Config:
         return cast("ConfigDict", quarto)
 
     @property
+    def styles(self) -> str:
+        """What great-docs styles: "all" of the page, or only its "widgets" and layout."""
+        styles = self["styles"]
+        if styles not in ("all", "widgets"):
+            raise ValueError(f'`styles` in great-docs.yml must be "all" or "widgets", not {styles!r}')
+        return styles
+
+    @property
     def show_dates(self) -> bool:
         """Whether to show page metadata timestamps in the footer."""
         return bool(self["show_dates"])
@@ -1116,6 +1138,12 @@ class Config:
     def interlinks_sources(self) -> ConfigDict:
         """Get the external documentation projects to link to."""
         return cast("ConfigDict", self["interlinks.sources"])
+
+    @property
+    def interlinks_aliases(self) -> list[str]:
+        """Get the module aliases prose uses for this project's own package, such as `sc`."""
+        aliases = self["interlinks.aliases"]
+        return [aliases] if isinstance(aliases, str) else list(aliases or [])
 
     @property
     def interlinks_add_function_parentheses(self) -> bool:

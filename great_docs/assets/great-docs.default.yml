@@ -58,6 +58,9 @@ parser: numpy
 #       aliases: [np]
 interlinks:
   sources: {} # Projects to link to; none by default
+  # Module aliases your prose uses for this project's own package, so that
+  # `sc.findinds()` links like `sciris.findinds()` (for `import sciris as sc`).
+  aliases: []
   # A link to a function or method shows a trailing "()", as `decode()` rather
   # than `decode`. Links to classes never show one.
   add_function_parentheses: true
@@ -274,6 +277,17 @@ site:
 #         mainfont: "Source Sans Pro"
 quarto: {}
 
+# Styles
+# ------
+# What Great Docs styles. Its widgets (navbar buttons, copy buttons, badges and
+# the like) and page layout are always styled; page content (heading and code
+# fonts, link and table styles) is optional.
+# : all - (default) the whole page
+# : widgets - only the widgets and layout, leaving page content to the Quarto
+#   theme and any SCSS you add to it (for example, to keep the look of an
+#   existing Quarto site)
+styles: all
+
 # Page Metadata
 # -------------
 # Show page timestamps in footer
@@ -408,6 +422,25 @@ csl: null
 #       - helper_func
 #       - another_func
 reference: []
+
+# quartodoc API Reference
+# -----------------------
+# Generate the API reference with quartodoc (e.g. the quartopydoc fork,
+# `pip install great-docs[quartodoc]`) instead of great-docs' own renderer.
+# Takes the same settings as the `quartodoc:` block of a Quarto project's
+# `_quarto.yml`, so an existing block can be copied over unchanged. `package`
+# defaults to the detected package and `dir` to "reference". When set, the
+# `reference` option above is ignored.
+#
+# quartodoc:
+#   style: pkgdown
+#   parser: google
+#   sections:
+#     - title: Utilities
+#       desc: Helper functions
+#       contents:
+#         - mymodule
+quartodoc: {}
 
 # Inline Methods
 # --------------
