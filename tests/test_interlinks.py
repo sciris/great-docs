@@ -568,6 +568,16 @@ def test_the_index_resolves_a_name_written_with_a_source_alias():
     assert index.resolves("np.missing") is False
 
 
+def test_the_index_resolves_a_name_written_with_a_local_alias():
+    """`import demo as dm` prose writes `dm.Thing`, which wins over a source's `dm`."""
+    source = Source(name="numpy", url="https://numpy.org/", aliases=("dm",))
+    index = build_index(LOCAL, AliasClaims(), [(source, DEMO)], aliases=("dm",))
+
+    assert index.prefixes["dm"] == ("demo",)
+    assert index.resolves("dm.Thing") is True
+    assert index.resolves("dm.ndarray") is False
+
+
 def test_the_index_resolves_nothing_for_an_ambiguous_name():
     """The filter refuses it, so a caller asking must be told the same."""
     index = build_index(LOCAL, AliasClaims(claimed=(("T", "demo.Thing"), ("T", "demo.go"))), [])

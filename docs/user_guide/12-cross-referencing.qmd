@@ -60,6 +60,14 @@ See [](`numpy.ndarray`) for the array type, or [](`np.ndarray`) using the alias.
 Code autolinks stay inside your own project. A bare `` `array` `` in your prose is left alone
 rather than linked into another project's documentation.
 
+Your own package can have an alias too. If your users write `import sciris as sc`, list `sc` under
+`interlinks.aliases`, and `` `sc.findinds()` `` in your prose links to `sciris.findinds()`:
+
+```yaml
+interlinks:
+  aliases: [sc]
+```
+
 See [Configuration](05-configuration.qmd) for the full set of fields a source accepts.
 
 ## When a Short Name Is Ambiguous

@@ -52,6 +52,9 @@ svg = [
 mcp = [
     "mcp>=1.0.0",
 ]
+quartodoc = [
+    "quartopydoc>=0.13.0",
+]
 marimo = [
     "marimo>=0.20.0",
     # marimo's `export html-wasm` (iframe mode) shells out to uv to resolve the

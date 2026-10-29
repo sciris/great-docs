@@ -222,6 +222,7 @@ def build_index(
     claims: AliasClaims,
     external: Sequence[tuple[Source, Inventory]],
     *,
+    aliases: Sequence[str] = (),
     add_function_parentheses: bool = True,
 ) -> Index:
     """
@@ -240,6 +241,9 @@ def build_index(
         The short names this project's documented objects claim.
     external :
         Each source and the inventory read for it.
+    aliases :
+        Module aliases prose uses for this project's own package. They win
+        over a source's alias of the same spelling.
     add_function_parentheses :
         Whether a link to a function or method shows a trailing `()`.
 
@@ -282,6 +286,8 @@ def build_index(
         roots = root_modules(inv)
         for alias in source.aliases:
             prefixes[alias] = roots
+    for alias in aliases:
+        prefixes[alias] = root_modules(local)
 
     ordered = {
         name: tuple(entry for _, entry in sorted(items, key=lambda pair: pair[0]))

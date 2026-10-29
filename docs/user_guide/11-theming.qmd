@@ -565,12 +565,20 @@ format:
 ```
 
 ::: {.callout-warning}
-Replacing a list replaces Great Docs' own entries too. For example, setting `format.html.theme`
-drops `great-docs.scss`, the stylesheet behind most of Great Docs' styling, and setting
+Replacing a list replaces Great Docs' own entries too. For example, setting
 `format.html.include-in-header` drops the scripts Great Docs injects. For everyday settings, prefer
-`site` (which merges into `format.html` before Great Docs adds its own entries), `include_in_header`,
-and the other dedicated options on this page.
+`site`, `include_in_header`, and the other dedicated options on this page. The one exception is
+`format.html.theme`: Great Docs puts its own stylesheet, `great-docs.scss`, back in right after the
+base theme, since its widgets need it, so your SCSS files still take precedence.
 :::
+
+To keep the look of an existing site's pages entirely, also set `styles: widgets`. Great Docs then
+styles only its own widgets and the page layout, leaving page content (heading and code fonts,
+link and table styles) to your Quarto theme and SCSS:
+
+```{.yaml filename="docs/great-docs.yml"}
+styles: widgets
+```
 
 ## Logo
 

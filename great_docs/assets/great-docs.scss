@@ -5,8 +5,19 @@
 // - https://getbootstrap.com/docs/5.3/utilities/text
 
 /*-- scss:defaults --*/
-$h2-font-size: 1.5rem;
-$h3-font-size: 1.3rem;
+// Whether great-docs styles page content as well as its own widgets and the
+// page layout: heading and code fonts, link and table styles and the like.
+// `styles: widgets` in great-docs.yml sets it to false, leaving page content
+// to the Quarto theme and the user's SCSS.
+$gd-content-styles: true !default;
+
+// Declared without a value, so the user's SCSS or else Bootstrap sets them
+$h2-font-size: null !default;
+$h3-font-size: null !default;
+@if $gd-content-styles {
+   $h2-font-size: 1.5rem !global;
+   $h3-font-size: 1.3rem !global;
+}
 
 /*-- scss:mixins --*/
 $headings-font-weight: 300 !default;
@@ -45,8 +56,10 @@ $member-groups: "section:is(.doc-attributes, .doc-classes, .doc-type-aliases, .d
 $ref-page: "body:is(.doc-reference, .doc-api-page)";
 $ref-index-links: 'a.sidebar-item-text:is([href$="/index.html"], [href$="/"])';
 
-a {
-   text-decoration: none;
+@if $gd-content-styles {
+   a {
+      text-decoration: none;
+   }
 }
 
 a.gdls-link {
@@ -98,28 +111,30 @@ span.gd-linkback-text {
    display: none;
 }
 
-// Set headings boldness back to the bootstrap default.
-// quarto changes it for h1, h2, h3!
-h1, .h2, h2, .h2, h3, .h3 {
-   @extend .fw-medium;
-}
-
-// Title headings get extra weight
-h1.title {
-   font-weight: 600 !important;
-}
-
-// Title headings get a larger font size on desktop
-@media (min-width: 992px) {
-   h1.title, .title.h1 {
-      font-size: 2.3rem;
+@if $gd-content-styles {
+   // Set headings boldness back to the bootstrap default.
+   // quarto changes it for h1, h2, h3!
+   h1, .h2, h2, .h2, h3, .h3 {
+      @extend .fw-medium;
    }
-}
 
-// Remove h2 underline (Quarto/Bootstrap adds border-bottom to h2 elements)
-h2, .h2 {
-   border-bottom: none;
-   padding-bottom: 0;
+   // Title headings get extra weight
+   h1.title {
+      font-weight: 600 !important;
+   }
+
+   // Title headings get a larger font size on desktop
+   @media (min-width: 992px) {
+      h1.title, .title.h1 {
+         font-size: 2.3rem;
+      }
+   }
+
+   // Remove h2 underline (Quarto/Bootstrap adds border-bottom to h2 elements)
+   h2, .h2 {
+      border-bottom: none;
+      padding-bottom: 0;
+   }
 }
 
 // Changelog version headings: add a Lucide-style tag glyph and code-like type.
@@ -149,8 +164,10 @@ body.gd-changelog-page .gd-otp-panel-link {
     font-family: $font-family-monospace;
 }
 
-h5, .h5 {
-   @extend .mt-3;
+@if $gd-content-styles {
+   h5, .h5 {
+      @extend .mt-3;
+   }
 }
 
 header p {
@@ -165,8 +182,10 @@ header p {
    }
 }
 
-table:not(.gt_table) {
-   @extend .table-bordered;
+@if $gd-content-styles {
+   table:not(.gt_table) {
+      @extend .table-bordered;
+   }
 }
 
 // Summary tables used in reference pages (Methods, Attributes sections)
@@ -925,14 +944,16 @@ html:not(.theme-loaded) body {
     opacity: 0.25;
 }
 
-.table a {
-    text-underline-offset: 4px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-    color: inherit;
-    font-weight: bold;
-    font-size: 0.875em;
-    word-break: initial;
-    text-decoration-thickness: 2px;
+@if $gd-content-styles {
+    .table a {
+        text-underline-offset: 4px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        color: inherit;
+        font-weight: bold;
+        font-size: 0.875em;
+        word-break: initial;
+        text-decoration-thickness: 2px;
+    }
 }
 
 /* Callable name in a `plain` signature, such as `add_node` in `Graph.add_node`. */
@@ -1003,16 +1024,12 @@ body {
     background-color: var(--gd-bg-primary, #FCFEFF);
 }
 
-p a {
-    color: black;
-    text-decoration: underline;
-    text-underline-offset: 4px;
-}
-
-li a {
-    color: black;
-    text-decoration: underline;
-    text-underline-offset: 4px;
+@if $gd-content-styles {
+    p a, li a {
+        color: black;
+        text-decoration: underline;
+        text-underline-offset: 4px;
+    }
 }
 
 /* ==========================================================================
@@ -1336,10 +1353,12 @@ dd > ol > li::marker {
     text-indent: 0;
 }
 
-code {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-    font-size: 0.875em;
-    color: rgb(18, 18, 18);
+@if $gd-content-styles {
+    code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 0.875em;
+        color: rgb(18, 18, 18);
+    }
 }
 
 .blockquote {
@@ -1348,8 +1367,10 @@ code {
     border-left-color: #4682B4;
 }
 
-p,h1,h2,h3,#toc-title,#toc-function-reference,.nav-link,.table {
-    font-family: "Open Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+@if $gd-content-styles {
+    p,h1,h2,h3,#toc-title,#toc-function-reference,.nav-link,.table {
+        font-family: "Open Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
 }
 
 /* Great Tables (gt) ship their own font as a self-contained component. The

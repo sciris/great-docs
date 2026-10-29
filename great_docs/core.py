@@ -28,6 +28,7 @@ from ._utils import (
     validate_build_dir,
     validate_layout_outputs,
     validate_tree_symlinks,
+    with_great_docs_scss,
     write_quarto_yml,
 )
 from ._website import i18n, markdown_pages, page_dates, page_metadata, page_url, social_cards
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
 
     from ._apiref.api_reference import APIReference
     from ._apiref.inventory import InventoryItem
+    from ._interlinks import AliasClaims
 
 # Injected into marimo `--mode edit` WASM exports (iframe mode). Those load inert
 # — cells are stale and the kernel isn't instantiated, so nothing renders and
@@ -103,6 +105,20 @@ class QuartoVersionError(RuntimeError):
 # The bundled extensions set the stage at which their filters run, which
 # Quarto's extension schema accepts from this release
 MIN_QUARTO_VERSION = (1, 9, 18)
+
+
+def _replace_values(node: Any, old: str, new: str) -> None:
+    """Replace every string value `old` in a nested config with `new`, in place."""
+    items = node.items() if isinstance(node, dict) else enumerate(node) if isinstance(node, list) else ()
+    for key, value in list(items):
+        if value == old:
+            node[key] = new
+        else:
+            _replace_values(value, old, new)
+
+
+# The file quartodoc writes the API reference sidebar to, unless configured
+QUARTODOC_SIDEBAR = "_quartodoc-sidebar.yml"
 
 
 def _quarto_version() -> tuple[int, ...] | None:
@@ -307,6 +323,12 @@ class GreatDocs:
 
         # Whether API reference was successfully configured (set during build)
         self._has_api_reference = True
+
+        # Whether quartodoc, not great-docs, builds the API reference (set during build)
+        self._uses_quartodoc = False
+
+        # The page of each object quartodoc documented, by full name (set during build)
+        self._quartodoc_uris: dict[str, str] = {}
 
         # Whether MCP pages were actually generated (None = not yet determined)
         self._mcp_pages_generated: bool | None = None
@@ -514,8 +536,10 @@ class GreatDocs:
                 print(f"Warning: CSS file not found: {css_path}")
 
         # Copy SCSS theme file (contains all site styling)
-        scss_src = self.assets_path / "great-docs.scss"
-        shutil.copy2(scss_src, self.build_dir / "great-docs.scss")
+        scss = (self.assets_path / "great-docs.scss").read_text(encoding="utf-8")
+        if self._config.styles == "widgets":
+            scss = scss.replace("$gd-content-styles: true !default;", "$gd-content-styles: false !default;", 1)
+        (self.build_dir / "great-docs.scss").write_text(scss, encoding="utf-8")
 
         # Quarto resolves the signature grammar relative to the build directory.
         shutil.copy2(
@@ -732,6 +756,8 @@ class GreatDocs:
         self._add_api_reference_config()
         if self._has_api_reference:
             self._update_sidebar_from_sections()
+            if self._config.quartodoc:
+                self._add_quartodoc_config()
 
         # Build the homepage after the API reference configuration. Its metadata
         # margin can then include links to `llms.txt` and `llms-full.txt` when the
@@ -11061,6 +11087,8 @@ anchor-sections: true
         skips API reference setup entirely and sets
         `self._has_api_reference = False`.
         """
+        self._uses_quartodoc = False
+
         # Explicit opt-out via great-docs.yml
         if not self._config.reference_enabled:
             print("API reference disabled (reference: false), skipping")
@@ -11219,6 +11247,142 @@ anchor-sections: true
         self._write_quarto_yml(quarto_yml, config)
 
         print(f"Added API reference configuration to {quarto_yml}")
+
+    def _add_quartodoc_config(self) -> None:
+        """
+        Configure quartodoc to build the API reference pages
+
+        Writes the `quartodoc` block of great-docs.yml into `_quarto.yml`, with
+        `package` defaulting to the API reference's package and `dir` to
+        "reference". Great Docs still analyzes the API itself, for llms.txt and
+        the like; quartodoc only writes the pages. quartodoc is always asked
+        for a sidebar (with any of the user's `sidebar` options), which
+        `_build_quartodoc` puts in `_quarto.yml`.
+        """
+        quarto_yml = self.build_dir / "_quarto.yml"
+        with open(quarto_yml, "r") as f:
+            config = read_yaml(f) or {}
+
+        qd_config = dict(self._config.quartodoc)
+        qd_config.setdefault("package", config["api-reference"]["package"])
+        qd_config.setdefault("dir", "reference")
+        sidebar = qd_config.get("sidebar")
+        sidebar = {"file": sidebar} if isinstance(sidebar, str) else dict(sidebar or {})
+        sidebar.setdefault("file", QUARTODOC_SIDEBAR)
+        sidebar.setdefault("id", "reference")
+        qd_config["sidebar"] = sidebar
+        config["quartodoc"] = qd_config
+        self._uses_quartodoc = True
+        print(f"Using quartodoc for the API reference pages of package: {qd_config['package']}")
+
+        self._write_quarto_yml(quarto_yml, config)
+
+    def _build_quartodoc(self) -> "AliasClaims":
+        """
+        Build the API reference pages with quartodoc
+
+        Runs in the build directory, which must be the current directory, as
+        `quartodoc build` would. Afterwards the site links to quartodoc's
+        pages: the reference sidebar is quartodoc's, links to the reference
+        index follow its `dir`, `objects.inv` is written from its inventory for
+        interlinks, and llms.txt is regenerated with its page URLs.
+
+        Returns
+        -------
+        AliasClaims
+            The short names quartodoc's documented objects claim, for interlinks.
+        """
+        try:
+            from quartodoc import Builder
+        except ImportError:
+            raise RuntimeError(
+                "The `quartodoc` option in great-docs.yml needs quartodoc installed; "
+                "install it with `pip install great-docs[quartodoc]`"
+            ) from None
+        import sphobjinv as soi
+
+        from great_docs._interlinks import AliasClaims
+
+        quarto_yml = self.build_dir / "_quarto.yml"
+        builder = Builder.from_quarto_config(str(quarto_yml))
+        builder.build()
+
+        # Interlinks read the inventory as objects.inv; llms.txt links by URI
+        inventory = builder.create_inventory(builder.items)
+        soi.writebytes(self.build_dir / "objects.inv", soi.compress(inventory.data_file()))
+        self._quartodoc_uris = {obj.name: obj.uri.replace("$", obj.name) for obj in inventory.objects}
+
+        config = self._read_quarto_config(quarto_yml)
+        ref_dir = str(builder.dir).strip("/")
+        if ref_dir != "reference":
+            _replace_values(config["website"], "reference/index.qmd", f"{ref_dir}/index.qmd")
+
+        sidebar_file = self.build_dir / builder.sidebar["file"]
+        with open(sidebar_file, "r", encoding="utf-8") as f:
+            qd_sidebar = (read_yaml(f) or {})["website"]["sidebar"][0]
+        sidebars = config["website"]["sidebar"]
+        for i, sb in enumerate(sidebars):
+            if isinstance(sb, dict) and sb.get("id") == qd_sidebar["id"]:
+                sidebars[i] = qd_sidebar
+                break
+        else:
+            sidebars.append(qd_sidebar)
+        self._write_quarto_yml(quarto_yml, config)
+
+        if self._llms_txt_available():
+            self._generate_llms_txt()
+
+        # Each object claims its own name; a class member, `Class.member`; and
+        # an object the package re-exports from a submodule, `package.name`
+        # (with its members, `package.Class.member`)
+        package = builder.package
+        exports = set(self._get_package_exports(package) or ())
+        classes = {obj.name for obj in inventory.objects if obj.role == "class"}
+        modules = {obj.name for obj in inventory.objects if obj.role == "module"} - {package}
+
+        def reexported(name: str) -> str | None:
+            parent, _, short = name.rpartition(".")
+            return f"{package}.{short}" if parent in modules and short in exports else None
+
+        claimed = []
+        for name in self._quartodoc_uris:
+            parent, _, short = name.rpartition(".")
+            claimed.append((short, name))
+            if parent in classes:
+                claimed.append((f"{parent.rpartition('.')[2]}.{short}", name))
+                if reexported_class := reexported(parent):
+                    claimed.append((f"{reexported_class}.{short}", name))
+            elif reexported_name := reexported(name):
+                claimed.append((reexported_name, name))
+        return AliasClaims(claimed=tuple(sorted(claimed)), published=frozenset(self._quartodoc_uris))
+
+    def _api_page_url(self, name: str, page_path: str) -> str | None:
+        """
+        Get the site-relative URL of an API object's documentation
+
+        Parameters
+        ----------
+        name
+            The object's name, as listed in the API reference config.
+        page_path
+            Its page in great-docs' own reference.
+
+        Returns
+        -------
+        str | None
+            The page great-docs writes for it, or, when quartodoc writes the
+            reference, its page in quartodoc's inventory: the full name, else
+            the shortest name ending in it. None if quartodoc doesn't document
+            it.
+        """
+        if not self._uses_quartodoc:
+            return f"reference/{page_path}.html"
+        uris = self._quartodoc_uris
+        package = self._config.quartodoc.get("package") or ""
+        if f"{package}.{name}" in uris:
+            return uris[f"{package}.{name}"]
+        matches = sorted((n for n in uris if n.endswith(f".{name}")), key=len)
+        return uris[matches[0]] if matches else None
 
     def _refresh_api_reference_config(self) -> None:
         """
@@ -11388,6 +11552,12 @@ anchor-sections: true
             config = read_yaml(f) or {}
         for _, overrides in layers:
             config = merge_quarto_overrides(config, overrides)
+
+        # A replaced theme keeps great-docs' stylesheet, which its widgets
+        # need, but just after the base theme so the user's SCSS wins
+        html = config.get("format", {}).get("html", {})
+        if html.get("theme"):
+            html["theme"] = with_great_docs_scss(html["theme"], position=1)
         write_quarto_yml(quarto_yml, config)
         return [name for name, _ in layers]
 
@@ -11801,10 +11971,7 @@ anchor-sections: true
         # We provide a light background container in dark mode via CSS
         config["format"]["html"]["mermaid"] = {"theme": "default"}
 
-        if "great-docs.scss" not in config["format"]["html"]["theme"]:
-            if isinstance(config["format"]["html"]["theme"], str):
-                config["format"]["html"]["theme"] = [config["format"]["html"]["theme"]]
-            config["format"]["html"]["theme"].append("great-docs.scss")
+        config["format"]["html"]["theme"] = with_great_docs_scss(config["format"]["html"]["theme"])
 
         # User-defined grammars must keep their order and survive repeated updates.
         syntax_definitions = config["format"]["html"].get("syntax-definitions") or []
@@ -13442,33 +13609,36 @@ anchor-sections: true
             section_title = section.title or section.subtitle or ""
             section_desc = section.desc or ""
 
+            # Add each item in the section that has a page
+            items = []
+            for entry in section.contents:
+                if not isinstance(entry, SpecObject):
+                    continue  # pragma: no cover
+                item_name = entry.name
+                page_url = self._api_page_url(item_name, entry.page_path)
+                if page_url is None:
+                    continue
+
+                # Get description from docstring if available
+                item_desc = self._get_docstring_summary(package_name, item_name)
+
+                url = f"{site_url}{page_url}"
+
+                # Format the line
+                if item_desc:
+                    items.append(f"- [{item_name}]({url}): {item_desc}")
+                else:
+                    items.append(f"- [{item_name}]({url})")
+            if not items:
+                continue
+
             # Add section header as a comment or sub-heading if there are multiple sections
             if len(sections) > 1 and section_title:
                 lines.append(f"#### {section_title}")
                 if section_desc:
                     lines.append(f"> {section_desc}")
                 lines.append("")
-
-            # Add each item in the section
-            for entry in section.contents:
-                if not isinstance(entry, SpecObject):
-                    continue  # pragma: no cover
-                item_name = entry.name
-
-                # Get description from docstring if available
-                item_desc = self._get_docstring_summary(package_name, item_name)
-
-                if site_url:
-                    url = f"{site_url}reference/{entry.page_path}.html"
-                else:
-                    url = f"reference/{entry.page_path}.html"
-
-                # Format the line
-                if item_desc:
-                    lines.append(f"- [{item_name}]({url}): {item_desc}")
-                else:
-                    lines.append(f"- [{item_name}]({url})")
-
+            lines.extend(items)
             lines.append("")
 
         # Write the llms.txt file
@@ -15389,7 +15559,13 @@ anchor-sections: true
                     pass
 
             # Step 14: Generate API reference
-            if self._has_api_reference:
+            if self._uses_quartodoc:
+                try:
+                    with redirect_stdout(devnull):
+                        self._build_quartodoc()
+                except Exception:
+                    pass
+            elif self._has_api_reference:
                 try:
                     from great_docs._apiref.api_reference import APIReference
 
@@ -16092,7 +16268,22 @@ anchor-sections: true
             # ── Step 14: Generate API reference ────────────────────────
             step += 1
             log.step_start(step, "Generate API reference")
-            if self._has_api_reference:
+            claims = None
+            if self._uses_quartodoc:
+                ref = None
+                build_env = self._get_quarto_env()
+                for p in build_env.get("PYTHONPATH", "").split(os.pathsep):
+                    if p and p not in sys.path:
+                        sys.path.insert(0, p)  # pragma: no cover
+                try:
+                    with _quiet_prints():
+                        claims = self._build_quartodoc()
+                    log.step_done("API reference generated with quartodoc")
+                except Exception as e:
+                    log.step_fail(f"quartodoc build failed: {e}")
+                    log.footer()
+                    sys.exit(1)
+            elif self._has_api_reference:
                 build_env = self._get_quarto_env()
                 extra_paths = build_env.get("PYTHONPATH", "").split(os.pathsep)
                 for p in extra_paths:
@@ -16151,7 +16342,7 @@ anchor-sections: true
                 self.build_dir,
                 self._config,
                 self._detect_package_name() or "",
-                AliasClaims.make(ref.items) if ref is not None else AliasClaims(),
+                claims or (AliasClaims.make(ref.items) if ref is not None else AliasClaims()),
             )
             for note in interlinks_notes:
                 log.detail(note)
