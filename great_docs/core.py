@@ -17,7 +17,12 @@ from yaml12 import format_yaml, read_yaml
 from ._content_naming import fix_numeric_prefix_links, section_slug, strip_numeric_prefix
 from ._layout import Layout, LayoutError
 from ._source_refs import source_reference_spans
-from ._subprocess import TEXT_MODE_KWARGS
+from ._subprocess import (
+    QUARTO_ARGS_ENV,
+    TEXT_MODE_KWARGS,
+    join_quarto_args,
+    quarto_render_command,
+)
 from ._typer_cli import is_cli_command, is_cli_group, param_kind, to_click_command
 from ._utils import (
     GITIGNORE_CONTENT,
@@ -15507,6 +15512,7 @@ anchor-sections: true
         version_tags: list[str] | None = None,
         latest_only: bool = False,
         jobs: int | str | None = None,
+        quarto_args: str | list[str] | None = None,
     ) -> None:
         """
         Build the documentation site.
@@ -15539,6 +15545,11 @@ anchor-sections: true
             reads the `GREAT_DOCS_RENDER_JOBS` environment variable and otherwise renders in one
             process. Sites that can't be split safely are rendered in one process anyway. Ignored
             for multi-version sites and in watch mode.
+        quarto_args
+            Extra arguments for each `quarto render` of the site, as one string
+            (`"--jobs 8 --keep-going"`) or a list. The default (`None`) reads the
+            `GREAT_DOCS_QUARTO_ARGS` environment variable. Which arguments work depends on your
+            Quarto version.
 
         Examples
         --------
@@ -15583,6 +15594,8 @@ anchor-sections: true
         # Settle the render process count up front so a bad value fails fast, and read the last
         # build's page timings before anything clears them (they guide how pages are split)
         render_jobs = _parallel_render.resolve_jobs(jobs)
+        if quarto_args is not None:
+            quarto_args = join_quarto_args(quarto_args)
         last_timings = (
             _parallel_render.read_timings(
                 self.layout.site_dir / "build-timings.json",
@@ -16319,6 +16332,8 @@ anchor-sections: true
 
             # Get environment with QUARTO_PYTHON set
             quarto_env = self._get_quarto_env()
+            if quarto_args is not None:
+                quarto_env[QUARTO_ARGS_ENV] = quarto_args
 
             # ── Pre-render termshow recordings ──────────────────────
             self._prerender_term_player(log)
@@ -16489,7 +16504,9 @@ anchor-sections: true
 
                 if result is None:
                     bar = log.progress("Rendering pages", 1)
-                    result = run_streaming(["quarto", "render"], env=quarto_env, progress_bar=bar)
+                    result = run_streaming(
+                        quarto_render_command(env=quarto_env), env=quarto_env, progress_bar=bar
+                    )
                     bar.finish()  # no-op if auto-finished at 100%
 
                 # Retry once on transient Quarto filesystem race conditions
@@ -16504,7 +16521,9 @@ anchor-sections: true
                     log.warn("Quarto hit a transient filesystem error — retrying render...")
                     # Reset progress state for retry
                     bar = log.progress("Rendering pages (retry)", 1)
-                    result = run_streaming(["quarto", "render"], env=quarto_env, progress_bar=bar)
+                    result = run_streaming(
+                        quarto_render_command(env=quarto_env), env=quarto_env, progress_bar=bar
+                    )
                     bar.finish()
 
                 if result.returncode != 0:

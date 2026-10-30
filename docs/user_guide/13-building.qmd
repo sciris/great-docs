@@ -112,6 +112,19 @@ great-docs build --jobs auto
 This feature is experimental. See [Parallel Rendering](46-parallel-rendering.qmd) for how it works,
 how much faster it is, and which sites it applies to.
 
+### Passing Arguments to Quarto {#quarto-args}
+
+`--quarto-args` adds arguments to each `quarto render` of the site, as one quoted string. For
+example, with a Quarto that can execute and render pages in parallel itself:
+
+```{.bash filename="Terminal"}
+great-docs build --quarto-args "--jobs 8 --keep-going"
+```
+
+The `GREAT_DOCS_QUARTO_ARGS` environment variable sets a default. The arguments go to every render
+of the site, including the processes of a parallel render and each version of a multi-version site,
+so avoid ones that only make sense once, such as an output directory.
+
 ## Build Output Structure
 
 After a successful build, the output directory has this layout:

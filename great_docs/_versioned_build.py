@@ -12,7 +12,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from great_docs._subprocess import TEXT_MODE_KWARGS
+from great_docs._subprocess import TEXT_MODE_KWARGS, quarto_render_command
 from great_docs._utils import (
     is_great_docs_build_dir,
     record_site_ownership,
@@ -1759,7 +1759,7 @@ def _render_single_version(  # pragma: no cover
     for attempt in range(2):
         try:
             result = subprocess.run(
-                ["quarto", "render"],
+                quarto_render_command(env=env),
                 cwd=build_dir,
                 capture_output=True,
                 **TEXT_MODE_KWARGS,
@@ -1802,7 +1802,7 @@ def _render_single_version_streaming(  # pragma: no cover
 
     try:
         proc = subprocess.Popen(
-            ["quarto", "render"],
+            quarto_render_command(env=env),
             cwd=build_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1858,7 +1858,7 @@ def _render_single_version_streaming(  # pragma: no cover
 
         try:
             proc = subprocess.Popen(
-                ["quarto", "render"],
+                quarto_render_command(env=env),
                 cwd=build_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

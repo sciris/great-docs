@@ -53,7 +53,7 @@ from typing import Any
 
 from yaml12 import parse_yaml, write_yaml
 
-from ._subprocess import TEXT_MODE_KWARGS
+from ._subprocess import TEXT_MODE_KWARGS, quarto_render_command
 from ._utils import QUARTO_YML_HEADER
 
 JOBS_ENV = "GREAT_DOCS_RENDER_JOBS"
@@ -785,7 +785,7 @@ class _Runner:
             (directory / target.path).mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
         proc = subprocess.Popen(
-            ["quarto", "render", target.path, "--use-freezer"],
+            quarto_render_command(target.path, "--use-freezer", env=self.env),
             cwd=directory,
             env=self.env,
             stdout=subprocess.PIPE,

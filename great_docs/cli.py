@@ -294,6 +294,12 @@ def init(project_path: str | None, force: bool, config_path: str | None = None) 
     default=None,
     help="Render pages with this many Quarto processes (a number or 'auto'; experimental)",
 )
+@click.option(
+    "--quarto-args",
+    type=str,
+    default=None,
+    help="Extra arguments for each 'quarto render' of the site, as one quoted string",
+)
 @_config_option
 def build(
     project_path: str | None,
@@ -307,6 +313,7 @@ def build(
     shallow: bool,
     preview_after: bool,
     jobs: str | None = None,
+    quarto_args: str | None = None,
     config_path: str | None = None,
 ) -> None:
     """
@@ -343,6 +350,10 @@ def build(
     Quarto processes at once. Pass a number, or 'auto' to pick one from the
     CPU count. The GREAT_DOCS_RENDER_JOBS environment variable sets a default.
 
+    Use '--quarto-args' to pass extra arguments to each 'quarto render' of the
+    site, such as '--quarto-args "--jobs 8 --keep-going"' for a Quarto that
+    supports them. The GREAT_DOCS_QUARTO_ARGS environment variable sets a default.
+
     \b
     Examples:
       great-docs build                      # Full build with API refresh
@@ -351,6 +362,7 @@ def build(
       great-docs build --versions 0.3,dev   # Build specific versions only
       great-docs build --latest-only        # Build only the latest version
       great-docs build --jobs auto          # Render pages in parallel
+      great-docs build --quarto-args "--keep-going"
       great-docs build --project-path ../pkg
       great-docs build --from-repo https://github.com/owner/pkg.git
       great-docs build --from-repo git@github.com:owner/pkg.git --branch v1.0
@@ -405,6 +417,7 @@ def build(
                 version_tags=version_tags,
                 latest_only=latest_only,
                 jobs=jobs,
+                quarto_args=quarto_args,
             )
     except KeyboardInterrupt:
         click.echo("\n👋 Stopped watching")
