@@ -10662,6 +10662,20 @@ def test_parse_user_guide_file_with_frontmatter_basic():
         assert result["section"] == "Getting Started"
 
 
+def test_parse_user_guide_file_sidebar_title():
+    """_parse_user_guide_file prefers `sidebar-title` to `title` for the sidebar label."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp = Path(tmp_dir)
+        qmd = tmp / "01-home.qmd"
+        qmd.write_text("---\ntitle: My Package\nsidebar-title: Home\n---\nBody\n")
+
+        docs = GreatDocs(project_path=tmp_dir)
+        result = docs._parse_user_guide_file(qmd)
+
+        assert result is not None
+        assert result["title"] == "Home"
+
+
 def test_parse_user_guide_file_derives_title():
     """_parse_user_guide_file derives title from filename when not in frontmatter."""
     with tempfile.TemporaryDirectory() as tmp_dir:

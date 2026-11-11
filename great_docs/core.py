@@ -5750,8 +5750,9 @@ class GreatDocs:
 
         frontmatter, _ = split_front_matter(content)
 
-        # Get title from frontmatter or derive from filename
-        title = frontmatter.string("title")
+        # Get the sidebar label from frontmatter (`sidebar-title`, falling back to `title`)
+        # or derive it from the filename
+        title = frontmatter.string("sidebar-title") or frontmatter.string("title")
         if not title:
             # Derive title from filename: "01-getting-started.qmd" -> "Getting Started"
             name = qmd_path.stem

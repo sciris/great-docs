@@ -109,6 +109,17 @@ User Guide
 This grouping is purely visual in the sidebar. The pages themselves remain as flat files in the
 `docs/user_guide/` directory.
 
+A page is listed in the sidebar (and in the previous/next links) by its `title`. To list it by a
+different name, such as a shorter one, set `sidebar-title`; the page itself keeps its `title`:
+
+```{.yaml filename="00-home.qmd"}
+---
+title: "My Package"
+sidebar-title: "Home"
+guide-section: "Getting Started"
+---
+```
+
 ### Section Order
 
 Sections appear in the order they're first encountered (based on file sort order). To control
