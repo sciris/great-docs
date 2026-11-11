@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
-import configparser
 import os
 import re
 import subprocess
-import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from great_docs._content_naming import section_slug
-from great_docs._layout import CONVENTIONAL_DOC_DIRS, Layout
+from great_docs._content.naming import section_slug
+from great_docs._project import manifest as _manifest
+from great_docs._project.layout import CONVENTIONAL_DOC_DIRS, Layout
+from great_docs._project.manifest import ManifestError
+from great_docs._project.model import package_name
 from great_docs._utils import is_great_docs_build_dir, recognised_build_dirs
+from great_docs._website import branding
+from great_docs._website.homepage import source as homepage_source
 from great_docs._yaml import YamlMapping, YamlValue
 
 from .content import (
@@ -67,8 +70,7 @@ _DISCOVERY_ROLES: dict[str, ConfigPath] = {
     "user-guide": ("user_guide",),
     "custom": ("custom_pages",),
     "notebooks": ("marimo",),
-    "index.qmd": ("index",),
-    "index.md": ("index",),
+    **{name: ("index",) for name in homepage_source.INDEX_NAMES},
 }
 
 
@@ -289,86 +291,48 @@ def _overlaps(left: Path, right: Path) -> bool:
 
 
 def _package_metadata(root: Path) -> tuple[str, list[Path]]:
-    name = ""
+    """
+    Find the package name and source paths protected from migration
+
+    Parameters
+    ----------
+    root
+        The project root.
+
+    Returns
+    -------
+    :
+        The distribution name and the paths a migration must not move into or over. If no
+        name is declared, the name is the only package directory at the root, or an empty
+        string if there is no single package directory. The protected paths are `src`, the
+        declared packages and package directories, every package directory at the root and
+        the directory named after the package.
+
+    Raises
+    ------
+    ManifestError
+        A packaging file cannot be read or parsed.
+    OSError
+        The root cannot be listed.
+    """
+    manifest = _manifest.read(root)
+    name = package_name(root, manifest) or ""
     sources: list[Path] = [root / "src"]
-    manifest = root / "pyproject.toml"
-    if manifest.is_file():
-        data = YamlMapping(tomllib.loads(manifest.read_bytes().decode("utf-8")))
-        name = data.mapping("project").string("name") or ""
-        tool = data.mapping("tool")
-        setuptools = tool.mapping("setuptools")
-        for directory in setuptools.mapping("package-dir").data.values():
-            if isinstance(directory, str) and directory not in {"", "."}:
-                sources.append(absolute_path(root / directory))
-        packages = setuptools.get("packages")
-        if isinstance(packages, dict):
-            for directory in YamlMapping(packages).mapping("find").sequence("where"):
-                if isinstance(directory, str) and directory not in {"", "."}:
-                    sources.append(absolute_path(root / directory))
-        elif isinstance(packages, list):
-            sources.extend(
-                root / package.split(".")[0] for package in packages if isinstance(package, str)
-            )
-        for package in tool.mapping("poetry").sequence("packages"):
-            entry = YamlMapping(package) if isinstance(package, dict) else YamlMapping()
-            include = entry.string("include")
-            if include is not None:
-                sources.append(root / (entry.string("from") or "") / include)
-    if not name and (root / "setup.cfg").is_file():
-        config = configparser.ConfigParser()
-        config.read_string((root / "setup.cfg").read_bytes().decode("utf-8"))
-        name = config.get("metadata", "name", fallback="")
-    if not name and (root / "setup.py").is_file():
-        match = re.search(
-            r"name\s*=\s*[\"']([^\"']+)[\"']", (root / "setup.py").read_bytes().decode("utf-8")
-        )
-        if match:
-            name = match[1]
+    sources.extend(
+        absolute_path(root / directory)
+        for directory in manifest["package_dirs"]
+        if directory not in {"", "."}
+    )
+    sources.extend(root / package for package in manifest["declared_packages"])
     packages = [
         child
         for child in sorted(root.iterdir())
         if not child.name.startswith(".") and (child / "__init__.py").is_file()
     ]
     sources.extend(packages)
-    if not name and len(packages) == 1:
-        name = packages[0].name
     if name:
         sources.append(root / name.replace("-", "_"))
     return name, sources
-
-
-def _logo_candidates(package: str, *, hero: bool) -> list[str]:
-    if hero:
-        return [
-            "logo-hero.svg",
-            "logo-hero.png",
-            "assets/logo-hero.svg",
-            "assets/logo-hero.png",
-            "logo-hero-light.svg",
-            "logo-hero-light.png",
-            "assets/logo-hero-light.svg",
-            "assets/logo-hero-light.png",
-        ]
-    candidates = [
-        "logo.svg",
-        "logo.png",
-        "assets/logo.svg",
-        "assets/logo.png",
-        "docs/assets/logo.svg",
-        "docs/assets/logo.png",
-    ]
-    for name in dict.fromkeys((package, package.replace("-", "_"))):
-        if name:
-            candidates.extend(
-                [
-                    f"{name}_logo.svg",
-                    f"{name}_logo.png",
-                    f"assets/{name}_logo.svg",
-                    f"assets/{name}_logo.png",
-                ]
-            )
-    candidates.extend(["assets/logo-light.svg", "assets/logo-light.png"])
-    return candidates
 
 
 def _relative_section_dirs(sections: list[YamlValue]) -> list[tuple[int, str, YamlMapping]]:
@@ -814,7 +778,7 @@ def analyse(layout: Layout, destination: Path) -> Migration:
         retain(root / name)
     try:
         package, package_sources = _package_metadata(root)
-    except (OSError, UnicodeError, ValueError, configparser.Error) as error:
+    except (ManifestError, OSError) as error:
         blockers.append(
             Note(
                 f"Cannot inspect package metadata: {error}",
@@ -860,7 +824,7 @@ def analyse(layout: Layout, destination: Path) -> Migration:
     # `rewrite_config` never even considers rewriting a path under either tag. The same
     # is not true of ("custom_pages",), which does name a rewritable field and is kept
     # out of the allowlist deliberately.
-    for name in ("index.qmd", "index.md"):
+    for name in homepage_source.INDEX_NAMES:
         if (root / name).exists() or (root / name).is_symlink():
             selected.append((root / name, ("index",)))
             break
@@ -997,10 +961,7 @@ def analyse(layout: Layout, destination: Path) -> Migration:
         "user-guide",
         "custom",
         "notebooks",
-        "index.qmd",
-        "index.md",
-        "README.md",
-        "README.rst",
+        *homepage_source.NAMES,
     ):
         if (root / name).is_file() or not (root / name).exists():
             retain(root / name)
@@ -1041,17 +1002,17 @@ def analyse(layout: Layout, destination: Path) -> Migration:
         )
         if explicit:
             continue
-        for candidate in _logo_candidates(package, hero=hero):
+        candidates = branding.HERO_LOGO_CANDIDATES if hero else branding.logo_candidates(package)
+        for candidate in candidates:
             candidate_path = root / candidate
             if not retained(candidate_path):
                 break
             if candidate_path.is_file():
-                light = Path(candidate)
-                dark = light.with_name(light.stem.replace("-light", "") + "-dark" + light.suffix)
+                dark = branding.dark_variant(candidate)
                 retain(root / dark)
                 variants = {
                     "light": candidate,
-                    "dark": dark.as_posix() if (root / dark).is_file() else candidate,
+                    "dark": dark if (root / dark).is_file() else candidate,
                 }
                 if isinstance(existing, dict):
                     implicit.update({(*path, key): value for key, value in variants.items()})
@@ -1149,7 +1110,7 @@ def analyse(layout: Layout, destination: Path) -> Migration:
         if not retained(source):
             continue
         _categorize_move_contents(source, config_path, documents, blockers, follow_up)
-    for name in ("README.md", "README.rst", "index.qmd", "index.md"):
+    for name in (*homepage_source.README_NAMES, *homepage_source.INDEX_NAMES):
         path = root / name
         if path.is_file():
             retain(path)
@@ -1247,8 +1208,8 @@ def analyse(layout: Layout, destination: Path) -> Migration:
         )
 
     generated_homepage = None
-    if not any((root / name).exists() for name in ("index.qmd", "index.md")) and any(
-        (root / name).is_file() for name in ("README.md", "README.rst")
+    if not any((root / name).exists() for name in homepage_source.INDEX_NAMES) and any(
+        (root / name).is_file() for name in homepage_source.README_NAMES
     ):
         generated_homepage = root / "index.qmd"
     for path in sorted(documents):

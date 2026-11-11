@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from great_docs._build_log import (
+from great_docs._build.log import (
     BuildLog,
     Colors,
     MultiProgressBar,
@@ -205,6 +205,15 @@ class TestShouldUseColor:
     def test_isatty_raises(self):
         with patch("sys.stdout") as mock_stdout:
             mock_stdout.isatty.side_effect = AttributeError("no isatty")
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("NO_COLOR", None)
+                os.environ.pop("TERM", None)
+                assert _should_use_color() is False
+
+    def test_closed_stdout(self):
+        stream = io.StringIO()
+        stream.close()
+        with patch("sys.stdout", stream):
             with patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("NO_COLOR", None)
                 os.environ.pop("TERM", None)
@@ -494,6 +503,18 @@ class TestProgressBar:
         # ...
         # bucket 10: 100*100//100=100 -> 100//10=10 (emitted at i=100)
         assert len(lines) == 11
+
+    @pytest.mark.parametrize("is_tty", [True, False])
+    def test_update_survives_a_closed_pipe(self, is_tty: bool):
+        class ClosedPipe(io.StringIO):
+            def write(self, text: str) -> int:
+                raise BrokenPipeError
+
+        bar = ProgressBar(
+            "Test", 100, is_tty=is_tty, colors=Colors(force_color=False), stream=ClosedPipe()
+        )
+        bar.update(50)
+        assert bar._current == 50
 
     def test_update_ci_no_repeat_buckets(self):
         stream = io.StringIO()
@@ -1813,7 +1834,7 @@ class TestMultiProgressBar:
     """Tests for MultiProgressBar (parallel version rendering progress)."""
 
     def test_init_and_labels(self):
-        from great_docs._build_log import MultiProgressBar
+        from great_docs._build.log import MultiProgressBar
 
         stream = io.StringIO()
         mpb = MultiProgressBar(
@@ -1828,7 +1849,7 @@ class TestMultiProgressBar:
         assert mpb._currents == [0, 0, 0]
 
     def test_set_total(self):
-        from great_docs._build_log import MultiProgressBar
+        from great_docs._build.log import MultiProgressBar
 
         stream = io.StringIO()
         mpb = MultiProgressBar(
@@ -1842,7 +1863,7 @@ class TestMultiProgressBar:
         assert mpb._totals == [10, 20]
 
     def test_set_total_minimum_one(self):
-        from great_docs._build_log import MultiProgressBar
+        from great_docs._build.log import MultiProgressBar
 
         stream = io.StringIO()
         mpb = MultiProgressBar(
@@ -1856,7 +1877,7 @@ class TestMultiProgressBar:
 
     def test_update_ci_mode(self):
         """Non-TTY stream gets CI-style percentage output."""
-        from great_docs._build_log import MultiProgressBar
+        from great_docs._build.log import MultiProgressBar
 
         stream = io.StringIO()
         mpb = MultiProgressBar(
@@ -1879,7 +1900,7 @@ class TestMultiProgressBar:
         assert "50%" in output
 
     def test_update_marks_slot_finished(self):
-        from great_docs._build_log import MultiProgressBar
+        from great_docs._build.log import MultiProgressBar
 
         stream = io.StringIO()
         mpb = MultiProgressBar(
@@ -1893,7 +1914,7 @@ class TestMultiProgressBar:
         assert 0 in mpb._finished_slots
 
     def test_render_slot_in_progress(self):
-        from great_docs._build_log import MultiProgressBar
+        from great_docs._build.log import MultiProgressBar
 
         stream = io.StringIO()
         mpb = MultiProgressBar(
@@ -1911,7 +1932,7 @@ class TestMultiProgressBar:
         assert "50%" in slot_str
 
     def test_render_slot_finished(self):
-        from great_docs._build_log import MultiProgressBar
+        from great_docs._build.log import MultiProgressBar
 
         stream = io.StringIO()
         mpb = MultiProgressBar(
@@ -1929,7 +1950,7 @@ class TestMultiProgressBar:
         assert "100%" in slot_str
 
     def test_finish_idempotent(self):
-        from great_docs._build_log import MultiProgressBar
+        from great_docs._build.log import MultiProgressBar
 
         stream = io.StringIO()
         mpb = MultiProgressBar(
@@ -1944,7 +1965,7 @@ class TestMultiProgressBar:
 
     def test_tty_mode_redraws(self):
         """TTY stream uses ANSI escape sequences for redraws."""
-        from great_docs._build_log import MultiProgressBar
+        from great_docs._build.log import MultiProgressBar
 
         class FakeTTY(io.StringIO):
             def isatty(self):
@@ -1968,7 +1989,7 @@ class TestMultiProgressBar:
 
     def test_tty_finish_clears(self):
         """finish() on a TTY with drawn content emits escape codes."""
-        from great_docs._build_log import MultiProgressBar
+        from great_docs._build.log import MultiProgressBar
 
         class FakeTTY(io.StringIO):
             def isatty(self):
@@ -2075,7 +2096,7 @@ class TestProgressBarFinishOSError:
         """OSError from get_terminal_size is swallowed."""
         stream = io.StringIO()
         bar = ProgressBar("Test", 10, is_tty=True, colors=Colors(force_color=True), stream=stream)
-        with patch("great_docs._build_log.shutil.get_terminal_size", side_effect=OSError("nope")):
+        with patch("great_docs._build.log.shutil.get_terminal_size", side_effect=OSError("nope")):
             bar.finish()
 
 
@@ -2103,7 +2124,7 @@ class TestMultiProgressBarOSError:
         mpb.set_total(0, 5)
         mpb.update(0, 3)
 
-        with patch("great_docs._build_log.shutil.get_terminal_size", side_effect=OSError("nope")):
+        with patch("great_docs._build.log.shutil.get_terminal_size", side_effect=OSError("nope")):
             mpb.finish()
 
     def test_redraw_get_terminal_size_raises(self):
@@ -2121,5 +2142,5 @@ class TestMultiProgressBarOSError:
         )
         mpb.set_total(0, 10)
 
-        with patch("great_docs._build_log.shutil.get_terminal_size", side_effect=OSError("nope")):
+        with patch("great_docs._build.log.shutil.get_terminal_size", side_effect=OSError("nope")):
             mpb.update(0, 5)

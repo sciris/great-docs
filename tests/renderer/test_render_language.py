@@ -6,7 +6,7 @@ import textwrap
 
 import pytest
 
-from great_docs._apiref._settings import Settings, active_settings
+from great_docs._apiref._settings import Settings, SourceLinks
 from great_docs._apiref._tools import render_code_variable
 
 FUNCTION = '''
@@ -83,8 +83,7 @@ def start():
 
 def _render(source: str, name: str | None, lang: str) -> str:
     """Render an object from source as QMD in the selected language"""
-    with active_settings(Settings(lang=lang)):
-        return render_code_variable(textwrap.dedent(source), name)
+    return render_code_variable(textwrap.dedent(source), name, Settings(lang=lang))
 
 
 @pytest.mark.parametrize(
@@ -132,21 +131,18 @@ def test_usage_label_is_translated():
     assert "Usage" not in qmd
 
 
-def test_source_link_is_translated(monkeypatch: pytest.MonkeyPatch):
-    from great_docs._apiref._render import doc
-
-    info = {"GITHUB_REPO_URL": "https://github.com/org/repo", "GIT_REF": "main"}
-    monkeypatch.setattr(doc, "package_info", info.get)
-
-    qmd = _render(FUNCTION, "f", "ja")
+def test_source_link_is_translated():
+    links = SourceLinks(repo_url="https://github.com/org/repo")
+    qmd = render_code_variable(
+        textwrap.dedent(FUNCTION), "f", Settings(lang="ja", source_links=links)
+    )
 
     assert "[ソースコード](https://github.com/org/repo/blob/main/" in qmd
 
 
 def test_english_output_is_unchanged():
     """Preserve English output when the language is omitted"""
-    with active_settings(Settings()):
-        default = render_code_variable(textwrap.dedent(FUNCTION), "f")
+    default = render_code_variable(textwrap.dedent(FUNCTION), "f")
 
     assert _render(FUNCTION, "f", "en") == default
     assert "Parameters {.doc-parameters}" in default
@@ -162,8 +158,8 @@ def test_index_section_titles_translate_only_standard_names(title: str, expected
     from great_docs._apiref._render import RenderReferenceSection
     from great_docs._apiref.content import Section
 
-    with active_settings(Settings(lang="ja")):
-        header = str(RenderReferenceSection(Section(title=title)).render_title())
+    render = RenderReferenceSection(Section(title=title), settings=Settings(lang="ja"))
+    header = str(render.render_title())
 
     assert f"{expected} {{.doc-group}}" in header
 

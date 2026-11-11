@@ -37,12 +37,14 @@ dependencies = [
     "nbclient>=0.10",
     "py-yaml12>=0.2.0",
     "PyYAML>=6.0",
-    "click>=8.0.0",
+    "click>=8.2.0",
     "griffe~=2.1.0",
-    "requests>=2.25.0",
+    "requests>=2.27.0",
     "python-dotenv>=1.0.0",
-    "Pillow>=9.0.0",
+    "Pillow>=9.2.0",
     "ruff>=0.9.9",
+    "watchfiles>=1.0.0",
+    "packaging>=22",
 ]
 
 [project.optional-dependencies]
@@ -50,7 +52,8 @@ svg = [
     "cairosvg>=2.5.0",
 ]
 mcp = [
-    "mcp>=1.0.0",
+    "mcp>=2.0.0",
+    "jsonschema>=4.20.0",
 ]
 quartodoc = [
     "quartopydoc>=0.13.0",
@@ -62,7 +65,7 @@ marimo = [
     "uv>=0.5.0",
 ]
 dev = [
-    "pytest>=6.0",
+    "pytest>=7.3",
     "pytest-cov>=3.0",
     "pytest-xdist>=3.5",
     # Validates termshow files against their published JSON Schemas
@@ -75,15 +78,16 @@ dev = [
     "pyright>=1.1.414",
     "build>=0.7",
     "twine>=3.4",
-    "typer>=0.12.0",
+    "typer>=0.16.0",
+    "rich-click>=1.9.8",
     "great-docs[docs]",
 ]
 docs = [
     "plotnine>=0.13.0",
     "jupyter>=1.0.0",
     "polars>=0.20",
-    "pandas>=2.0",
-    "pyarrow>=12.0",
+    "pandas>=2.2.2",
+    "pyarrow>=16.0",
     "great_tables>=1.1.0",
     "great-docs[mcp,marimo]",
 ]
@@ -119,6 +123,7 @@ addopts = [
 ]
 markers = [
     "dedicated: test targets one or more specific gdtest_* packages (not a generic sweep)",
+    "network: allow external host lookups and socket connections in the test process",
 ]
 
 [tool.coverage.run]
@@ -183,18 +188,24 @@ pythonVersion = "3.11"
 typeCheckingMode = "strict"
 include = [
     "great_docs/_apiref",
+    "great_docs/_build",
     "great_docs/_builtin",
-    "great_docs/_git.py",
+    "great_docs/_checks",
+    "great_docs/_cliref",
+    "great_docs/_content",
+    "great_docs/_contribution.py",
     "great_docs/_icons.py",
     "great_docs/_interlinks",
-    "great_docs/_layout.py",
     "great_docs/_layout_migration",
-    "great_docs/_layout_notice.py",
-    "great_docs/_mcp_runner.py",
+    "great_docs/_marimo.py",
+    "great_docs/_mcpref",
+    "great_docs/_project",
+    "great_docs/_reference",
     "great_docs/_source_refs.py",
     "great_docs/_subprocess.py",
+    "great_docs/_term_player/prerender.py",
     "great_docs/_translations.py",
-    "great_docs/_typer_cli.py",
+    "great_docs/_versions/selector.py",
     "great_docs/_website",
     "great_docs/_yaml.py",
     "great_docs/config.py",
@@ -210,6 +221,17 @@ exclude = [
     "**/dist",
     "tests",
     "docs",
+    # Exclude modules in included packages until they pass strict checking
+    "great_docs/_build/log.py",
+    "great_docs/_build/parallel_render.py",
+    "great_docs/_checks/examples.py",
+    "great_docs/_checks/harper.py",
+    "great_docs/_checks/lint.py",
+    "great_docs/_mcpref/reference.py",
+    "great_docs/_website/d2.py",
+    "great_docs/_website/mermaid.py",
+    "great_docs/_website/mock_code.py",
+    "great_docs/_website/spdx.py",
 ]
 reportMissingImports = true
 reportMissingTypeStubs = false

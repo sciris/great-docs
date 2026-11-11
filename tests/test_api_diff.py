@@ -2,70 +2,78 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from great_docs._api_diff import (
-    _EVOLUTION_TABLE_CSS,
+from great_docs._api_evolution.compare import (
+    _describe_param_change,
+    _diff_cli_command,
+    _diff_parameters,
+    _diff_symbol,
+    api_diff,
+    diff_snapshots,
+)
+from great_docs._api_evolution.history import (
+    CallEdge,
+    DependencyGraph,
+    InheritanceEdge,
+    SymbolHistory,
+    SymbolHistoryEntry,
+    _mermaid_id,
+    build_dependency_graph,
+    build_timeline,
+    format_signature,
+    symbol_history,
+)
+from great_docs._api_evolution.markers import (
+    _parse_marker_attrs,
+    process_evolution_markers,
+    process_evolution_markers_in_file,
+    render_badge_html,
+)
+from great_docs._api_evolution.model import (
     ApiDiff,
     ApiSnapshot,
-    CallEdge,
     CliChange,
     CliCommandInfo,
     CliOptionInfo,
-    DependencyGraph,
-    InheritanceEdge,
     ParameterChange,
     ParameterInfo,
     SymbolChange,
-    SymbolHistory,
-    SymbolHistoryEntry,
     SymbolInfo,
-    _annotation_str,
-    _augment_params_with_separators,
-    _describe_param_change,
-    _detect_package_name,
-    _diff_parameters,
-    _diff_symbol,
-    _escape_html,
-    _extract_bases,
-    _extract_decorators,
-    _extract_package_at_tag,
-    _extract_parameters,
-    _filter_tag_range,
-    _mermaid_id,
-    _parameter_kind_str,
-    _parse_marker_attrs,
     _symbol_change_to_dict,
-    api_diff,
-    build_dependency_graph,
-    build_timeline,
-    _diff_cli_command,
-    diff_snapshots,
+)
+from great_docs._api_evolution.render import (
+    _EVOLUTION_TABLE_CSS,
+    _augment_params_with_separators,
+    _escape_html,
+    _filter_tag_range,
     evolution_table,
     evolution_table_html,
     evolution_table_text,
     evolution_table_to_dict,
-    format_signature,
-    _get_tag_date,
-    _import_cli_from_source,
-    _read_cli_module_at_tag,
-    _symbol_info_for_dotted,
-    list_version_tags,
-    process_evolution_markers,
-    process_evolution_markers_in_file,
-    render_badge_html,
     render_evolution_table,
     render_evolution_table_from_dict,
-    snapshot_at_tag,
-    snapshot_cli_from_click,
-    snapshot_from_griffe,
-    symbol_history,
     timeline_to_mermaid,
 )
+from great_docs._api_evolution.snapshot import (
+    BinaryOnlySnapshotError,
+    _annotation_str,
+    _detect_package_name,
+    _extract_bases,
+    _extract_decorators,
+    _extract_package_at_tag,
+    _get_tag_date,
+    _symbol_info_for_dotted,
+    list_version_tags,
+    snapshot_at_tag,
+    snapshot_from_griffe,
+)
+from great_docs._cliref.click import extract_snapshot, read_module_at_tag, snapshot_from_source
 
 
 def test_parameter_info_defaults():
@@ -557,7 +565,7 @@ def test_timeline_to_mermaid_empty():
     assert "xychart-beta" in m
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
 def test_parses_tags(mock_run):
     mock_run.return_value = MagicMock(
         returncode=0,
@@ -568,7 +576,7 @@ def test_parses_tags(mock_run):
     assert tags == ["v0.1.0", "v0.2.0", "v1.0.0"]
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
 def test_handles_no_v_prefix(mock_run):
     mock_run.return_value = MagicMock(returncode=0, stdout="1.0.0\n2.0\n")
     tags = list_version_tags(Path("/fake"))
@@ -576,7 +584,7 @@ def test_handles_no_v_prefix(mock_run):
     assert tags == ["1.0.0", "2.0"]
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
 def test_handles_failure(mock_run):
     mock_run.return_value = MagicMock(returncode=1, stdout="")
     tags = list_version_tags(Path("/fake"))
@@ -584,7 +592,7 @@ def test_handles_failure(mock_run):
     assert tags == []
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
 def test_handles_timeout(mock_run):
     mock_run.side_effect = subprocess.TimeoutExpired(cmd="git", timeout=10)
     tags = list_version_tags(Path("/fake"))
@@ -830,8 +838,8 @@ def test_symbol_history_to_dict_roundtrip_json():
     assert loaded["symbol"] == "foo"
 
 
-@patch("great_docs._api_diff.list_version_tags")
-@patch("great_docs._api_diff.snapshot_at_tag")
+@patch("great_docs._api_evolution.history.list_version_tags")
+@patch("great_docs._api_evolution.history.snapshot_at_tag")
 def test_tracks_across_versions(mock_snap, mock_tags):
     mock_tags.return_value = ["v1", "v2", "v3"]
 
@@ -867,8 +875,8 @@ def test_tracks_across_versions(mock_snap, mock_tags):
     assert hist.entries[2].change is None  # unchanged from v2
 
 
-@patch("great_docs._api_diff.list_version_tags")
-@patch("great_docs._api_diff.snapshot_at_tag")
+@patch("great_docs._api_evolution.history.list_version_tags")
+@patch("great_docs._api_evolution.history.snapshot_at_tag")
 def test_symbol_not_present(mock_snap, mock_tags):
     mock_tags.return_value = ["v1", "v2"]
 
@@ -883,8 +891,8 @@ def test_symbol_not_present(mock_snap, mock_tags):
     assert all(not e.present for e in hist.entries)
 
 
-@patch("great_docs._api_diff.list_version_tags")
-@patch("great_docs._api_diff.snapshot_at_tag")
+@patch("great_docs._api_evolution.history.list_version_tags")
+@patch("great_docs._api_evolution.history.snapshot_at_tag")
 def test_symbol_added_later(mock_snap, mock_tags):
     mock_tags.return_value = ["v1", "v2"]
 
@@ -908,8 +916,8 @@ def test_symbol_added_later(mock_snap, mock_tags):
     assert hist.entries[1].change.change_type == "added"
 
 
-@patch("great_docs._api_diff.list_version_tags")
-@patch("great_docs._api_diff.snapshot_at_tag")
+@patch("great_docs._api_evolution.history.list_version_tags")
+@patch("great_docs._api_evolution.history.snapshot_at_tag")
 def test_symbol_removed(mock_snap, mock_tags):
     mock_tags.return_value = ["v1", "v2"]
 
@@ -1633,7 +1641,7 @@ def test_missing_new_returns_all():
     assert _filter_tag_range(tags, None, "v99") == ["v1", "v2"]
 
 
-@patch("great_docs._api_diff.list_version_tags")
+@patch("great_docs._api_evolution.render.list_version_tags")
 def test_no_tags(mock_tags):
     mock_tags.return_value = []
     result = render_evolution_table("/fake", "build")
@@ -1642,8 +1650,8 @@ def test_no_tags(mock_tags):
     assert result.startswith("<!--")
 
 
-@patch("great_docs._api_diff.symbol_history")
-@patch("great_docs._api_diff.list_version_tags")
+@patch("great_docs._api_evolution.render.symbol_history")
+@patch("great_docs._api_evolution.render.list_version_tags")
 def test_no_history(mock_tags, mock_hist):
     mock_tags.return_value = ["v1", "v2"]
     mock_hist.return_value = None
@@ -1652,8 +1660,8 @@ def test_no_history(mock_tags, mock_hist):
     assert "no evolution data" in result
 
 
-@patch("great_docs._api_diff.symbol_history")
-@patch("great_docs._api_diff.list_version_tags")
+@patch("great_docs._api_evolution.render.symbol_history")
+@patch("great_docs._api_evolution.render.list_version_tags")
 def test_returns_css_and_table(mock_tags, mock_hist):
     mock_tags.return_value = ["v1", "v2"]
     sym = SymbolInfo(
@@ -1684,8 +1692,8 @@ def test_returns_css_and_table(mock_tags, mock_hist):
     assert "<details" not in result  # disclosure=False by default
 
 
-@patch("great_docs._api_diff.symbol_history")
-@patch("great_docs._api_diff.list_version_tags")
+@patch("great_docs._api_evolution.render.symbol_history")
+@patch("great_docs._api_evolution.render.list_version_tags")
 def test_include_css_false(mock_tags, mock_hist):
     mock_tags.return_value = ["v1"]
     sym = SymbolInfo(
@@ -1711,8 +1719,8 @@ def test_include_css_false(mock_tags, mock_hist):
     assert "<table" in result or "<details" in result
 
 
-@patch("great_docs._api_diff.symbol_history")
-@patch("great_docs._api_diff.list_version_tags")
+@patch("great_docs._api_evolution.render.symbol_history")
+@patch("great_docs._api_evolution.render.list_version_tags")
 def test_disclosure_false(mock_tags, mock_hist):
     mock_tags.return_value = ["v1"]
     sym = SymbolInfo(
@@ -1738,8 +1746,8 @@ def test_disclosure_false(mock_tags, mock_hist):
     assert "<table" in result
 
 
-@patch("great_docs._api_diff.symbol_history")
-@patch("great_docs._api_diff.list_version_tags")
+@patch("great_docs._api_evolution.render.symbol_history")
+@patch("great_docs._api_evolution.render.list_version_tags")
 def test_tag_range_filtering(mock_tags, mock_hist):
     mock_tags.return_value = ["v1", "v2", "v3", "v4"]
     sym = SymbolInfo(
@@ -1811,7 +1819,7 @@ def test_whitespace_around_equals():
     assert _parse_marker_attrs('symbol = "build"') == {"symbol": "build"}
 
 
-@patch("great_docs._api_diff.render_evolution_table")
+@patch("great_docs._api_evolution.markers.render_evolution_table")
 def test_replaces_marker(mock_render):
     mock_render.return_value = "<table>mock</table>"
     content = 'Before\n<!-- %evolution symbol="build" -->\nAfter'
@@ -1823,7 +1831,7 @@ def test_replaces_marker(mock_render):
     assert "<!-- %evolution" not in result
 
 
-@patch("great_docs._api_diff.render_evolution_table")
+@patch("great_docs._api_evolution.markers.render_evolution_table")
 def test_passes_attributes(mock_render):
     mock_render.return_value = "<table/>"
     content = '<!-- %evolution symbol="build" old_version="v1" new_version="v2" changes_only="false" disclosure="false" css="false" -->'
@@ -1846,7 +1854,7 @@ def test_missing_symbol_gives_error():
     assert result.startswith("<!--")
 
 
-@patch("great_docs._api_diff.render_evolution_table")
+@patch("great_docs._api_evolution.markers.render_evolution_table")
 def test_multiple_markers(mock_render):
     mock_render.side_effect = ["<table>A</table>", "<table>B</table>"]
     content = '<!-- %evolution symbol="foo" -->\n<!-- %evolution symbol="bar" -->'
@@ -1857,7 +1865,7 @@ def test_multiple_markers(mock_render):
     assert mock_render.call_count == 2
 
 
-@patch("great_docs._api_diff.render_evolution_table")
+@patch("great_docs._api_evolution.markers.render_evolution_table")
 def test_no_markers_returns_unchanged(mock_render):
     content = "No markers here."
     result = process_evolution_markers(content, "/fake")
@@ -1867,18 +1875,31 @@ def test_no_markers_returns_unchanged(mock_render):
     mock_render.assert_not_called()
 
 
-@patch("great_docs._api_diff.render_evolution_table")
-def test_exception_gives_error_comment(mock_render):
-    mock_render.side_effect = RuntimeError("boom")
-    content = '<!-- %evolution symbol="build" -->'
-    result = process_evolution_markers(content, "/fake")
+def test_package_that_fails_to_load_gives_error_comment(tmp_path: Path):
+    """Replace a marker with an error comment when a release contains invalid Python"""
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "t@t.co")
+    _git(tmp_path, "config", "user.name", "t")
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "mypkg"\n')
+    (tmp_path / "mypkg").mkdir()
+    (tmp_path / "mypkg" / "__init__.py").write_text("def build(a:\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "broken")
+    _git(tmp_path, "tag", "v0.1.0")
 
-    assert "error for build" in result
-    assert "boom" in result
-    assert result.startswith("<!--")
+    result = process_evolution_markers('<!-- %evolution symbol="build" -->', tmp_path)
+
+    assert result.startswith("<!-- %evolution error for build: Syntax error")
 
 
-@patch("great_docs._api_diff.render_evolution_table")
+@patch("great_docs._api_evolution.markers.render_evolution_table", side_effect=TypeError("bug"))
+def test_unexpected_error_propagates(mock_render):
+    """Propagate unexpected errors raised while rendering an evolution table"""
+    with pytest.raises(TypeError, match="bug"):
+        process_evolution_markers('<!-- %evolution symbol="build" -->', "/fake")
+
+
+@patch("great_docs._api_evolution.markers.render_evolution_table")
 def test_summary_attr(mock_render):
     mock_render.return_value = "<table/>"
     content = '<!-- %evolution symbol="build" summary="Build history" -->'
@@ -1889,7 +1910,7 @@ def test_summary_attr(mock_render):
     assert kwargs["summary_text"] == "Build history"
 
 
-@patch("great_docs._api_diff.render_evolution_table")
+@patch("great_docs._api_evolution.markers.render_evolution_table")
 def test_package_attr_overrides_argument(mock_render):
     mock_render.return_value = "<table/>"
     content = '<!-- %evolution symbol="fn" package="other_pkg" -->'
@@ -1900,7 +1921,7 @@ def test_package_attr_overrides_argument(mock_render):
     assert kwargs["package"] == "other_pkg"
 
 
-@patch("great_docs._api_diff.render_evolution_table")
+@patch("great_docs._api_evolution.markers.render_evolution_table")
 def test_reads_and_processes(mock_render, tmp_path):
     mock_render.return_value = "<table>result</table>"
     qmd = tmp_path / "test.qmd"
@@ -1914,7 +1935,7 @@ def test_reads_and_processes(mock_render, tmp_path):
     assert "<!-- %evolution" in qmd.read_text()
 
 
-@patch("great_docs._api_diff.render_evolution_table")
+@patch("great_docs._api_evolution.markers.render_evolution_table")
 def test_in_place(mock_render, tmp_path):
     mock_render.return_value = "<table>replaced</table>"
     qmd = tmp_path / "test.qmd"
@@ -1927,7 +1948,7 @@ def test_in_place(mock_render, tmp_path):
     assert "<!-- %evolution symbol" not in written
 
 
-@patch("great_docs._api_diff.render_evolution_table")
+@patch("great_docs._api_evolution.markers.render_evolution_table")
 def test_no_markers_skips_write(mock_render, tmp_path):
     qmd = tmp_path / "test.qmd"
     qmd.write_text("No markers.")
@@ -1991,6 +2012,44 @@ def test_python_bridge_parses_args():
 
     assert result.returncode == 0
     assert "symbol" in result.stdout.lower()
+
+
+def test_python_bridge_renders_demo_json(tmp_path: Path) -> None:
+    """Render evolution JSON through the installed shortcode bridge"""
+    import sys
+
+    bridge = _ext_dir() / "_evolution_shortcode.py"
+    demo = bridge.parents[2] / "api-evolution-demo.json"
+    result = subprocess.run(
+        [sys.executable, str(bridge), "build", "--json_file", str(demo)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert '<table class="gd-evolution-table">' in result.stdout
+    assert "project_path" in result.stdout
+    assert "v0.1.0" in result.stdout
+
+
+def test_python_bridge_reports_a_missing_json_file(tmp_path: Path):
+    """Report a missing JSON file as an error comment without a traceback"""
+    import sys
+
+    bridge = _ext_dir() / "_evolution_shortcode.py"
+    result = subprocess.run(
+        [sys.executable, str(bridge), "build", "--json_file", str(tmp_path / "missing.json")],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 1
+    assert result.stderr.startswith("<!-- evolution shortcode error for build: ")
+    assert "Traceback" not in result.stderr
 
 
 def _base_data() -> dict:
@@ -2164,58 +2223,6 @@ def test_annotation_str_string():
     assert _annotation_str("int") == "int"
 
 
-def test_annotation_str_exception():
-    """Returns None when str() raises."""
-
-    class BadObj:
-        def __str__(self):
-            raise ValueError("cannot convert")
-
-    assert _annotation_str(BadObj()) is None
-
-
-def test_parameter_kind_str_missing():
-    """Returns default when .kind.name raises."""
-
-    class BadParam:
-        kind = None
-
-    assert _parameter_kind_str(BadParam()) == "POSITIONAL_OR_KEYWORD"
-
-
-def test_extract_parameters_exception():
-    """Returns empty list when parameters iteration fails."""
-
-    class BadObj:
-        @property
-        def parameters(self):
-            raise AttributeError("no params")
-
-    assert _extract_parameters(BadObj()) == []
-
-
-def test_extract_bases_exception():
-    """Returns empty list when bases iteration fails."""
-
-    class BadObj:
-        @property
-        def bases(self):
-            raise TypeError("no bases")
-
-    assert _extract_bases(BadObj()) == []
-
-
-def test_extract_decorators_exception():
-    """Returns empty list when decorators iteration fails."""
-
-    class BadObj:
-        @property
-        def decorators(self):
-            raise RuntimeError("no decorators")
-
-    assert _extract_decorators(BadObj()) == []
-
-
 def test_describe_param_change_retyped():
     """Describes retyped parameter."""
     pc = ParameterChange(
@@ -2342,7 +2349,68 @@ def test_detect_package_name_invalid_toml(tmp_path):
     assert _detect_package_name(tmp_path) is None
 
 
-@patch("great_docs._api_diff.subprocess.run")
+def test_detect_package_name_from_setup_cfg(tmp_path):
+    """Reads the package name from `setup.cfg` when `pyproject.toml` has none"""
+    (tmp_path / "setup.cfg").write_text("[metadata]\nname = my-package\n")
+
+    assert _detect_package_name(tmp_path) == "my_package"
+
+
+def test_detect_package_name_from_poetry(tmp_path):
+    """Reads the package name from a Poetry 1.x `[tool.poetry]` table"""
+    (tmp_path / "pyproject.toml").write_text('[tool.poetry]\nname = "my-package"\n')
+
+    assert _detect_package_name(tmp_path) == "my_package"
+
+
+@pytest.mark.parametrize("module", ["yaml12", "firebird.base"])
+def test_detect_package_name_uses_configured_module(tmp_path: Path, module: str) -> None:
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "py-yaml12"\n')
+    (tmp_path / "great-docs.yml").write_text(f"module: {module}\n")
+
+    assert _detect_package_name(tmp_path) == module
+
+
+def test_detect_package_name_uses_selected_config(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "py-yaml12"\n')
+    config_path = tmp_path / "custom.yml"
+    config_path.write_text("module: yaml12\n")
+
+    assert _detect_package_name(tmp_path, config_path) == "yaml12"
+
+
+def test_tagged_api_uses_configured_importable_module(tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from great_docs.cli import cli
+
+    package = tmp_path / "src" / "yaml12"
+    package.mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "py-yaml12"\n')
+    (tmp_path / "great-docs.yml").write_text("module: yaml12\n")
+    (package / "__init__.py").write_text("def load(): ...\n")
+    _git(tmp_path, "init")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "-c", "user.email=t@t.co", "-c", "user.name=t", "commit", "-m", "v100")
+    _git(tmp_path, "tag", "v1.0.0")
+    (package / "__init__.py").write_text("def load(): ...\ndef dump(): ...\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "-c", "user.email=t@t.co", "-c", "user.name=t", "commit", "-m", "v200")
+    _git(tmp_path, "tag", "v2.0.0")
+
+    diff = api_diff(tmp_path, "v1.0.0", "v2.0.0")
+    assert diff is not None
+    assert diff.package_name == "yaml12"
+    assert any(change.symbol == "dump" for change in diff.added)
+
+    result = CliRunner().invoke(cli, ["api-snapshot", "v1.0.0", "--project-path", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    snapshot = ApiSnapshot.load(tmp_path / ".great-docs" / "snapshots" / "v1.0.0.json")
+    assert snapshot.package_name == "yaml12"
+    assert set(snapshot.symbols) == {"load"}
+
+
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
 def test_list_version_tags_success(mock_run):
     """Returns sorted version tags."""
     mock_run.return_value = MagicMock(
@@ -2354,7 +2422,7 @@ def test_list_version_tags_success(mock_run):
     assert tags == ["v0.1.0", "v1.0.0", "v1.1.0"]
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
 def test_list_version_tags_failure(mock_run):
     """Returns empty list on git failure."""
     mock_run.return_value = MagicMock(returncode=128, stdout="")
@@ -2362,7 +2430,7 @@ def test_list_version_tags_failure(mock_run):
     assert list_version_tags(Path("/project")) == []
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
 def test_list_version_tags_timeout(mock_run):
     """Returns empty list on timeout."""
     mock_run.side_effect = subprocess.TimeoutExpired(cmd="git", timeout=10)
@@ -2370,24 +2438,24 @@ def test_list_version_tags_timeout(mock_run):
     assert list_version_tags(Path("/project")) == []
 
 
-@patch("great_docs._api_diff.subprocess.run")
-def test_extract_package_at_tag_not_found(mock_run):
-    """Returns None when package dir not in git tree."""
-    mock_run.return_value = MagicMock(returncode=1, stdout="")
-    result = _extract_package_at_tag(Path("/project"), "v1.0", "mypkg")
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
+def test_extract_package_at_tag_not_found(mock_run, tmp_path: Path):
+    """Return `None` when the package is absent from the tagged source"""
+    mock_run.return_value = MagicMock(returncode=0, stdout="")
+    result = _extract_package_at_tag(Path("/project"), "v1.0", "mypkg", tmp_path)
 
     assert result is None
 
 
-@patch("great_docs._api_diff.subprocess.run")
-def test_extract_package_at_tag_archive_fails(mock_run):
-    """Returns None when git archive fails."""
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
+def test_extract_package_at_tag_archive_fails(mock_run, tmp_path: Path):
+    """Return `None` when `git archive` fails"""
 
     def fake_run(cmd, **kwargs):
         mock = MagicMock()
         if "ls-tree" in cmd:
             mock.returncode = 0
-            mock.stdout = "mypkg/\n"
+            mock.stdout = "mypkg\n"
             return mock
         # archive fails
         mock.returncode = 1
@@ -2395,12 +2463,12 @@ def test_extract_package_at_tag_archive_fails(mock_run):
         return mock
 
     mock_run.side_effect = fake_run
-    result = _extract_package_at_tag(Path("/project"), "v1.0", "mypkg")
+    result = _extract_package_at_tag(Path("/project"), "v1.0", "mypkg", tmp_path)
 
     assert result is None
 
 
-@patch("great_docs._api_diff._extract_package_at_tag", return_value=None)
+@patch("great_docs._api_evolution.snapshot._extract_package_at_tag", return_value=None)
 def test_snapshot_at_tag_extraction_fails(mock_extract):
     """Returns None when extraction fails."""
     result = snapshot_at_tag(Path("/project"), "v1.0", "mypkg")
@@ -2408,8 +2476,8 @@ def test_snapshot_at_tag_extraction_fails(mock_extract):
     assert result is None
 
 
-@patch("great_docs._api_diff.snapshot_at_tag")
-@patch("great_docs._api_diff.list_version_tags", return_value=["v1.0", "v2.0"])
+@patch("great_docs._api_evolution.history.snapshot_at_tag")
+@patch("great_docs._api_evolution.history.list_version_tags", return_value=["v1.0", "v2.0"])
 def test_build_timeline_success(mock_tags, mock_snap):
     """Builds timeline entries for each tag."""
     snap1 = ApiSnapshot(
@@ -2435,8 +2503,8 @@ def test_build_timeline_success(mock_tags, mock_snap):
     assert timeline[1]["classes"] == 1
 
 
-@patch("great_docs._api_diff.snapshot_at_tag", return_value=None)
-@patch("great_docs._api_diff.list_version_tags", return_value=["v1.0"])
+@patch("great_docs._api_evolution.history.snapshot_at_tag", return_value=None)
+@patch("great_docs._api_evolution.history.list_version_tags", return_value=["v1.0"])
 def test_build_timeline_skip_failed(mock_tags, mock_snap):
     """Skips tags where snapshot fails."""
     timeline = build_timeline(Path("/project"), "pkg")
@@ -2444,7 +2512,7 @@ def test_build_timeline_skip_failed(mock_tags, mock_snap):
     assert timeline == []
 
 
-@patch("great_docs._api_diff._detect_package_name", return_value=None)
+@patch("great_docs._api_evolution.snapshot._detect_package_name", return_value=None)
 def test_api_diff_no_package_name(mock_detect):
     """Returns None when package name not detected."""
     result = api_diff(Path("/project"), "v1.0", "v2.0")
@@ -2452,8 +2520,8 @@ def test_api_diff_no_package_name(mock_detect):
     assert result is None
 
 
-@patch("great_docs._api_diff.snapshot_at_tag", return_value=None)
-@patch("great_docs._api_diff.snapshot_from_griffe")
+@patch("great_docs._api_evolution.snapshot.snapshot_at_tag", return_value=None)
+@patch("great_docs._api_evolution.snapshot.snapshot_from_griffe")
 def test_api_diff_head_version(mock_griffe, mock_tag):
     """Uses snapshot_from_griffe for HEAD version."""
     mock_griffe.return_value = ApiSnapshot(version="HEAD", package_name="pkg", symbols={})
@@ -2464,8 +2532,8 @@ def test_api_diff_head_version(mock_griffe, mock_tag):
     assert result is None
 
 
-@patch("great_docs._api_diff.diff_snapshots")
-@patch("great_docs._api_diff.snapshot_at_tag")
+@patch("great_docs._api_evolution.compare.diff_snapshots")
+@patch("great_docs._api_evolution.snapshot.snapshot_at_tag")
 def test_api_diff_success(mock_tag, mock_diff):
     """Successfully diffs two versions."""
     snap = ApiSnapshot(version="v1.0", package_name="pkg", symbols={})
@@ -2503,6 +2571,76 @@ def test_snapshot_from_griffe_no_exports():
 
     assert "public_fn" in snap.symbols
     assert "_private" not in snap.symbols
+
+
+def test_snapshot_from_griffe_skips_unresolved_exports(tmp_path: Path):
+    """Exports whose alias target is missing or cyclic are left out of the snapshot"""
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        "from ext_missing import Missing\n"
+        "from mypkg.a import Cyclic\n"
+        "from mypkg import core\n"
+        "from mypkg.core import LIMIT, Widget, fit\n"
+        "__all__ = ['Missing', 'Cyclic', 'core', 'LIMIT', 'Widget', 'fit']\n"
+    )
+    (pkg / "a.py").write_text("from mypkg.b import Cyclic\n")
+    (pkg / "b.py").write_text("from mypkg.a import Cyclic\n")
+    (pkg / "core.py").write_text(
+        "import functools\n"
+        "LIMIT: int = 3\n"
+        "class Widget(int): ...\n"
+        "@functools.cache\n"
+        "def fit(x: int) -> int: ...\n"
+    )
+
+    snap = snapshot_from_griffe("mypkg", version="dev", search_paths=[str(tmp_path)])
+
+    assert {name: info.kind for name, info in snap.symbols.items()} == {
+        "core": "module",
+        "LIMIT": "attribute",
+        "Widget": "class",
+        "fit": "function",
+    }
+    assert snap.symbols["fit"].decorators == ["functools.cache"]
+    assert snap.symbols["Widget"].bases == ["int"]
+
+
+def test_snapshot_from_griffe_unresolved_all_falls_back(tmp_path: Path):
+    """An `__all__` imported from a missing module gives way to the public members"""
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("from ext_missing import __all__\ndef fit(): ...\n")
+
+    snap = snapshot_from_griffe("mypkg", version="dev", search_paths=[str(tmp_path)])
+
+    assert set(snap.symbols) == {"fit"}
+
+
+def test_snapshot_from_griffe_all_from_a_name_falls_back(tmp_path: Path):
+    """Fall back to public members when griffe cannot expand `__all__`"""
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("_names = ['fit']\n__all__ = _names\ndef fit(): ...\n")
+
+    snap = snapshot_from_griffe("mypkg", version="dev", search_paths=[str(tmp_path)])
+
+    assert set(snap.symbols) == {"fit"}
+
+
+def test_snapshot_from_griffe_all_imported_from_submodule(tmp_path: Path):
+    """Capture submodule exports when the package imports its `__all__`"""
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("from .core import *\nfrom .core import __all__\n")
+    (pkg / "core.py").write_text("__all__ = ['fit', 'Widget']\ndef fit(): ...\nclass Widget: ...\n")
+
+    snap = snapshot_from_griffe("mypkg", version="dev", search_paths=[str(tmp_path)])
+
+    assert {name: info.kind for name, info in snap.symbols.items()} == {
+        "fit": "function",
+        "Widget": "class",
+    }
 
 
 def _write_griffe_pkg(root: Path) -> None:
@@ -2546,6 +2684,19 @@ class TestDeepSnapshot:
         )
 
         assert set(snap.symbols) == {"sub.Widget"}
+
+    def test_omits_names_whose_import_does_not_resolve(self, tmp_path: Path):
+        """Omit documented re-exports whose source module is missing"""
+        _write_griffe_pkg(tmp_path)
+        (tmp_path / "mypkg" / "extra.py").write_text("from ext_missing import Missing\n")
+        snap = snapshot_from_griffe(
+            "mypkg",
+            version="dev",
+            documented_names=["TopClass", "extra.Missing"],
+            search_paths=[str(tmp_path)],
+        )
+
+        assert set(snap.symbols) == {"TopClass"}
 
     def test_default_behavior_unchanged_top_level(self, tmp_path: Path):
         """Default behavior (no documented_names) unchanged — captures top-level only."""
@@ -2608,12 +2759,133 @@ class TestSnapshotAtTagDeep:
         }
         assert set(s1.symbols) != set(s2.symbols)
 
+    def test_tag_read_from_inside_the_project(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """
+        Use tagged source when the working directory contains the same package
+        """
+        _init_two_tag_repo(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        documented = ["sub.Widget", "sub.Gadget"]
+        snap = snapshot_at_tag(tmp_path, "v0.1.0", "mypkg", documented_names=documented)
+
+        assert set(snap.symbols) == {"sub.Widget"}
+
+
+def _tag_package(root: Path, package_dir: str) -> None:
+    """
+    Tag a package exporting `Widget` as `v1.0.0`
+
+    Create the package in `package_dir` relative to `root`.
+    """
+    package = root / package_dir
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("class Widget:\n    def fit(self): ...\n")
+    _git(root, "init")
+    _git(root, "add", "-A")
+    _git(root, "-c", "user.email=t@t.co", "-c", "user.name=t", "commit", "-m", "v100")
+    _git(root, "tag", "v1.0.0")
+
+
+class TestSnapshotAtTagLayouts:
+    """API snapshots from tagged packages in different source layouts"""
+
+    @pytest.mark.parametrize("source_dir", ["src", "python", "lib"])
+    def test_package_in_source_directory(self, tmp_path: Path, source_dir: str):
+        """Find a package below the project's `src`, `python` or `lib` directory"""
+        _tag_package(tmp_path, f"{source_dir}/mypkg")
+        snap = snapshot_at_tag(tmp_path, "v1.0.0", "mypkg")
+
+        assert snap is not None
+        assert set(snap.symbols) == {"Widget"}
+
+    def test_dotted_module_in_namespace_package(self, tmp_path: Path):
+        """Find a subpackage of a namespace package by its dotted name"""
+        _tag_package(tmp_path, "src/firebird/base")
+        snap = snapshot_at_tag(tmp_path, "v1.0.0", "firebird.base")
+
+        assert snap is not None
+        assert set(snap.symbols) == {"Widget"}
+
+    @pytest.mark.parametrize("filename", ["single.py", "single.pyi"])
+    def test_single_file_module(self, tmp_path: Path, filename: str) -> None:
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / filename).write_text("def load() -> str: ...\n")
+        _git(tmp_path, "init")
+        _git(tmp_path, "add", "-A")
+        _git(tmp_path, "-c", "user.email=t@t.co", "-c", "user.name=t", "commit", "-m", "v100")
+        _git(tmp_path, "tag", "v1.0.0")
+
+        snap = snapshot_at_tag(tmp_path, "v1.0.0", "single")
+
+        assert snap is not None
+        assert set(snap.symbols) == {"load"}
+
+    def test_stub_only_package(self, tmp_path: Path) -> None:
+        package = tmp_path / "src" / "compiled"
+        package.mkdir(parents=True)
+        (package / "__init__.pyi").write_text("def load() -> str: ...\n")
+        (package / "_native.so").write_bytes(b"compiled extension placeholder")
+        _git(tmp_path, "init")
+        _git(tmp_path, "add", "-A")
+        _git(tmp_path, "-c", "user.email=t@t.co", "-c", "user.name=t", "commit", "-m", "v100")
+        _git(tmp_path, "tag", "v1.0.0")
+
+        snap = snapshot_at_tag(tmp_path, "v1.0.0", "compiled")
+
+        assert snap is not None
+        assert set(snap.symbols) == {"load"}
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    ["single.cpython-313-darwin.so", "src/single.cpython-313-darwin.so", "src/single/_native.so"],
+)
+def test_binary_only_tag_reports_snapshot_limit(tmp_path: Path, artifact: str) -> None:
+    from click.testing import CliRunner
+
+    from great_docs.cli import cli
+
+    binary = tmp_path / artifact
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_bytes(b"compiled extension placeholder")
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "single"\n')
+    _git(tmp_path, "init")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "-c", "user.email=t@t.co", "-c", "user.name=t", "commit", "-m", "v100")
+    _git(tmp_path, "tag", "v1.0.0")
+
+    with (
+        patch(
+            "great_docs._api_evolution.snapshot.snapshot_from_griffe",
+            side_effect=AssertionError("loaded"),
+        ),
+        pytest.raises(BinaryOnlySnapshotError, match=r"versions\[\]\.api_snapshot"),
+    ):
+        snapshot_at_tag(tmp_path, "v1.0.0", "single")
+
+    for args in (
+        ["api-snapshot", "v1.0.0"],
+        ["api-diff", "v1.0.0", "v1.0.0"],
+    ):
+        result = CliRunner().invoke(cli, [*args, "--project-path", str(tmp_path)])
+        assert result.exit_code == 1
+        assert "compiled files but no Python source or `.pyi` stubs" in result.output
+        assert "`versions[].api_snapshot`" in result.output
+        assert "Traceback" not in result.output
+
+    assert snapshot_at_tag(tmp_path, "missing-tag", "single") is None
+
 
 def test_render_evolution_table_callable_via_top_level_import():
-    """great_docs.render_evolution_table wraps _api_diff.render_evolution_table."""
+    """Render a table through the package-level convenience function"""
     import great_docs
 
-    with patch("great_docs._api_diff.render_evolution_table", return_value="<html/>") as mock:
+    with patch(
+        "great_docs._api_evolution.render.render_evolution_table", return_value="<html/>"
+    ) as mock:
         result = great_docs.render_evolution_table("/fake", "sym")
 
     mock.assert_called_once_with("/fake", "sym")
@@ -2795,58 +3067,7 @@ def test_symbol_info_for_dotted_alias_error_on_members():
     assert result is None
 
 
-def test_symbol_info_for_dotted_alias_error_on_kind():
-    """_symbol_info_for_dotted returns None when kind.value raises CyclicAliasError."""
-    from griffe import CyclicAliasError
-
-    class FakeKind:
-        @property
-        def value(self):
-            raise CyclicAliasError(["foo", "bar"])
-
-    class FakeObj:
-        kind = FakeKind()
-        bases = []
-        decorators = []
-        is_async = False
-        annotation = None
-        returns = None
-
-    class FakePkg:
-        @property
-        def members(self):
-            return {"foo": FakeObj()}
-
-    result = _symbol_info_for_dotted(FakePkg(), "foo")
-
-    assert result is None
-
-
-# --- snapshot_from_griffe: __all__ from pkg.members with .value ---
-
-
-def test_snapshot_from_griffe_all_in_members():
-    """snapshot_from_griffe uses __all__ from pkg.members when exports is None."""
-    mock_all = MagicMock()
-    mock_all.value = ["public_fn"]
-
-    mock_member = MagicMock()
-    mock_member.kind.value = "function"
-    mock_member.is_async = False
-    mock_member.parameters = []
-    mock_member.annotation = None
-    mock_member.returns = None
-    mock_member.decorators = []
-
-    mock_pkg = MagicMock()
-    mock_pkg.exports = None
-    mock_pkg.members = {"__all__": mock_all, "public_fn": mock_member, "_priv": MagicMock()}
-
-    with patch("griffe.load", return_value=mock_pkg):
-        snap = snapshot_from_griffe("mypkg", "v1.0")
-
-    assert "public_fn" in snap.symbols
-    assert "_priv" not in snap.symbols
+# --- Top-level export filtering ---
 
 
 def test_snapshot_from_griffe_skip_names_in_skip_set():
@@ -2895,38 +3116,10 @@ def test_snapshot_from_griffe_skip_missing_member():
     assert "present_fn" in snap.symbols
 
 
-def test_snapshot_from_griffe_exception_in_member_introspection():
-    """snapshot_from_griffe skips members that raise during introspection."""
-
-    class BadMember:
-        @property
-        def kind(self):
-            raise RuntimeError("bad introspection")
-
-    mock_pkg = MagicMock()
-    mock_pkg.exports = ["bad_fn", "good_fn"]
-
-    mock_good = MagicMock()
-    mock_good.kind.value = "function"
-    mock_good.is_async = False
-    mock_good.parameters = []
-    mock_good.annotation = None
-    mock_good.returns = None
-    mock_good.decorators = []
-
-    mock_pkg.members = {"bad_fn": BadMember(), "good_fn": mock_good}
-
-    with patch("griffe.load", return_value=mock_pkg):
-        snap = snapshot_from_griffe("mypkg", "v1.0")
-
-    assert "bad_fn" not in snap.symbols
-    assert "good_fn" in snap.symbols
-
-
 # --- _get_tag_date success path ---
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
 def test_get_tag_date_success(mock_run):
     """_get_tag_date returns date string on success."""
     mock_run.return_value = MagicMock(returncode=0, stdout="2024-03-15 12:00:00 -0500\n")
@@ -2935,7 +3128,7 @@ def test_get_tag_date_success(mock_run):
     assert result == "2024-03-15"
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
 def test_get_tag_date_failure(mock_run):
     """_get_tag_date returns None on non-zero returncode."""
     mock_run.return_value = MagicMock(returncode=1, stdout="")
@@ -2944,7 +3137,7 @@ def test_get_tag_date_failure(mock_run):
     assert result is None
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
 def test_get_tag_date_timeout(mock_run):
     """_get_tag_date returns None on timeout."""
     mock_run.side_effect = subprocess.TimeoutExpired(cmd="git", timeout=10)
@@ -2953,66 +3146,72 @@ def test_get_tag_date_timeout(mock_run):
     assert result is None
 
 
-# --- _extract_package_at_tag src layout path ---
+# --- CLI module configuration in pyproject.toml ---
 
 
-@patch("great_docs._api_diff.subprocess.run")
-@patch("great_docs._api_diff.shutil.move")
-@patch("great_docs._api_diff.tempfile.mkdtemp")
-def test_extract_package_at_tag_src_layout(mock_mkdtemp, mock_move, mock_run, tmp_path):
-    """_extract_package_at_tag moves pkg dir for src-layout."""
-    src_dir = tmp_path / "src" / "mypkg"
-    src_dir.mkdir(parents=True)
-
-    mock_mkdtemp.return_value = str(tmp_path)
-
-    def fake_run(cmd, **kwargs):
-        m = MagicMock()
-        if "ls-tree" in cmd:
-            # succeed for src/mypkg, fail for mypkg
-            if "src/mypkg/" in cmd:
-                m.returncode = 0
-                m.stdout = "src/mypkg/\n"
-            else:
-                m.returncode = 1
-                m.stdout = ""
-        elif "archive" in cmd:
-            m.returncode = 0
-            m.stdout = b""
-        else:
-            # tar
-            m.returncode = 0
-            m.stdout = b""
-        return m
-
-    mock_run.side_effect = fake_run
-
-    result = _extract_package_at_tag(Path("/project"), "v1.0", "mypkg")
-
-    # move should have been called if src_dir existed
-    assert result is not None or mock_move.called or True  # just verifying no exception
+def _tag_cli_files(repo: Path) -> None:
+    """
+    Commit prepared project files as a tagged release
+    """
+    _git(repo, "init")
+    _git(repo, "config", "user.email", "t@t.co")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "release")
+    _git(repo, "tag", "v1.0")
 
 
-# --- _read_cli_module_at_tag pyproject with CLI enabled ---
+@pytest.mark.parametrize(
+    ("config_file", "project_content", "root_content"),
+    [
+        (
+            "pyproject.toml",
+            '[tool.great-docs.cli]\nenabled = true\nmodule = "mypkg.cli"\n',
+            '[tool.great-docs.cli]\nenabled = true\nmodule = "wrong.cli"\n',
+        ),
+        (
+            "great-docs.yml",
+            "cli:\n  enabled: true\n  module: mypkg.cli\n",
+            "cli:\n  enabled: true\n  module: wrong.cli\n",
+        ),
+    ],
+)
+def test_read_cli_module_from_nested_project_config(
+    tmp_path: Path, config_file: str, project_content: str, root_content: str
+) -> None:
+    """
+    Read tagged CLI settings from the project rather than the repository root
+    """
+    project = tmp_path / "packages" / "demo"
+    project.mkdir(parents=True)
+    (project / config_file).write_text(project_content)
+    (tmp_path / config_file).write_text(root_content)
+    _tag_cli_files(tmp_path)
+
+    assert read_module_at_tag(project, "v1.0", "mypkg") == "mypkg.cli"
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._cliref.click.subprocess.run")
 def test_read_cli_module_pyproject_enabled(mock_run):
-    """_read_cli_module_at_tag returns module when CLI enabled in pyproject.toml."""
+    """
+    Read the CLI module from release metadata when enabled in `pyproject.toml`
+    """
     toml_content = """
 [tool.great-docs.cli]
 enabled = true
 module = "mypkg.cli"
 """
     mock_run.return_value = MagicMock(returncode=0, stdout=toml_content)
-    result = _read_cli_module_at_tag(Path("/project"), "v1.0", "mypkg")
+    result = read_module_at_tag(Path("/project"), "v1.0", "mypkg")
 
     assert result == "mypkg.cli"
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._cliref.click.subprocess.run")
 def test_read_cli_module_pyproject_not_enabled(mock_run):
-    """_read_cli_module_at_tag returns None when CLI not enabled and no fallback found."""
+    """
+    Return `None` when CLI documentation is disabled and no fallback module exists
+    """
     toml_content = '[tool.great-docs.cli]\nenabled = false\nmodule = "mypkg.cli"\n'
 
     def fake_run(cmd, **kwargs):
@@ -3031,17 +3230,19 @@ def test_read_cli_module_pyproject_not_enabled(mock_run):
         return m
 
     mock_run.side_effect = fake_run
-    result = _read_cli_module_at_tag(Path("/project"), "v1.0", "mypkg")
+    result = read_module_at_tag(Path("/project"), "v1.0", "mypkg")
 
     assert result is None
 
 
-# --- _read_cli_module_at_tag yaml path ---
+# --- CLI module configuration in YAML ---
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._cliref.click.subprocess.run")
 def test_read_cli_module_yaml_enabled(mock_run):
-    """_read_cli_module_at_tag returns module from great-docs.yml when CLI enabled."""
+    """
+    Read the CLI module from a release's `great-docs.yml` when enabled
+    """
     yaml_content = "cli:\n  enabled: true\n  module: mypkg.cli\n"
 
     def fake_run(cmd, **kwargs):
@@ -3055,17 +3256,68 @@ def test_read_cli_module_yaml_enabled(mock_run):
         return m
 
     mock_run.side_effect = fake_run
-    result = _read_cli_module_at_tag(Path("/project"), "v1.0", "mypkg")
+    result = read_module_at_tag(Path("/project"), "v1.0", "mypkg")
 
     assert result == "mypkg.cli"
 
 
-# --- _read_cli_module_at_tag fallback cli module check ---
+# --- CLI module fallback ---
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@pytest.mark.parametrize("source_dir", ["", "src", "python", "lib"])
+@pytest.mark.parametrize("suffix", ["cli", "__main__"])
+def test_read_cli_module_from_nested_project_source(
+    tmp_path: Path, source_dir: str, suffix: str
+) -> None:
+    """
+    Find a tagged CLI module in each conventional project source directory
+    """
+    project = tmp_path / "packages" / "demo"
+    package = project / source_dir / "mypkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / f"{suffix}.py").write_text("")
+    _tag_cli_files(tmp_path)
+
+    assert read_module_at_tag(project, "v1.0", "mypkg") == f"mypkg.{suffix}"
+
+
+def test_read_cli_module_from_dotted_package_at_tag(tmp_path: Path) -> None:
+    """
+    Find a CLI module below a tagged namespace package
+    """
+    project = tmp_path / "packages" / "demo"
+    package = project / "src" / "firebird" / "base"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "cli.py").write_text("")
+    _tag_cli_files(tmp_path)
+
+    assert read_module_at_tag(project, "v1.0", "firebird.base") == "firebird.base.cli"
+
+
+def test_snapshot_at_tag_includes_nested_project_cli(tmp_path: Path) -> None:
+    """
+    Capture a release's CLI from a package below a nested project's source directory
+    """
+    project = tmp_path / "packages" / "demo"
+    package = project / "src" / "mypkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("__all__ = []\n")
+    (package / "cli.py").write_text("import click\n\n@click.command()\ndef main():\n    pass\n")
+    _tag_cli_files(tmp_path)
+
+    snap = snapshot_at_tag(project, "v1.0", "mypkg")
+
+    assert snap is not None
+    assert snap.cli_commands is not None
+
+
+@patch("great_docs._cliref.click.subprocess.run")
 def test_read_cli_module_fallback_cli(mock_run):
-    """_read_cli_module_at_tag falls back to checking mypkg/cli.py."""
+    """
+    Fall back to the release's `mypkg/cli.py` module
+    """
 
     def fake_run(cmd, **kwargs):
         m = MagicMock()
@@ -3082,27 +3334,78 @@ def test_read_cli_module_fallback_cli(mock_run):
         return m
 
     mock_run.side_effect = fake_run
-    result = _read_cli_module_at_tag(Path("/project"), "v1.0", "mypkg")
+    result = read_module_at_tag(Path("/project"), "v1.0", "mypkg")
 
     assert result == "mypkg.cli"
 
 
-# --- _import_cli_from_source: click ImportError ---
+# --- CLI source import without Click ---
 
 
-def test_import_cli_from_source_no_click(tmp_path):
-    """_import_cli_from_source returns None when click is not available."""
+def test_snapshot_from_source_no_click(tmp_path):
+    """
+    Return `None` when the CLI module cannot be imported without Click
+    """
     with patch.dict("sys.modules", {"click": None}):
-        result = _import_cli_from_source(tmp_path, "some_module")
+        result = snapshot_from_source(tmp_path, "some_module")
 
     assert result is None
 
 
-# --- _import_cli_from_source: fallback attribute search --+
+def test_snapshot_from_source_module_exiting_on_import(tmp_path):
+    """
+    Return `None` when the CLI module at a release exits on import
+    """
+    pkg = tmp_path / "exitpkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "__main__.py").write_text("raise SystemExit(2)\n")
+
+    assert snapshot_from_source(tmp_path, "exitpkg.__main__") is None
 
 
-def test_import_cli_from_source_fallback_attr_search(tmp_path):
-    """_import_cli_from_source finds CLI via fallback attribute scan."""
+@pytest.mark.parametrize("error", ["ValueError", "TypeError"])
+def test_snapshot_from_source_module_raising_on_import(tmp_path, error):
+    """
+    Return `None` when a CLI import raises `ValueError` or `TypeError`
+
+    Restore `sys.path` and leave the failing CLI module out of `sys.modules`.
+    """
+    pkg = tmp_path / "oldpkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "cli.py").write_text(f"raise {error}('written for older dependencies')\n")
+    path_before = list(sys.path)
+
+    assert snapshot_from_source(tmp_path, "oldpkg.cli") is None
+    assert sys.path == path_before
+    assert "oldpkg.cli" not in sys.modules
+
+
+def test_snapshot_at_tag_without_cli_snapshot_when_release_cli_fails(tmp_path: Path):
+    """
+    Keep the Python API snapshot when the release's CLI module raises on import
+    """
+    _init_two_tag_repo(tmp_path)
+    (tmp_path / "mypkg" / "cli.py").write_text("raise ValueError('old release')\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "broken cli")
+    _git(tmp_path, "tag", "v0.3.0")
+
+    snap = snapshot_at_tag(tmp_path, "v0.3.0", "mypkg", documented_names=["sub.Widget"])
+
+    assert snap is not None
+    assert set(snap.symbols) == {"sub.Widget"}
+    assert snap.cli_commands is None
+
+
+# --- CLI source attribute fallback ---
+
+
+def test_snapshot_from_source_fallback_attr_search(tmp_path):
+    """
+    Find a command under a non-standard public attribute name
+    """
     import click
 
     @click.command()
@@ -3126,7 +3429,7 @@ def test_import_cli_from_source_fallback_attr_search(tmp_path):
         patch.object(fake_module, "__dir__", return_value=["my_cmd"]),
     ):
         # We patch import_module directly so we don't need a real module
-        result = _import_cli_from_source(tmp_path, "fake_module")
+        result = snapshot_from_source(tmp_path, "fake_module")
 
     # Should have found my_cmd as the CLI
     assert result is not None
@@ -3135,10 +3438,10 @@ def test_import_cli_from_source_fallback_attr_search(tmp_path):
 # --- snapshot_at_tag: with cli_module ---
 
 
-@patch("great_docs._api_diff._import_cli_from_source")
-@patch("great_docs._api_diff._read_cli_module_at_tag")
-@patch("great_docs._api_diff.snapshot_from_griffe")
-@patch("great_docs._api_diff._extract_package_at_tag")
+@patch("great_docs._cliref.click.snapshot_from_source")
+@patch("great_docs._cliref.click.read_module_at_tag")
+@patch("great_docs._api_evolution.snapshot.snapshot_from_griffe")
+@patch("great_docs._api_evolution.snapshot._extract_package_at_tag")
 def test_snapshot_at_tag_with_cli_module(mock_extract, mock_griffe, mock_read_cli, mock_import_cli):
     """snapshot_at_tag sets cli_commands when CLI module is found."""
     tmp_dir = Path("/tmp/fake_extracted")
@@ -3148,12 +3451,12 @@ def test_snapshot_at_tag_with_cli_module(mock_extract, mock_griffe, mock_read_cl
     mock_read_cli.return_value = "mypkg.cli"
     mock_import_cli.return_value = CliCommandInfo(name="mypkg", is_group=True)
 
-    with patch("great_docs._api_diff.shutil.rmtree"):
-        result = snapshot_at_tag(Path("/project"), "v1.0", "mypkg")
+    result = snapshot_at_tag(Path("/project"), "v1.0", "mypkg")
 
     assert result is not None
     assert result.cli_commands is not None
     assert result.cli_commands.name == "mypkg"
+    mock_import_cli.assert_called_once_with(tmp_dir, "mypkg.cli")
 
 
 # --- _diff_symbol: added decorators ---
@@ -3241,18 +3544,22 @@ def test_diff_cli_command_no_changes():
     assert change is None
 
 
-# --- snapshot_cli_from_click: non-click object returns None ---
+# --- Unsupported snapshot objects ---
 
 
-def test_snapshot_cli_from_click_non_click_object():
-    """snapshot_cli_from_click returns None for non-Click objects."""
-    result = snapshot_cli_from_click("not a click command")
+def test_extract_snapshot_non_click_object():
+    """
+    Return `None` for an object that is neither a Click command nor a Typer app
+    """
+    result = extract_snapshot("not a click command")
 
     assert result is None
 
 
-def test_snapshot_cli_from_click_success():
-    """snapshot_cli_from_click returns CliCommandInfo for a Click command."""
+def test_extract_snapshot_success():
+    """
+    Record a Click command in an API snapshot
+    """
     import click
 
     @click.command()
@@ -3261,7 +3568,7 @@ def test_snapshot_cli_from_click_success():
         """A simple command."""
         pass
 
-    result = snapshot_cli_from_click(my_cmd)
+    result = extract_snapshot(my_cmd)
 
     assert result is not None
     assert result.name is not None
@@ -3271,9 +3578,9 @@ def test_snapshot_cli_from_click_success():
 # --- symbol_history: snap is None ---
 
 
-@patch("great_docs._api_diff.list_version_tags")
-@patch("great_docs._api_diff.snapshot_at_tag")
-@patch("great_docs._api_diff._get_tag_date")
+@patch("great_docs._api_evolution.history.list_version_tags")
+@patch("great_docs._api_evolution.history.snapshot_at_tag")
+@patch("great_docs._api_evolution.history._get_tag_date")
 def test_symbol_history_skip_none_snapshot(mock_date, mock_snap, mock_tags):
     """symbol_history skips tags where snapshot_at_tag returns None."""
     mock_tags.return_value = ["v1", "v2", "v3"]
@@ -3301,8 +3608,8 @@ def test_symbol_history_skip_none_snapshot(mock_date, mock_snap, mock_tags):
 # --- symbol_history: tags provided explicitly --+
 
 
-@patch("great_docs._api_diff.snapshot_at_tag")
-@patch("great_docs._api_diff._get_tag_date")
+@patch("great_docs._api_evolution.history.snapshot_at_tag")
+@patch("great_docs._api_evolution.history._get_tag_date")
 def test_symbol_history_explicit_tags(mock_date, mock_snap):
     """symbol_history uses provided tags without calling list_version_tags."""
     mock_date.return_value = "2024-01-01"
@@ -3320,7 +3627,7 @@ def test_symbol_history_explicit_tags(mock_date, mock_snap):
 # --- render_evolution_table: no matching tags in range ---
 
 
-@patch("great_docs._api_diff.list_version_tags")
+@patch("great_docs._api_evolution.render.list_version_tags")
 def test_render_evolution_table_no_matching_tags(mock_tags):
     """render_evolution_table returns comment when tag range is empty."""
     mock_tags.return_value = ["v1", "v2", "v3"]
@@ -3334,8 +3641,8 @@ def test_render_evolution_table_no_matching_tags(mock_tags):
 # --- render_evolution_table: html starts with <!-- --+
 
 
-@patch("great_docs._api_diff.symbol_history")
-@patch("great_docs._api_diff.list_version_tags")
+@patch("great_docs._api_evolution.render.symbol_history")
+@patch("great_docs._api_evolution.render.list_version_tags")
 def test_render_evolution_table_passes_through_comment(mock_tags, mock_hist):
     """render_evolution_table passes through comment from evolution_table_html."""
     mock_tags.return_value = ["v1"]
@@ -3488,7 +3795,7 @@ def test_format_signature_param_no_annotation():
 # --- build_timeline: tags provided explicitly ---
 
 
-@patch("great_docs._api_diff.snapshot_at_tag")
+@patch("great_docs._api_evolution.history.snapshot_at_tag")
 def test_build_timeline_explicit_tags(mock_snap):
     """build_timeline uses provided tags without calling list_version_tags."""
     snap = ApiSnapshot(
@@ -3506,10 +3813,10 @@ def test_build_timeline_explicit_tags(mock_snap):
 # --- symbol_history: package_name is None but _detect_package_name succeeds ---
 
 
-@patch("great_docs._api_diff.list_version_tags")
-@patch("great_docs._api_diff.snapshot_at_tag")
-@patch("great_docs._api_diff._get_tag_date")
-@patch("great_docs._api_diff._detect_package_name")
+@patch("great_docs._api_evolution.history.list_version_tags")
+@patch("great_docs._api_evolution.history.snapshot_at_tag")
+@patch("great_docs._api_evolution.history._get_tag_date")
+@patch("great_docs._api_evolution.history._detect_package_name")
 def test_symbol_history_detects_package_name(mock_detect, mock_date, mock_snap, mock_tags):
     """symbol_history calls _detect_package_name when package_name is None."""
     mock_detect.return_value = "mypkg"
@@ -3526,12 +3833,14 @@ def test_symbol_history_detects_package_name(mock_detect, mock_date, mock_snap, 
     mock_detect.assert_called_once()
 
 
-# --- _read_cli_module_at_tag yaml path: enabled=False ---
+# --- Disabled CLI reference in YAML ---
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._cliref.click.subprocess.run")
 def test_read_cli_module_yaml_not_enabled(mock_run):
-    """_read_cli_module_at_tag returns None when yaml CLI is not enabled."""
+    """
+    Return `None` when YAML disables the CLI reference and no fallback module exists
+    """
     yaml_content = "cli:\n  enabled: false\n  module: mypkg.cli\n"
 
     def fake_run(cmd, **kwargs):
@@ -3551,19 +3860,21 @@ def test_read_cli_module_yaml_not_enabled(mock_run):
         return m
 
     mock_run.side_effect = fake_run
-    result = _read_cli_module_at_tag(Path("/project"), "v1.0", "mypkg")
+    result = read_module_at_tag(Path("/project"), "v1.0", "mypkg")
 
     assert result is None
 
 
-# --- _read_cli_module_at_tag: outer timeout exception ---
+# --- Release file timeouts ---
 
 
-@patch("great_docs._api_diff.subprocess.run")
+@patch("great_docs._cliref.click.subprocess.run")
 def test_read_cli_module_timeout_exception(mock_run):
-    """_read_cli_module_at_tag handles TimeoutExpired on git show."""
+    """
+    Return `None` when Git times out while reading release files
+    """
     mock_run.side_effect = subprocess.TimeoutExpired(cmd="git", timeout=10)
-    result = _read_cli_module_at_tag(Path("/project"), "v1.0", "mypkg")
+    result = read_module_at_tag(Path("/project"), "v1.0", "mypkg")
 
     # Should handle gracefully and return None
     assert result is None
@@ -3584,11 +3895,13 @@ def test_diff_symbol_module_kind_no_param_diff():
     assert change.parameter_changes == []
 
 
-# --- _snapshot_click_command: hidden subcommand skipped ---
+# --- Hidden snapshot subcommands ---
 
 
-def test_snapshot_click_command_hidden_subcommand():
-    """_snapshot_click_command skips hidden subcommands."""
+def test_extract_snapshot_hidden_subcommand():
+    """
+    Exclude hidden subcommands from the snapshot
+    """
     import click
 
     @click.group()
@@ -3603,7 +3916,7 @@ def test_snapshot_click_command_hidden_subcommand():
     def hidden_cmd():
         pass
 
-    result = snapshot_cli_from_click(grp)
+    result = extract_snapshot(grp)
 
     assert result is not None
     assert result.is_group
@@ -3612,11 +3925,13 @@ def test_snapshot_click_command_hidden_subcommand():
     assert "hidden-cmd" not in visible_names and "hidden_cmd" not in visible_names
 
 
-# --- _snapshot_click_command: Argument param ---
+# --- Snapshot positional arguments ---
 
 
-def test_snapshot_click_command_with_argument():
-    """_snapshot_click_command captures Click Arguments."""
+def test_extract_snapshot_with_argument():
+    """
+    Record positional arguments in the snapshot
+    """
     import click
 
     @click.command()
@@ -3625,7 +3940,7 @@ def test_snapshot_click_command_with_argument():
         """Command with argument."""
         pass
 
-    result = snapshot_cli_from_click(my_cmd)
+    result = extract_snapshot(my_cmd)
 
     assert result is not None
     assert any(o.type == "argument" and o.name == "filename" for o in result.options)
@@ -3669,11 +3984,13 @@ def test_diff_symbol_decorator_removed_only():
     assert not any("Added decorator" in d for d in change.details)
 
 
-# --- Additional test to cover _import_cli_from_source standard attr path ---
+# --- Conventional CLI source attributes ---
 
 
-def test_import_cli_from_source_standard_attr(tmp_path):
-    """_import_cli_from_source finds CLI via standard attribute name."""
+def test_snapshot_from_source_standard_attr(tmp_path):
+    """
+    Find the command held in the module's `cli` attribute
+    """
     import click
 
     @click.command()
@@ -3689,17 +4006,19 @@ def test_import_cli_from_source_standard_attr(tmp_path):
     fake_module.command = None
 
     with patch("importlib.import_module", return_value=fake_module):
-        result = _import_cli_from_source(tmp_path, "fake_module")
+        result = snapshot_from_source(tmp_path, "fake_module")
 
     # Should have found the CLI via the 'cli' attribute
     assert result is not None
 
 
-# --- _import_cli_from_source: various paths in fallback loop and exception handling ---
+# --- CLI source fallback searches and import failures ---
 
 
-def test_import_cli_from_source_fallback_loop_mixed_attrs(tmp_path):
-    """_import_cli_from_source handles mix of private, non-CLI, and CLI attrs in fallback."""
+def test_snapshot_from_source_fallback_loop_mixed_attrs(tmp_path):
+    """
+    Skip private attributes and non-commands when scanning for a command
+    """
     import click
 
     @click.command()
@@ -3725,13 +4044,15 @@ def test_import_cli_from_source_fallback_loop_mixed_attrs(tmp_path):
     fake_module = FakeModule()
 
     with patch("importlib.import_module", return_value=fake_module):
-        result = _import_cli_from_source(tmp_path, "fake_module")
+        result = snapshot_from_source(tmp_path, "fake_module")
 
     assert result is not None
 
 
-def test_import_cli_from_source_no_cli_found(tmp_path):
-    """_import_cli_from_source returns None when no CLI command found anywhere."""
+def test_snapshot_from_source_no_cli_found(tmp_path):
+    """
+    Return `None` when the imported module has no command
+    """
 
     class FakeModule:
         cli = None
@@ -3746,104 +4067,43 @@ def test_import_cli_from_source_no_cli_found(tmp_path):
     fake_module = FakeModule()
 
     with patch("importlib.import_module", return_value=fake_module):
-        result = _import_cli_from_source(tmp_path, "fake_module")
+        result = snapshot_from_source(tmp_path, "fake_module")
 
     assert result is None
 
 
-def test_import_cli_from_source_import_error(tmp_path):
-    """_import_cli_from_source returns None when import fails."""
+def test_snapshot_from_source_import_error(tmp_path):
+    """
+    Return `None` when the CLI module cannot be imported
+    """
     with patch(
         "importlib.import_module",
         side_effect=ImportError("no module"),
     ):
-        result = _import_cli_from_source(tmp_path, "nonexistent_module")
+        result = snapshot_from_source(tmp_path, "nonexistent_module")
 
     assert result is None
 
 
-# --- snapshot_from_griffe: __all__.value not present ---
+# --- Tagged-source extraction timeout ---
 
 
-def test_snapshot_from_griffe_all_without_value():
-    """snapshot_from_griffe falls through when __all__ member has no .value attribute."""
-    # __all__ member exists in members but has no .value attribute
-    # -> falls through to public members fallback
-
-    class AllWithoutValue:
-        pass  # no .value attribute
-
-    mock_member = MagicMock()
-    mock_member.kind.value = "function"
-    mock_member.is_async = False
-    mock_member.parameters = []
-    mock_member.annotation = None
-    mock_member.returns = None
-    mock_member.decorators = []
-
-    mock_pkg = MagicMock()
-    mock_pkg.exports = None
-    mock_pkg.members = {
-        "__all__": AllWithoutValue(),
-        "public_fn": mock_member,
-        "_private": MagicMock(),
-    }
-
-    with patch("griffe.load", return_value=mock_pkg):
-        snap = snapshot_from_griffe("mypkg", "v1.0")
-
-    # Falls through to public members (non-underscore)
-    assert "public_fn" in snap.symbols
-
-
-def test_snapshot_from_griffe_all_value_raises():
-    """snapshot_from_griffe handles exception when accessing __all__.value."""
-
-    class AllWithBadValue:
-        @property
-        def value(self):
-            raise RuntimeError("bad value")
-
-    mock_member = MagicMock()
-    mock_member.kind.value = "function"
-    mock_member.is_async = False
-    mock_member.parameters = []
-    mock_member.annotation = None
-    mock_member.returns = None
-    mock_member.decorators = []
-
-    mock_pkg = MagicMock()
-    mock_pkg.exports = None
-    mock_pkg.members = {
-        "__all__": AllWithBadValue(),
-        "public_fn": mock_member,
-        "_private": MagicMock(),
-    }
-
-    with patch("griffe.load", return_value=mock_pkg):
-        snap = snapshot_from_griffe("mypkg", "v1.0")
-
-    # Exception caught, falls through to public members
-    assert "public_fn" in snap.symbols
-
-
-# --- _extract_package_at_tag: exception in inner loop ---
-
-
-@patch("great_docs._api_diff.subprocess.run")
-def test_extract_package_at_tag_timeout_exception(mock_run):
-    """_extract_package_at_tag handles TimeoutExpired exception gracefully."""
+@patch("great_docs._api_evolution.snapshot.subprocess.run")
+def test_extract_package_at_tag_timeout_exception(mock_run, tmp_path: Path):
+    """Return `None` when the git command times out"""
     mock_run.side_effect = subprocess.TimeoutExpired(cmd="git", timeout=10)
-    result = _extract_package_at_tag(Path("/project"), "v1.0", "mypkg")
+    result = _extract_package_at_tag(Path("/project"), "v1.0", "mypkg", tmp_path)
 
     assert result is None
 
 
-# --- _read_cli_module_at_tag yaml exception path ---
+# --- Invalid CLI configuration in YAML ---
 
 
 def test_read_cli_module_yaml_parse_exception():
-    """_read_cli_module_at_tag handles yaml parse exception gracefully."""
+    """
+    Return `None` when YAML parsing fails and no fallback module exists
+    """
     yaml_content = "valid: yaml\n"
 
     def fake_run(cmd, **kwargs):
@@ -3862,10 +4122,10 @@ def test_read_cli_module_yaml_parse_exception():
         return m
 
     with (
-        patch("great_docs._api_diff.subprocess.run", side_effect=fake_run),
-        patch("yaml12.parse_yaml", side_effect=Exception("yaml parse error")),
+        patch("great_docs._cliref.click.subprocess.run", side_effect=fake_run),
+        patch("yaml12.parse_yaml", side_effect=ValueError("yaml parse error")),
     ):
-        result = _read_cli_module_at_tag(Path("/project"), "v1.0", "mypkg")
+        result = read_module_at_tag(Path("/project"), "v1.0", "mypkg")
 
     # yaml raised, fallback also fails -> None
     assert result is None

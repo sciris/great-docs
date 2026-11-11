@@ -422,6 +422,15 @@ class TestApplyPromptPatternSubstitution:
         # "$ cmd" matches
         assert result.cells[1][0].char == "❯"
 
+    def test_wide_char_before_prompt(self):
+        """The prompt character is found by column, not by string index."""
+        from great_docs._term_player.emulator import TerminalEmulator
+
+        emu = TerminalEmulator(cols=10, rows=1)
+        emu.feed("🐍 $ ls")
+        result = _apply_prompt_pattern_substitution(emu.screen, r"^\S+ \$ ", "❯")
+        assert [c.char for c in result.cells[0][:6]] == ["🐍", "", " ", "❯", " ", "l"]
+
 
 class TestPromptSubstitutionIntegration:
     def test_generate_manifest_with_prompt(self, tmp_path: Path):
@@ -590,6 +599,14 @@ class TestSerializeHighlight:
 # ---------------------------------------------------------------------------
 # generate_manifest — uncovered branches
 # ---------------------------------------------------------------------------
+
+
+class TestInitialKeyframe:
+    def test_added_when_the_recording_starts_before_zero(self):
+        events = [Event(time=-1.0, code="o", data="a"), Event(time=-0.5, code="o", data="b")]
+        rec = Recording(events=events, term=TermInfo(cols=20, rows=4))
+        manifest = generate_manifest(rec)
+        assert [kf.time for kf in manifest.keyframes] == [-1.0, -0.5, 0.0]
 
 
 class TestGenerateManifestBranches:

@@ -3,7 +3,11 @@ from pathlib import Path
 from threading import Event
 from unittest.mock import Mock, patch
 
+import pytest
+
 from great_docs import GreatDocs
+from great_docs._checks import links
+from tests.support import AUTHORED_PAGES, write_authored_pages, write_config
 
 # ============================================================================
 # URL Extraction Tests
@@ -355,9 +359,44 @@ class TestURLCleaning:
                 ignore_patterns=["example.com"],
             )
 
-            # Should have found a URL with the parentheses (possibly truncated)
-            # The important thing is it doesn't crash
-            assert results["total"] == 1
+            assert results["skipped"] == ["https://example.com/wiki/Page_(disambiguation)"]
+
+
+def _urls_found(tmp_path: Path, text: str) -> list[str]:
+    """
+    Find URLs in a Markdown page without making HTTP requests
+
+    Parameters
+    ----------
+    tmp_path
+        A directory to write the page in.
+    text
+        The page's content.
+
+    Returns
+    -------
+    :
+        The URLs found, in the order they appear.
+    """
+    page = tmp_path / "page.md"
+    page.write_text(text)
+    results = links.check(
+        [page], tmp_path, timeout=1.0, ignore_patterns=["."], report=lambda _line: None
+    )
+    return results["by_file"].get("page.md", [])
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "[docs](https://docs.test/page)",
+        "(see https://docs.test/page).",
+        "(https://docs.test/page.)",
+    ],
+    ids=["markdown-link", "parenthesised", "punctuation-inside"],
+)
+def test_check_links_drops_the_parenthesis_that_closes_around_a_url(tmp_path: Path, text: str):
+    assert _urls_found(tmp_path, text) == ["https://docs.test/page"]
 
 
 # ============================================================================
@@ -824,6 +863,15 @@ Real link: http://real-example.com
             assert "http://real-example.com" in results["skipped"]
 
 
+def test_check_links_skips_a_marked_url_wherever_it_appears_in_the_page(tmp_path: Path):
+    text = (
+        "Try https://fake.test{.gd-no-link} or https://fake.test/a_(b){.gd-no-link}.\n"
+        "Again: https://fake.test and https://fake.test/a_(b), but https://real.test.\n"
+    )
+
+    assert _urls_found(tmp_path, text) == ["https://real.test"]
+
+
 # ============================================================================
 # HTTP Status Tests
 # ============================================================================
@@ -1137,28 +1185,45 @@ class TestErrorHandling:
             assert len(results["broken"]) == 1
             assert "SSL Error" in results["broken"][0]["error"]
 
-    def test_handles_unreadable_file(self):
-        """Test handling of files that can't be read."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            docs_dir = Path(tmp_dir) / "user_guide"
-            docs_dir.mkdir()
+    def test_reports_unreadable_file_and_continues(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """Report an unreadable file and continue checking the remaining files"""
+        docs_dir = tmp_path / "user_guide"
+        (docs_dir / "folder.md").mkdir(parents=True)
+        (docs_dir / "valid.md").write_text("https://example.com/valid")
 
-            # Create a valid file
-            test_md = docs_dir / "valid.md"
-            test_md.write_text("https://example.com/valid")
+        results = GreatDocs(project_path=tmp_path).check_links(
+            include_source=False, include_docs=True, ignore_patterns=["example.com"], verbose=True
+        )
 
-            quarto_yml = docs_dir / "_quarto.yml"
-            quarto_yml.write_text("project:\n  type: website\n")
+        assert results["skipped"] == ["https://example.com/valid"]
+        assert f"Warning: Could not read {docs_dir / 'folder.md'}" in capsys.readouterr().out
 
-            docs = GreatDocs(project_path=tmp_dir)
-            # Should complete without error even if some files are problematic
-            results = docs.check_links(
-                include_source=False,
-                include_docs=True,
-                ignore_patterns=["example.com"],
-            )
+    @patch("requests.head")
+    def test_reports_other_request_errors_as_broken(self, mock_head: Mock, tmp_path: Path):
+        """Record an otherwise unhandled request error as a broken link with its message"""
+        import requests
 
-            assert "total" in results
+        mock_head.side_effect = requests.exceptions.InvalidURL("bad host")
+        (tmp_path / "user_guide").mkdir()
+        (tmp_path / "user_guide" / "test.md").write_text("https://bad.test/page")
+
+        results = GreatDocs(project_path=tmp_path).check_links(
+            include_source=False, include_docs=True
+        )
+
+        assert results["broken"][0]["error"] == "bad host"
+
+    @patch("requests.head")
+    def test_propagates_errors_outside_requests(self, mock_head: Mock, tmp_path: Path):
+        """Propagate an error that `requests` does not raise instead of marking the URL broken"""
+        mock_head.side_effect = ValueError("bug")
+        (tmp_path / "user_guide").mkdir()
+        (tmp_path / "user_guide" / "test.md").write_text("https://ok.test/page")
+
+        with pytest.raises(ValueError, match="bug"):
+            GreatDocs(project_path=tmp_path).check_links(include_source=False, include_docs=True)
 
 
 # ============================================================================
@@ -1300,11 +1365,12 @@ class TestResultStructure:
             quarto_yml.write_text("project:\n  type: website\n")
 
             docs = GreatDocs(project_path=tmp_dir)
-            results = docs.check_links(
-                include_source=False,
-                include_docs=True,
-                timeout=2.0,
-            )
+            with patch("requests.head", return_value=Mock(status_code=404)):
+                results = docs.check_links(
+                    include_source=False,
+                    include_docs=True,
+                    timeout=2.0,
+                )
 
             if results["broken"]:
                 broken = results["broken"][0]
@@ -1424,7 +1490,8 @@ class TestCLIIntegration:
             "https://this-url-definitely-does-not-exist-xyz123.com/"
         )
 
-        result = runner.invoke(cli, ["check-links", "--docs-only", "--timeout", "2"])
+        with patch("requests.head", return_value=Mock(status_code=404)):
+            result = runner.invoke(cli, ["check-links", "--docs-only", "--timeout", "2"])
 
         # Should exit with error due to broken link
         assert result.exit_code == 1
@@ -1530,3 +1597,55 @@ https://skip2.example.com/
         )
 
         assert result.exit_code == 0
+
+
+@pytest.mark.parametrize(
+    ("settings", "directory"),
+    [("user_guide: guides\n", "guides"), ("", "user-guide")],
+    ids=["configured", "hyphenated"],
+)
+def test_check_links_reads_the_guide_directory_the_build_uses(
+    tmp_path: Path, settings: str, directory: str
+):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\n')
+    (tmp_path / "great-docs.yml").write_text(settings)
+    (tmp_path / directory).mkdir()
+    (tmp_path / directory / "page.md").write_text("Visit https://example.com for info")
+
+    results = GreatDocs(project_path=tmp_path).check_links(
+        include_source=False, ignore_patterns=["example.com"]
+    )
+
+    assert results["skipped"] == ["https://example.com"]
+
+
+def test_check_links_reads_the_authored_pages_the_build_publishes(tmp_path: Path):
+    write_authored_pages(tmp_path)
+
+    results = GreatDocs(project_path=tmp_path).check_links(ignore_patterns=["."])
+
+    assert list(results["by_file"]) == ["src/demo/__init__.py", *AUTHORED_PAGES]
+
+
+def test_check_links_without_a_guide_skips_the_build_directory(tmp_path: Path):
+    write_authored_pages(tmp_path)
+    write_config(tmp_path, "sections:\n  - title: Tutorials\n    dir: tutorials\n")
+
+    results = GreatDocs(project_path=tmp_path).check_links(
+        include_source=False, ignore_patterns=["."]
+    )
+
+    assert list(results["by_file"]) == ["README.md", "tutorials/first.md"]
+
+
+def test_check_links_reads_the_configured_module_of_a_project_without_a_name(tmp_path: Path):
+    (tmp_path / "great-docs.yml").write_text("module: beta\n")
+    for package in ("alpha", "beta"):
+        (tmp_path / package).mkdir()
+        (tmp_path / package / "__init__.py").write_text(f'URL = "https://{package}.test"\n')
+
+    results = GreatDocs(project_path=tmp_path).check_links(
+        include_docs=False, ignore_patterns=["."]
+    )
+
+    assert results["by_file"] == {"beta/__init__.py": ["https://beta.test"]}

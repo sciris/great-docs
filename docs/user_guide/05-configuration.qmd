@@ -644,6 +644,25 @@ homepage: user_guide
 | `index` (default) | Separate homepage from README / `index.qmd`. "User Guide" appears as a navbar link. |
 | `user_guide` | First User Guide page becomes the landing page. Left sidebar shows the UG table of contents. Right sidebar shows project metadata. No separate "User Guide" navbar link. |
 
+### Homepage Front Matter
+
+In `index` mode, the homepage preserves its source file's front matter, including `execute`,
+`page-layout` and `format`. An explicit `toc` setting overrides the default of no table of contents.
+Great Docs adds `gd-homepage` to any `body-classes` the source sets. For example:
+
+```{.yaml filename="docs/index.qmd"}
+---
+title: My Package
+page-layout: full
+execute:
+  echo: false
+body-classes: wide
+---
+```
+
+The homepage uses a full-width layout, hides code and includes both `wide` and `gd-homepage`
+in its body classes.
+
 ### How `user_guide` Mode Works
 
 When `homepage: user_guide` is set:
@@ -798,8 +817,10 @@ navbar_order:
   - Changelog
 ```
 
-Items are matched by their display text. Any navbar items not listed are appended at the end in
-their original order. This is useful when you want a specific item (like the User Guide) to appear
+Items match their display text. Great Docs' own items (User Guide, Recipes, Reference, Changelog
+and Tags) accept either their English or translated label, so the list above works for any
+`site.lang`. `navbar_after` follows the same matching rule. Items not listed follow the listed
+items in their original order. Use `navbar_order` to put a specific item, such as the User Guide,
 first.
 
 ## Reference Section Order
@@ -936,6 +957,25 @@ skill:
 For the full guide — including how to write a skill, the resolution order, multi-skill mode,
 the `great-docs skill` CLI, freshness checking, and the Python API — see
 [Agent Skills](38-agent-skills.qmd).
+
+## WebMCP [version-badge new 0.18]
+
+With [WebMCP](https://github.com/webmachinelearning/webmcp) turned on, every page registers
+read-only tools that an AI agent in the reader's browser can call to search and read the site.
+This is experimental and off by default. `webmcp: true` turns it on with the defaults below; use a
+mapping to change them:
+
+```{.yaml filename="docs/great-docs.yml"}
+webmcp:
+  enabled: true          # Register WebMCP tools on every page
+  actions: true          # Register tools that change the page (none yet)
+  js_api: true           # Expose the tools as window.greatDocs.tools
+  exclude_tools: []      # Tool names to leave out, such as [search_docs]
+  origin_trials: []      # Origin-trial tokens to add to every page
+```
+
+A page can opt out with `webmcp: false` in its front matter. For the tools, browser support,
+local testing and the JavaScript API, see [WebMCP](47-webmcp.qmd).
 
 ## Page Metadata [version-badge new 0.2]
 

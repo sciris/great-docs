@@ -10,10 +10,9 @@ from unittest.mock import patch
 import pytest
 from yaml12 import read_yaml
 
-from great_docs._api_diff import ApiSnapshot, ParameterInfo, SymbolInfo
-from great_docs._layout import Layout
-from great_docs._utils import QUARTO_YML_HEADER
-from great_docs._versioned_build import (
+from great_docs._api_evolution.model import ApiSnapshot, ParameterInfo, SymbolInfo
+from great_docs._project.layout import Layout
+from great_docs._versions.build import (
     _version_build_dir,
     assemble_site,
     create_version_aliases,
@@ -22,11 +21,12 @@ from great_docs._versioned_build import (
     run_versioned_build,
     write_version_map,
 )
-from great_docs._versioning import (
+from great_docs._versions.model import (
     VersionEntry,
     get_latest_version,
     parse_versions_config,
 )
+from great_docs._website import quarto_yml
 
 
 @pytest.mark.parametrize("directory", [".", "docs", "website"])
@@ -37,10 +37,11 @@ def test_layout_pipeline(tmp_path: Path, directory: str) -> None:
     config.write_text("module: sample\n")
     layout = Layout.make(tmp_path, config)
     layout.build_dir.mkdir(parents=True)
-    (layout.build_dir / "_quarto.yml").write_text(
-        QUARTO_YML_HEADER
-        + "project:\n  type: website\nwebsite:\n  site-url: https://example.com/docs\n"
-    )
+    quarto_config = {
+        "project": {"type": "website"},
+        "website": {"site-url": "https://example.com/docs"},
+    }
+    quarto_yml.write(layout.build_dir, quarto_config)
     (layout.build_dir / "index.qmd").write_text("# Home\n")
     (layout.build_dir / "old.qmd").write_text('---\nversions: ["v1.5.0"]\n---\nOld page\n')
 
@@ -49,12 +50,13 @@ def test_layout_pipeline(tmp_path: Path, directory: str) -> None:
             fake_quarto_render(build)
         return [(str(build), 0, "", "", []) for build in build_dirs]
 
-    with patch("great_docs._versioned_build.render_versions_parallel", side_effect=render):
+    with patch("great_docs._versions.build.render_versions_parallel", side_effect=render):
         result = run_versioned_build(
             layout.build_dir,
             tmp_path,
             ["2.0", "v1.5.0"],
             layout=layout,
+            quarto_config=quarto_config,
         )
     assert result["success"]
     assert (layout.site_dir / "v/1.5.0/old.html").is_file()
@@ -275,9 +277,11 @@ def run_mock_versioned_build(
 
     pages_by_version: dict[str, list[str]] = {}
     build_dirs: list[Path] = []
+    layout = Layout.make(project_root)
 
     for entry in ordered_targets:
         ver_dir = _version_build_dir(source_dir, entry, latest_tag)
+        quarto_config = quarto_yml.read(source_dir)
         pp_pages = preprocess_version(
             source_dir,
             ver_dir,
@@ -285,7 +289,10 @@ def run_mock_versioned_build(
             versions,
             project_root=project_root,
             section_configs=section_configs,
+            layout=layout,
+            quarto_config=quarto_config,
         )
+        quarto_yml.write(ver_dir, quarto_config)
         pages_by_version[entry.tag] = pp_pages
         build_dirs.append(ver_dir)
 
@@ -539,6 +546,16 @@ class TestSectionScoping:
             tmp_path,
             versions_config=["0.3", "0.2", "0.1"],
             pages={
+                "_quarto.yml": (
+                    "project:\n  type: website\n  output-dir: _site\n"
+                    "website:\n"
+                    "  title: Test Site\n"
+                    "  navbar:\n"
+                    "    left:\n"
+                    "      - text: Guide\n        href: user-guide/intro.qmd\n"
+                    "      - text: Recipes\n        href: recipes/01-basic.qmd\n"
+                    "      - text: Migrations\n        href: migrations/v03.qmd\n"
+                ),
                 "index.qmd": "---\ntitle: Home\n---\n\nHello.",
                 "user-guide/intro.qmd": "---\ntitle: Intro\n---\n\nGuide.",
                 "recipes/01-basic.qmd": "---\ntitle: Basic Recipe\n---\n\nRecipe.",
@@ -567,6 +584,18 @@ class TestSectionScoping:
         assert_page_exists(site["output_dir"], "user-guide/intro.html")
         assert_page_exists(site["output_dir"], "user-guide/intro.html", version="0.2")
         assert_page_exists(site["output_dir"], "user-guide/intro.html", version="0.1")
+
+    def test_navbar_links_only_to_included_sections(self, site):
+        def navbar_hrefs(entry: VersionEntry) -> list[str]:
+            build_dir = _version_build_dir(site["source_dir"], entry, site["latest_tag"])
+            quarto_config = read_yaml(build_dir / "_quarto.yml")
+            return [item["href"] for item in quarto_config["website"]["navbar"]["left"]]
+
+        assert {entry.tag: navbar_hrefs(entry) for entry in site["versions"]} == {
+            "0.3": ["user-guide/intro.qmd", "recipes/01-basic.qmd", "migrations/v03.qmd"],
+            "0.2": ["user-guide/intro.qmd", "recipes/01-basic.qmd"],
+            "0.1": ["user-guide/intro.qmd"],
+        }
 
 
 class TestInlineBadgesAndCallouts:
@@ -2135,12 +2164,22 @@ class TestVersionTitleSuffix:
         latest = get_latest_version(versions)
         latest_tag = latest.tag
 
-        from great_docs._versioned_build import _rewrite_quarto_yml_for_version
+        from great_docs._versions.build import _adjust_quarto_config_for_version
 
         for entry in versions:
             ver_dir = _version_build_dir(source_dir, entry, latest_tag)
-            preprocess_version(source_dir, ver_dir, entry, versions, project_root=project_root)
-            _rewrite_quarto_yml_for_version(ver_dir, entry, latest_tag)
+            quarto_config = quarto_yml.read(source_dir)
+            preprocess_version(
+                source_dir,
+                ver_dir,
+                entry,
+                versions,
+                project_root=project_root,
+                layout=Layout.make(project_root),
+                quarto_config=quarto_config,
+            )
+            _adjust_quarto_config_for_version(quarto_config, entry, latest_tag)
+            quarto_yml.write(ver_dir, quarto_config)
 
         return {
             "source_dir": source_dir,
@@ -2354,7 +2393,7 @@ class TestOverlappingSectionDirs:
             },
             section_configs=[
                 {"dir": "api", "versions": ["0.3", "0.2", "0.1"]},  # All versions
-                {"dir": "experimental", "versions": ["0.3"]},  # Only 0.3
+                {"dir": "api/experimental", "versions": ["0.3"]},  # Only 0.3
             ],
         )
 
@@ -2364,12 +2403,7 @@ class TestOverlappingSectionDirs:
         assert_page_exists(site["output_dir"], "api/core.html", version="0.1")
 
     def test_experimental_exclusion(self, site):
-        """
-        experimental/ is a subdir of api/ — the 'experimental' section config
-        should match its path component.
-        """
-        # The _in_excluded_section checks each path component, so
-        # api/experimental/new.qmd has "experimental" as a component
+        """Exclude the nested section from older versions that include its parent"""
         assert_page_exists(site["output_dir"], "api/experimental/new.html")
         assert_page_missing(site["output_dir"], "api/experimental/new.html", version="0.2")
         assert_page_missing(site["output_dir"], "api/experimental/new.html", version="0.1")

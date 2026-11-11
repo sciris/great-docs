@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import shlex
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import TypedDict
 
 
@@ -79,3 +80,30 @@ def quarto_render_command(*args: str, env: Mapping[str, str] | None = None) -> l
         env = os.environ
     extra = shlex.split(env.get(QUARTO_ARGS_ENV, ""))
     return ["quarto", "render", *args, *extra]
+
+
+@contextmanager
+def quarto_args_set(quarto_args: str | Sequence[str] | None) -> Iterator[None]:
+    """
+    Set `GREAT_DOCS_QUARTO_ARGS` for the duration of a build, then restore it
+
+    Every environment a build gives Quarto starts from this process's, so setting it here
+    reaches each render of the site, including parallel and versioned ones.
+
+    Parameters
+    ----------
+    quarto_args
+        The arguments, as one string or a list. `None` leaves the environment as it is.
+    """
+    if quarto_args is None:
+        yield
+        return
+    previous = os.environ.get(QUARTO_ARGS_ENV)
+    os.environ[QUARTO_ARGS_ENV] = join_quarto_args(quarto_args)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(QUARTO_ARGS_ENV, None)
+        else:
+            os.environ[QUARTO_ARGS_ENV] = previous

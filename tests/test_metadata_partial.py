@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import great_docs
+from great_docs._website import metadata_partial
 from great_docs.core import GreatDocs
 
 VENDORED = Path(great_docs.__file__).parent / "assets" / "metadata.html"
@@ -141,7 +142,7 @@ def test_title_line_applies_template_only_to_titled_pages(template: str, titled:
     name as `pagetitle`. The conditional therefore excludes surrounding
     template text from those pages.
     """
-    line = GreatDocs._build_title_template_line(None, template)  # type: ignore[arg-type]
+    line = metadata_partial.title_element(template)
 
     assert line == f"<title>$if(title-prefix)${titled}$else$$pagetitle$$endif$</title>"
 
@@ -149,7 +150,7 @@ def test_title_line_applies_template_only_to_titled_pages(template: str, titled:
 @pytest.mark.parametrize("template", ["{site_name}", "$pagetitle$", "{page_title} $ {site_name}"])
 def test_title_line_rejects_missing_page_placeholder_or_dollar(template: str):
     """Reject templates that omit `{page_title}` or contain `$`"""
-    assert GreatDocs._build_title_template_line(None, template) is None  # type: ignore[arg-type]
+    assert metadata_partial.title_element(template) is None
 
 
 @pytest.mark.parametrize("template", [None, False, 42, ["{page_title}"]])
@@ -160,7 +161,7 @@ def test_title_line_rejects_non_string_templates(template: object):
     YAML parses an empty `title_template:` as `None`. Treat every non-string
     value as unsupported so the build keeps Quarto's titles.
     """
-    assert GreatDocs._build_title_template_line(None, template) is None  # type: ignore[arg-type]
+    assert metadata_partial.title_element(template) is None
 
 
 def _write_partial(tmp_path: Path, yaml: str) -> tuple[GreatDocs, dict]:
@@ -181,9 +182,9 @@ def _write_partial(tmp_path: Path, yaml: str) -> tuple[GreatDocs, dict]:
     """
     (tmp_path / "great-docs.yml").write_text(yaml, encoding="utf-8")
     docs = GreatDocs(project_path=str(tmp_path))
-    docs.build_dir.mkdir(parents=True, exist_ok=True)
+    docs.layout.build_dir.mkdir(parents=True, exist_ok=True)
     config: dict = {"format": {"html": {}}}
-    docs._write_metadata_partial(config)
+    metadata_partial.write(config, docs._config, docs.layout, report=print)
     return docs, config
 
 
@@ -193,7 +194,7 @@ def test_partial_carries_translations_without_seo(tmp_path: Path):
         tmp_path, "site:\n  lang: fr\nseo:\n  enabled: false\nsocial_cards: false\n"
     )
 
-    partial = (docs.build_dir / "metadata.html").read_text(encoding="utf-8")
+    partial = (docs.layout.build_dir / "metadata.html").read_text(encoding="utf-8")
     assert config["format"]["html"]["template-partials"] == ["metadata.html"]
     assert '<meta name="gd-i18n" content="' in partial
     assert _without_title(partial)[:-1] == _without_title(VENDORED.read_text(encoding="utf-8"))
@@ -209,7 +210,7 @@ def test_bundled_partial_registered_without_options(tmp_path: Path) -> None:
     """
     docs, config = _write_partial(tmp_path, "seo:\n  enabled: false\nsocial_cards: false\n")
 
-    partial = (docs.build_dir / "metadata.html").read_text(encoding="utf-8")
+    partial = (docs.layout.build_dir / "metadata.html").read_text(encoding="utf-8")
     assert partial == VENDORED.read_text(encoding="utf-8")
     assert config["format"]["html"]["template-partials"] == ["metadata.html"]
 
@@ -220,7 +221,7 @@ def test_partial_carries_title_and_translations(tmp_path: Path):
         tmp_path, "site:\n  lang: fr\nseo:\n  title_template: '{site_name} - {page_title}'\n"
     )
 
-    partial = (docs.build_dir / "metadata.html").read_text(encoding="utf-8")
+    partial = (docs.layout.build_dir / "metadata.html").read_text(encoding="utf-8")
     assert "$title-prefix$ - $pagetitle$" in partial
     assert '<meta name="gd-i18n" content="' in partial
 
@@ -231,7 +232,7 @@ def test_partial_carries_og_type_without_seo(tmp_path: Path):
     """
     docs, config = _write_partial(tmp_path, "seo:\n  enabled: false\n")
 
-    partial = (docs.build_dir / "metadata.html").read_text(encoding="utf-8")
+    partial = (docs.layout.build_dir / "metadata.html").read_text(encoding="utf-8")
     assert config["format"]["html"]["template-partials"] == ["metadata.html"]
     assert partial.count('<meta property="og:type" content="website">') == 1
 
@@ -242,7 +243,7 @@ def test_partial_omits_og_type_without_social_cards(tmp_path: Path):
     """
     docs, _ = _write_partial(tmp_path, "social_cards: false\n")
 
-    partial = (docs.build_dir / "metadata.html").read_text(encoding="utf-8")
+    partial = (docs.layout.build_dir / "metadata.html").read_text(encoding="utf-8")
     assert "og:type" not in partial
 
 
@@ -257,7 +258,7 @@ def test_show_dates_registers_partial(tmp_path: Path) -> None:
         tmp_path, "show_dates: true\nseo:\n  enabled: false\nsocial_cards: false\n"
     )
 
-    partial = (docs.build_dir / "metadata.html").read_text(encoding="utf-8")
+    partial = (docs.layout.build_dir / "metadata.html").read_text(encoding="utf-8")
     assert config["format"]["html"]["template-partials"] == ["metadata.html"]
     assert partial.count("$for(gd-head-tags)$") == 1
     assert partial.count('<meta name="gd-build-time" content="') == 1

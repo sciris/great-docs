@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 from functools import partial
 from textwrap import indent
@@ -10,9 +11,12 @@ from typing import TYPE_CHECKING, Any, Callable, cast
 import griffe as gf
 from yaml12 import format_yaml
 
+from great_docs._translations import DEFAULT_LANGUAGE
 from great_docs.hooks._docstring_parsed import emit_docstring_parsed
 from great_docs.hooks._object_resolved import emit_object_resolved
 
+from ._exports import declared_exports
+from ._type_checks import is_enum
 from ._walkable import MISSING, MissingType, Walkable
 from .content import Doc, Link, MemberPage, Page, Section, Text
 from .introspect import resolve_alias
@@ -46,8 +50,6 @@ _BUILTIN_NOISE_DUNDERS = frozenset(
     }
 )
 
-_ENUM_BASES = frozenset({"Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ReprEnum", "EnumCheck"})
-
 if TYPE_CHECKING:
     from collections.abc import Generator
 
@@ -55,6 +57,12 @@ if TYPE_CHECKING:
     from .spec import SpecEntry
 
 _log = logging.getLogger(__name__)
+
+# The language of the API reference whose objects are being resolved. An
+# `object_resolved` handler receives only the object, yet the version callouts
+# translate their titles while it runs; this variable is the one way the
+# language reaches them.
+resolution_lang: ContextVar[str] = ContextVar("resolution_lang", default=DEFAULT_LANGUAGE)
 
 # Type alias for the griffe object loader callable used throughout this module.
 _GetObject = Callable[..., gf.Object | gf.Alias]
@@ -103,9 +111,16 @@ def _is_documented_dunder(name: str, obj: gf.Object | gf.Alias) -> bool:
 
 
 def _sections_from_package(mod: gf.Module) -> list[SpecSection]:
-    """Derive default API sections from a package module's exported members"""
+    """
+    Derive default API sections from a package module's exported members
+
+    Use declared export names when they can be resolved, including names from an
+    imported `__all__`. When an `__all__` expression cannot be resolved, use public
+    members without treating the expression's variable name as an export.
+    """
 
     has_all = "__all__" in mod.members
+    declared = declared_exports(mod)
 
     if not has_all:
         print(
@@ -115,15 +130,18 @@ def _sections_from_package(mod: gf.Module) -> list[SpecSection]:
             " functions it exports (and should be documented).\n"
         )
 
+    if declared is None:
+        names = [name for name in mod.members if not has_all or not name.startswith("_")]
+    else:
+        names = declared
+
     contents: list[SpecObject] = []
-    for name, member in mod.members.items():
+    for name in names:
+        member = mod.members.get(name)
+        if member is None:
+            continue
         external_alias = _is_external_alias(member, mod)
-        if (
-            external_alias
-            or member.is_module
-            or name.startswith("__")
-            or (has_all and not member.is_exported)
-        ):
+        if external_alias or member.is_module or name.startswith("__"):
             continue
 
         contents.append(SpecObject(name=name))
@@ -281,16 +299,33 @@ class Resolver:
         with self._scoped(package=el.package):
             return self._resolve_documented_object(el)
 
-    def _resolve_documented_object(self, el: SpecObject) -> Doc | None:
-        """Locate the subject object in griffe and rebuild it with its resolved members"""
+    def entry_object(self, section: SpecSection, el: SpecObject) -> gf.Object | gf.Alias:
+        """
+        Locate the griffe object an entry of a section documents, without resolving it
+
+        Looks the object up exactly as resolving the section would, but skips
+        the resolution hooks, docstring parsing and members.
+        """
+        with self._scoped(package=section.package, options=section.options):
+            with self._scoped(package=el.package):
+                path, el, dynamic = self._locate(el)
+                return self.get_object_or_raise(path, dynamic=dynamic)
+
+    def _locate(self, el: SpecObject) -> tuple[str, SpecObject, bool]:
+        """The lookup path, the entry with inherited options merged in, and its dynamic mode"""
         path = _join_path(self.current_package, el.name)
 
         # Merge inherited section-level options under the entry's own settings.
         el = el.with_defaults(self.options)
 
-        _log.info(f"Getting object for {path}")
-
         dynamic = el.dynamic if el.dynamic is not None else self.dynamic
+        return path, el, dynamic
+
+    def _resolve_documented_object(self, el: SpecObject) -> Doc | None:
+        """Locate the subject object in griffe and rebuild it with its resolved members"""
+        path, el, dynamic = self._locate(el)
+
+        _log.info(f"Getting object for {path}")
 
         # The subject object being documented (the class/module/function itself).
         obj = self.get_object_or_raise(path, dynamic=dynamic)
@@ -393,12 +428,7 @@ class Resolver:
         # Phase 2 — content filters: require resolved targets.
         # Enum members are always shown — their names and values are
         # inherently meaningful even without a per-member docstring.
-        is_enum_cls = (
-            obj.is_class
-            and isinstance(obj, (gf.Class, gf.Alias))
-            and {str(b).rsplit(".", 1)[-1] for b in obj.bases} & _ENUM_BASES
-        )
-        if not el.include_empty and not is_enum_cls:
+        if not el.include_empty and not is_enum(obj):
             candidates = {k: v for k, v in candidates.items() if v.docstring is not None}
 
         if not el.include_attributes:

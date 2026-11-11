@@ -45,3 +45,22 @@ def test_join_quarto_args():
     assert quarto_render_command(env={QUARTO_ARGS_ENV: join_quarto_args(args)})[2:] == args
     with pytest.raises(ValueError):
         join_quarto_args("--metadata 'title")
+
+
+def test_quarto_args_set(monkeypatch: pytest.MonkeyPatch):
+    """A build's arguments reach the environment only while it runs."""
+    import os
+
+    from great_docs._subprocess import quarto_args_set
+
+    monkeypatch.delenv(QUARTO_ARGS_ENV, raising=False)
+    with quarto_args_set(["--jobs", "4"]):
+        assert os.environ[QUARTO_ARGS_ENV] == "--jobs 4"
+    assert QUARTO_ARGS_ENV not in os.environ
+
+    monkeypatch.setenv(QUARTO_ARGS_ENV, "--keep-going")
+    with quarto_args_set(None):
+        assert os.environ[QUARTO_ARGS_ENV] == "--keep-going"
+    with quarto_args_set("--jobs 2"):
+        assert os.environ[QUARTO_ARGS_ENV] == "--jobs 2"
+    assert os.environ[QUARTO_ARGS_ENV] == "--keep-going"

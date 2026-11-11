@@ -14,7 +14,9 @@ from great_docs._skill_install import (
     install_skill,
     list_skills,
 )
+from great_docs._website.ai_agents.skills import SkillsWriter
 from great_docs._yaml import split_front_matter
+from tests.support import make_project
 
 # ---------------------------------------------------------------------------
 # detect_agents
@@ -405,6 +407,19 @@ class TestFindPackageSkills:
                 assert len(results) == 1
                 assert results[0].name == "SKILL.md"
 
+    def test_namespace_package_has_no_skills(self, tmp_path: Path, monkeypatch):
+        # A namespace package has `__file__ = None`, so skill discovery skips it.
+        import sys
+
+        skill = tmp_path / "ns_pkg" / "skills" / "ns-pkg"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("# Skill")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        try:
+            assert _find_package_skills("ns-pkg") == []
+        finally:
+            sys.modules.pop("ns_pkg", None)
+
     def test_package_without_skills_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
             pkg_dir = Path(tmp) / "bare_pkg"
@@ -493,7 +508,12 @@ class TestMultiSkillWellKnown:
             )
 
             docs = GreatDocs(project_path=tmp_dir)
-            docs._generate_skill_md()
+            SkillsWriter(
+                docs._config,
+                docs.layout,
+                make_project(docs).name,
+                make_project(docs).manifest,
+            ).write(None)
 
             # Check primary skill.md was created
             primary = great_docs_dir / "skill.md"
@@ -1122,6 +1142,25 @@ class TestCheckContentFreshness:
             result = _check_content_freshness("mypkg", "my-skill", "anyhash")
 
         assert result == "outdated"
+
+
+# ---------------------------------------------------------------------------
+# _get_package_version
+# ---------------------------------------------------------------------------
+
+
+class TestGetPackageVersion:
+    def test_installed_package(self):
+        """Return a version for an installed package"""
+        from great_docs._skill_install import _get_package_version
+
+        assert _get_package_version("pytest")
+
+    def test_missing_package_is_none(self):
+        """Return `None` for a missing package"""
+        from great_docs._skill_install import _get_package_version
+
+        assert _get_package_version("no-such-package-k91s") is None
 
 
 # ---------------------------------------------------------------------------

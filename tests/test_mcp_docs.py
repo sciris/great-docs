@@ -1,8 +1,9 @@
-"""Tests for _mcp_docs.py (pure page-generation functions) and _mcp_runner.py."""
+"""Tests for _mcpref/reference.py (pure page-generation functions) and _mcpref/runner.py."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import types
 from pathlib import Path
@@ -10,8 +11,9 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from mcp.shared.exceptions import MCPError
 
-from great_docs._mcp_docs import (
+from great_docs._mcpref.reference import (
     _dump,
     _extract_tools_from_source,
     _first_sentence,
@@ -21,15 +23,14 @@ from great_docs._mcp_docs import (
     _generate_resource_template_page,
     _generate_tool_page,
     _json_value,
-    _locate_server,
     _messages_for_prompt,
     _schema_type_display,
     categorize_tools,
     discover_mcp_server,
     generate_mcp_manifest,
     generate_mcp_reference_pages,
+    locate_server,
 )
-
 
 # ---------------------------------------------------------------------------
 # _dump
@@ -50,28 +51,16 @@ class TestDump:
         assert _dump(obj) == {"serverInfo": {"name": "my-server"}}
         obj.model_dump.assert_called_once_with(by_alias=True, exclude_none=True)
 
-    def test_falls_back_to_dict_when_model_dump_raises(self):
+    def test_serialisation_failure_propagates(self):
         obj = MagicMock(spec=["model_dump", "dict"])
-        obj.model_dump.side_effect = RuntimeError("fail")
+        obj.model_dump.side_effect = ValueError("cannot serialise")
         obj.dict.return_value = {"key": "val"}
-        assert _dump(obj) == {"key": "val"}
-
-    def test_returns_empty_when_no_serializer(self):
-        class Plain:
-            pass
-
-        assert _dump(Plain()) == {}
-
-    def test_returns_empty_when_dict_also_raises(self):
-        """When both model_dump and dict raise, returns {} (lines 203-204)."""
-        obj = MagicMock(spec=["model_dump", "dict"])
-        obj.model_dump.side_effect = RuntimeError("v2 fail")
-        obj.dict.side_effect = TypeError("v1 fail")
-        assert _dump(obj) == {}
+        with pytest.raises(ValueError, match="cannot serialise"):
+            _dump(obj)
 
 
 # ---------------------------------------------------------------------------
-# _locate_server
+# locate_server
 # ---------------------------------------------------------------------------
 
 
@@ -85,29 +74,36 @@ class TestLocateServer:
     def test_explicit_var_found(self):
         obj = object()
         mod = self._make_module(my_server=obj)
-        assert _locate_server(mod, "my_server") is obj
+        assert locate_server(mod, "my_server") is obj
 
     def test_explicit_var_missing_returns_none(self):
         mod = self._make_module()
-        assert _locate_server(mod, "missing_server") is None
+        assert locate_server(mod, "missing_server") is None
 
     def test_auto_detect_server_type(self):
         mock_server = MagicMock()
         type(mock_server).__name__ = "Server"
         type(mock_server).__module__ = "mcp.server"
         mod = self._make_module(srv=mock_server)
-        assert _locate_server(mod, None) is mock_server
+        assert locate_server(mod, None) is mock_server
 
     def test_auto_detect_fastmcp_type(self):
         mock_server = MagicMock()
         type(mock_server).__name__ = "FastMCP"
         type(mock_server).__module__ = "mcp.fastmcp"
         mod = self._make_module(app=mock_server)
-        assert _locate_server(mod, None) is mock_server
+        assert locate_server(mod, None) is mock_server
+
+    def test_auto_detect_mcpserver_type(self):
+        mock_server = MagicMock()
+        type(mock_server).__name__ = "MCPServer"
+        type(mock_server).__module__ = "mcp.server.mcpserver.server"
+        mod = self._make_module(app=mock_server)
+        assert locate_server(mod, None) is mock_server
 
     def test_auto_detect_nothing_returns_none(self):
         mod = self._make_module(x=23, y="hello")
-        assert _locate_server(mod, None) is None
+        assert locate_server(mod, None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -595,9 +591,9 @@ class TestExtractToolsFromSource:
         mod = types.ModuleType("fake")
         mod.__file__ = "<string>"
         # Patch inspect.getsource to return the given source
-        with patch("great_docs._mcp_docs.inspect") as mock_inspect:
+        with patch("great_docs._mcpref.reference.inspect") as mock_inspect:
             mock_inspect.getsource.return_value = source
-            from great_docs._mcp_docs import _extract_tools_from_source as fn
+            from great_docs._mcpref.reference import _extract_tools_from_source as fn
 
             return fn(mod)
 
@@ -630,8 +626,8 @@ Tool(name="tool_b", description="Second tool", inputSchema={})
 
     def test_returns_empty_on_getsource_error(self):
         mod = types.ModuleType("fake")
-        with patch("great_docs._mcp_docs.inspect.getsource", side_effect=OSError):
-            from great_docs._mcp_docs import _extract_tools_from_source as fn
+        with patch("great_docs._mcpref.reference.inspect.getsource", side_effect=OSError):
+            from great_docs._mcpref.reference import _extract_tools_from_source as fn
 
             assert fn(mod) == []
 
@@ -792,16 +788,41 @@ class TestGenerateMcpManifest:
 class TestDiscoverMcpServer:
     def test_returns_none_on_import_error(self):
         with patch(
-            "great_docs._mcp_docs.importlib.import_module", side_effect=ImportError("no module")
+            "great_docs._mcpref.reference.importlib.import_module",
+            side_effect=ImportError("no module"),
         ):
             result = discover_mcp_server("nonexistent.module")
         assert result is None
 
     def test_returns_none_when_no_server_found(self):
         mod = types.ModuleType("fake")
-        with patch("great_docs._mcp_docs.importlib.import_module", return_value=mod):
+        with patch("great_docs._mcpref.reference.importlib.import_module", return_value=mod):
             result = discover_mcp_server("fake")
         assert result is None
+
+    def test_lists_tools_of_an_mcpserver_over_the_protocol(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        (tmp_path / "probe_mcpserver.py").write_text(
+            "from mcp.server.mcpserver import MCPServer\n"
+            "\n"
+            'app = MCPServer("probe")\n'
+            "\n"
+            "\n"
+            "@app.tool()\n"
+            "def add(a: int, b: int) -> int:\n"
+            '    """Add numbers."""\n'
+            "    return a + b\n",
+            encoding="utf-8",
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+
+        info = discover_mcp_server("probe_mcpserver")
+
+        assert info is not None
+        assert info["name"] == "probe"
+        assert [tool["name"] for tool in info["tools"]] == ["add"]
 
     def test_protocol_failure_falls_back_to_static_scan(self):
         import inspect
@@ -814,7 +835,7 @@ class TestDiscoverMcpServer:
         mod.srv = mock_server
 
         with (
-            patch("great_docs._mcp_docs._introspect_via_protocol", return_value=None),
+            patch("great_docs._mcpref.reference._introspect_via_protocol", return_value=None),
             patch.object(inspect, "getsource", return_value=source),
             patch("importlib.import_module", return_value=mod),
         ):
@@ -841,8 +862,10 @@ class TestDiscoverMcpServer:
             "completions_enabled": False,
         }
 
-        with patch("great_docs._mcp_docs._introspect_via_protocol", return_value=protocol_info):
-            with patch("great_docs._mcp_docs.importlib.import_module", return_value=mod):
+        with patch(
+            "great_docs._mcpref.reference._introspect_via_protocol", return_value=protocol_info
+        ):
+            with patch("great_docs._mcpref.reference.importlib.import_module", return_value=mod):
                 result = discover_mcp_server("fake")
 
         assert result is not None
@@ -867,74 +890,31 @@ class TestDiscoverMcpServer:
             "completions_enabled": False,
         }
 
-        with patch("great_docs._mcp_docs._introspect_via_protocol", return_value=protocol_info):
-            with patch("great_docs._mcp_docs.importlib.import_module", return_value=mod):
+        with patch(
+            "great_docs._mcpref.reference._introspect_via_protocol", return_value=protocol_info
+        ):
+            with patch("great_docs._mcpref.reference.importlib.import_module", return_value=mod):
                 result = discover_mcp_server("fake")
 
         assert result["name"] == "fallback-name"
 
 
 # ---------------------------------------------------------------------------
-# _mcp_runner: _find_server
-# ---------------------------------------------------------------------------
-
-
-class TestFindServer:
-    def setup_method(self):
-        from great_docs._mcp_runner import _find_server
-
-        self._find_server = _find_server
-
-    def _make_module(self, **attrs) -> types.ModuleType:
-        mod = types.ModuleType("fake")
-        for k, v in attrs.items():
-            setattr(mod, k, v)
-        return mod
-
-    def test_explicit_var_found(self):
-        obj = object()
-        mod = self._make_module(my_server=obj)
-        assert self._find_server(mod, "my_server") is obj
-
-    def test_explicit_var_missing_returns_none(self):
-        mod = self._make_module()
-        assert self._find_server(mod, "missing") is None
-
-    def test_auto_detect_server(self):
-        mock_server = MagicMock()
-        type(mock_server).__name__ = "Server"
-        type(mock_server).__module__ = "mcp.server.lowlevel"
-        mod = self._make_module(srv=mock_server)
-        assert self._find_server(mod, None) is mock_server
-
-    def test_auto_detect_fastmcp(self):
-        mock_server = MagicMock()
-        type(mock_server).__name__ = "FastMCP"
-        type(mock_server).__module__ = "mcp.fastmcp"
-        mod = self._make_module(app=mock_server)
-        assert self._find_server(mod, None) is mock_server
-
-    def test_auto_detect_nothing_returns_none(self):
-        mod = self._make_module(x=23)
-        assert self._find_server(mod, None) is None
-
-
-# ---------------------------------------------------------------------------
-# _mcp_runner: _run
+# MCP server discovery
 # ---------------------------------------------------------------------------
 
 
 class TestMcpRunnerRun:
     def test_raises_system_exit_when_no_server(self):
-        from great_docs._mcp_runner import _run
+        from great_docs._mcpref.runner import _run
 
         mod = types.ModuleType("fake")
-        with patch("great_docs._mcp_runner.importlib.import_module", return_value=mod):
+        with patch("great_docs._mcpref.runner.importlib.import_module", return_value=mod):
             with pytest.raises(SystemExit):
                 asyncio.run(_run("fake.module", None))
 
     def test_calls_run_stdio_async_on_fastmcp(self):
-        from great_docs._mcp_runner import _run
+        from great_docs._mcpref.runner import _run
 
         mock_server = AsyncMock()
         mock_server.run_stdio_async = AsyncMock()
@@ -944,13 +924,13 @@ class TestMcpRunnerRun:
         mod = types.ModuleType("fake")
         mod.app = mock_server
 
-        with patch("great_docs._mcp_runner.importlib.import_module", return_value=mod):
+        with patch("great_docs._mcpref.runner.importlib.import_module", return_value=mod):
             asyncio.run(_run("fake.module", None))
 
         mock_server.run_stdio_async.assert_called_once()
 
     def test_explicit_server_var_used(self):
-        from great_docs._mcp_runner import _run
+        from great_docs._mcpref.runner import _run
 
         mock_server = AsyncMock()
         mock_server.run_stdio_async = AsyncMock()
@@ -960,28 +940,262 @@ class TestMcpRunnerRun:
         mod = types.ModuleType("fake")
         mod.named_server = mock_server
 
-        with patch("great_docs._mcp_runner.importlib.import_module", return_value=mod):
+        with patch("great_docs._mcpref.runner.importlib.import_module", return_value=mod):
             asyncio.run(_run("fake.module", "named_server"))
 
         mock_server.run_stdio_async.assert_called_once()
 
+    def test_runs_low_level_server_with_initialization_options(self):
+        from great_docs._mcpref.runner import _run
+
+        server = MagicMock(spec=["run", "create_initialization_options"])
+        server.run = AsyncMock()
+        mod = types.ModuleType("fake")
+        mod.server = server
+
+        @contextlib.asynccontextmanager
+        async def fake_stdio_server():
+            yield "read", "write"
+
+        # The second patch replaces the import function that `patch` uses to
+        # resolve targets. Apply the stdio patch first.
+        with (
+            patch("mcp.server.stdio.stdio_server", fake_stdio_server),
+            patch("great_docs._mcpref.runner.importlib.import_module", return_value=mod),
+        ):
+            asyncio.run(_run("fake.module", "server"))
+
+        server.run.assert_awaited_once_with(
+            "read", "write", server.create_initialization_options.return_value
+        )
+
 
 # ---------------------------------------------------------------------------
-# _introspect_via_protocol exception path
+# _introspect_via_protocol
 # ---------------------------------------------------------------------------
+
+_LOW_LEVEL_SERVER = """
+from mcp import types
+from mcp.server import Server
+
+
+async def list_tools(ctx, params=None):
+    tool = types.Tool(name="add", description="Add numbers.", input_schema={"type": "object"})
+    return types.ListToolsResult(tools=[tool])
+
+
+async def list_prompts(ctx, params=None):
+    argument = types.PromptArgument(name="topic", required=True)
+    prompt = types.Prompt(name="explain", description="Explain.", arguments=[argument])
+    return types.ListPromptsResult(prompts=[prompt])
+
+
+async def get_prompt(ctx, params):
+    topic = (params.arguments or {})["topic"]
+    content = types.TextContent(type="text", text=f"Explain {topic}")
+    return types.GetPromptResult(messages=[types.PromptMessage(role="user", content=content)])
+
+
+async def list_resources(ctx, params=None):
+    resource = types.Resource(uri="probe://config", name="config", mime_type="text/plain")
+    return types.ListResourcesResult(resources=[resource])
+
+
+async def list_resource_templates(ctx, params=None):
+    template = types.ResourceTemplate(uri_template="probe://items/{id}", name="item")
+    return types.ListResourceTemplatesResult(resource_templates=[template])
+
+
+server = Server(
+    "probe",
+    instructions="  Start here.  ",
+    on_list_tools=list_tools,
+    on_list_prompts=list_prompts,
+    on_get_prompt=get_prompt,
+    on_list_resources=list_resources,
+    on_list_resource_templates=list_resource_templates,
+)
+"""
 
 
 class TestIntrospectViaProtocol:
-    def test_returns_none_when_collect_raises(self):
-        from great_docs._mcp_docs import _introspect_via_protocol
+    def test_reads_a_low_level_server_over_the_protocol(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        from great_docs._mcpref.reference import _introspect_via_protocol
 
-        async def _bad_coro(*args, **kwargs):
-            raise RuntimeError("connection refused")
+        (tmp_path / "probe_server.py").write_text(_LOW_LEVEL_SERVER, encoding="utf-8")
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))
 
-        with patch("great_docs._mcp_docs._collect_over_protocol", _bad_coro):
+        info = _introspect_via_protocol("probe_server", "server")
+
+        assert info is not None
+        assert info["name"] == "probe"
+        assert info["instructions"] == "Start here."
+        assert [tool["name"] for tool in info["tools"]] == ["add"]
+        assert info["resources"][0]["mime_type"] == "text/plain"
+        assert info["resource_templates"][0]["uri_template"] == "probe://items/{id}"
+        # The required prompt argument makes the preview use a placeholder value.
+        assert info["prompts"][0]["messages"] == [{"role": "user", "text": "Explain <topic>"}]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            # Nested groups reproduce how AnyIO reports a server connection failure.
+            ExceptionGroup(
+                "outer", [ExceptionGroup("inner", [MCPError(-32000, "Connection closed")])]
+            ),
+            TimeoutError("no answer"),
+            OSError("cannot start"),
+        ],
+        ids=["protocol-error-in-task-groups", "timeout", "os-error"],
+    )
+    def test_expected_failure_falls_back(
+        self, error: Exception, capsys: pytest.CaptureFixture[str]
+    ):
+        from great_docs._mcpref.reference import _introspect_via_protocol
+
+        async def failing(*args: Any) -> None:
+            raise error
+
+        with patch("great_docs._mcpref.reference._collect_over_protocol", failing):
             result = _introspect_via_protocol("fake.module", None)
 
         assert result is None
+        message = "Connection closed" if isinstance(error, ExceptionGroup) else str(error)
+        assert (
+            f"Could not introspect MCP server over protocol: {message}" in capsys.readouterr().out
+        )
+
+    def test_missing_mcp_falls_back(self):
+        from great_docs._mcpref.reference import _introspect_via_protocol
+
+        with patch.dict("sys.modules", {"mcp.shared.exceptions": None}):
+            assert _introspect_via_protocol("fake.module", None) is None
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RuntimeError("bug"),
+            ExceptionGroup("outer", [MCPError(-32000, "Connection closed"), RuntimeError("bug")]),
+        ],
+        ids=["bare", "beside-a-protocol-error"],
+    )
+    def test_unexpected_error_propagates(self, error: Exception):
+        from great_docs._mcpref.reference import _introspect_via_protocol
+
+        async def failing(*args: Any) -> None:
+            raise error
+
+        with patch("great_docs._mcpref.reference._collect_over_protocol", failing):
+            with pytest.raises(type(error)):
+                _introspect_via_protocol("fake.module", None)
+
+
+# ---------------------------------------------------------------------------
+# Protocol listing helpers
+# ---------------------------------------------------------------------------
+
+
+class TestListHelpers:
+    def test_list_tools_follows_the_next_cursor(self):
+        from great_docs._mcpref.reference import _list_tools
+
+        session = MagicMock()
+        session.list_tools = AsyncMock(
+            side_effect=[
+                {"tools": [{"name": "first"}], "nextCursor": "page-2"},
+                {"tools": [{"name": "second"}]},
+            ]
+        )
+
+        tools = asyncio.run(_list_tools(session))
+
+        assert [tool["name"] for tool in tools] == ["first", "second"]
+        assert session.list_tools.await_args_list[0].kwargs == {"params": None}
+        assert session.list_tools.await_args_list[1].kwargs["params"].cursor == "page-2"
+
+    @pytest.mark.parametrize(
+        "method", ["list_resources", "list_resource_templates", "list_prompts"]
+    )
+    @pytest.mark.parametrize(
+        "error",
+        [MCPError(-32601, "Method not found"), TimeoutError()],
+        ids=["protocol-error", "timeout"],
+    )
+    def test_protocol_error_or_timeout_lists_nothing(self, method: str, error: Exception):
+        from great_docs._mcpref import reference
+
+        session = MagicMock()
+        setattr(session, method, AsyncMock(side_effect=error))
+
+        assert asyncio.run(getattr(reference, f"_{method}")(session)) == []
+
+    @pytest.mark.parametrize(
+        "method", ["list_resources", "list_resource_templates", "list_prompts"]
+    )
+    def test_unexpected_error_from_a_list_call_propagates(self, method: str):
+        from great_docs._mcpref import reference
+
+        session = MagicMock()
+        setattr(session, method, AsyncMock(side_effect=RuntimeError("bug")))
+
+        with pytest.raises(RuntimeError, match="bug"):
+            asyncio.run(getattr(reference, f"_{method}")(session))
+
+    @pytest.mark.parametrize(
+        "error",
+        [MCPError(-32602, "topic is required"), TimeoutError()],
+        ids=["protocol-error", "timeout"],
+    )
+    def test_prompt_preview_retries_with_placeholder_arguments(self, error: Exception):
+        from great_docs._mcpref.reference import _get_prompt_messages
+
+        message = {"role": "user", "content": {"type": "text", "text": "Explain <topic>"}}
+        session = MagicMock()
+        session.get_prompt = AsyncMock(side_effect=[error, {"messages": [message]}])
+
+        messages = asyncio.run(_get_prompt_messages(session, "explain", ["topic"]))
+
+        assert messages == [message]
+        assert session.get_prompt.await_args_list[1].args == ("explain", {"topic": "<topic>"})
+
+    def test_prompt_preview_is_empty_when_every_attempt_fails(self):
+        from great_docs._mcpref.reference import _get_prompt_messages
+
+        session = MagicMock()
+        session.get_prompt = AsyncMock(side_effect=MCPError(-32602, "topic is required"))
+
+        assert asyncio.run(_get_prompt_messages(session, "explain", ["topic"])) == []
+        assert session.get_prompt.await_count == 2
+
+    def test_prompt_that_asks_for_input_has_no_preview(self):
+        from mcp.types import InputRequiredResult
+
+        from great_docs._mcpref.reference import _get_prompt_messages
+
+        # The client requires callers to opt in to responses that request
+        # user input. Match that requirement in the fake.
+        async def get_prompt(
+            name: str, arguments: dict[str, str], *, allow_input_required: bool = False
+        ) -> InputRequiredResult:
+            if not allow_input_required:
+                raise RuntimeError("Server returned InputRequiredResult")
+            return InputRequiredResult(request_state="awaiting-topic")
+
+        session = MagicMock()
+        session.get_prompt = get_prompt
+
+        assert asyncio.run(_get_prompt_messages(session, "explain", ["topic"])) == []
+
+    def test_unexpected_error_from_a_prompt_preview_propagates(self):
+        from great_docs._mcpref.reference import _get_prompt_messages
+
+        session = MagicMock()
+        session.get_prompt = AsyncMock(side_effect=RuntimeError("bug"))
+
+        with pytest.raises(RuntimeError, match="bug"):
+            asyncio.run(_get_prompt_messages(session, "explain", []))
 
 
 # ---------------------------------------------------------------------------

@@ -6,10 +6,11 @@ import json
 import re
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from yaml12 import write_yaml
 
-from ._layout import Layout
+from ._project.layout import Layout
 
 _SEEALSO_RE = re.compile(
     r"^[^\S\r\n]*%seealso[^\S\r\n]+(.+?)[^\S\r\n]*$",
@@ -91,91 +92,31 @@ QUARTO_YML_HEADER = (
 )
 
 
-def write_quarto_yml(path: Path, config: dict) -> None:
+def write_quarto_yml(path: Path, config: dict[str, Any]) -> None:
     """
     Write a build directory's Quarto configuration as a generated file
 
     The file begins with `QUARTO_YML_HEADER`, so the directory still passes the
-    ownership check that guards every later build step.
+    ownership check that guards every later build step. Its last top-level key is
+    `api-reference`, wherever that key sits in `config`.
 
     Parameters
     ----------
     path
         The `_quarto.yml` file to write.
     config
-        The Quarto configuration.
+        The Quarto configuration, left unchanged.
 
     Returns
     -------
     :
     """
+    ordered = {key: value for key, value in config.items() if key != "api-reference"}
+    if "api-reference" in config:
+        ordered["api-reference"] = config["api-reference"]
     with open(path, "w", encoding="utf-8") as f:
         f.write(QUARTO_YML_HEADER)
-        write_yaml(config, f)
-
-
-def merge_quarto_overrides(config: dict, overrides: dict) -> dict:
-    """
-    Deep merge user overrides into a Quarto configuration
-
-    Mappings present on both sides merge key by key; any other value (a list,
-    a scalar) replaces the original; a `None` value removes the key. Neither
-    argument is mutated.
-
-    Parameters
-    ----------
-    config
-        The generated Quarto configuration.
-    overrides
-        The user's settings, which take precedence.
-
-    Returns
-    -------
-    dict
-        The merged configuration.
-    """
-    result = dict(config)
-    for key, value in overrides.items():
-        if value is None:
-            result.pop(key, None)
-        elif isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = merge_quarto_overrides(result[key], value)
-        else:
-            result[key] = value
-    return result
-
-
-GREAT_DOCS_SCSS = "great-docs.scss"
-
-
-def with_great_docs_scss(theme: str | list | dict, position: int | None = None) -> str | list | dict:
-    """
-    Add great-docs' stylesheet to a Quarto `theme` value
-
-    Handles each form `theme` takes: a theme name, a list of themes and SCSS
-    files, or a mapping of such values by mode (`light`, `dark`). A value that
-    already includes the stylesheet is returned unchanged.
-
-    Parameters
-    ----------
-    theme
-        The `format.html.theme` value.
-    position
-        Where to insert the stylesheet in each list; `None` appends it, so it
-        overrides the rest, while `1` puts it right after the base theme, so
-        the user's own SCSS files override it.
-
-    Returns
-    -------
-    str | list | dict
-        The theme value with the stylesheet added.
-    """
-    if isinstance(theme, dict):
-        return {mode: with_great_docs_scss(value, position) for mode, value in theme.items()}
-    themes = [theme] if isinstance(theme, str) else list(theme)
-    if GREAT_DOCS_SCSS not in themes:
-        themes.insert(len(themes) if position is None else position, GREAT_DOCS_SCSS)
-    return themes
+        write_yaml(ordered, f)
 
 
 GITIGNORE_CONTENT = """# Great Docs build directory

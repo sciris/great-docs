@@ -3,14 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from pydantic import AnyUrl
+from mcp.types import (
+    CallToolRequestParams,
+    CompletionArgument,
+    CompletionContext,
+    PromptReference,
+    ResourceTemplateReference,
+)
 
 import great_docs.mcp as mcp_module
+from great_docs._project import Project
+from great_docs._project.layout import Layout
 from great_docs._utils import QUARTO_YML_HEADER
+from great_docs._yaml import split_front_matter
+from great_docs.config import ConfigError
 from great_docs.mcp import (
     _build_output_dirs,
     _get_project_root,
@@ -31,6 +44,33 @@ from great_docs.mcp import (
     list_tools,
     read_resource,
 )
+from tests.support import mock_config, write_pyproject
+
+
+def _reading_project(
+    exports: MagicMock, root: Path
+) -> Callable[[str | None, str | None], MagicMock]:
+    """
+    Create a lookup that attaches current project facts to an export discovery mock
+
+    Parameters
+    ----------
+    exports
+        The mock to return, with the configuration used to read the project.
+    root
+        The project directory.
+
+    Returns
+    -------
+    :
+        A replacement for the server's lookup of the selected project's exports.
+    """
+
+    def get(project_path: str | None, config_path: str | None) -> MagicMock:
+        exports.project = Project.make(exports.config, Layout.make(root))
+        return exports
+
+    return get
 
 
 def test_tool_schemas_accept_config_selection() -> None:
@@ -90,17 +130,15 @@ def test_preview_command_quotes_paths(tmp_path: Path) -> None:
 def test_page_completion_uses_selected_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from types import SimpleNamespace
-
-    from mcp.types import CompletionArgument, ResourceTemplateReference
-
     (tmp_path / "website").mkdir()
     config = tmp_path / "website/settings.yml"
     config.write_text("{}\n")
     (tmp_path / "website/guide.qmd").write_text("Guide\n")
     (tmp_path / "unrelated.qmd").write_text("Unrelated\n")
     monkeypatch.chdir(tmp_path)
-    context = SimpleNamespace(arguments={"project_path": str(tmp_path), "config_path": str(config)})
+    context = CompletionContext(
+        arguments={"project_path": str(tmp_path), "config_path": str(config)}
+    )
     result = asyncio.run(
         handle_completion(
             ResourceTemplateReference(type="ref/resource", uri="gd://page/{path}"),
@@ -242,6 +280,52 @@ class TestCallTool:
             result = asyncio.run(call_tool("gd_build", {}))
         assert result.is_error is True
 
+    def test_configuration_error_returns_error_text(self):
+        error = ConfigError("great-docs.yml: parser: 'nope' is not one of numpy, google, sphinx.")
+        with patch("great_docs.mcp._handle_scan", side_effect=error):
+            result = asyncio.run(call_tool("gd_scan", {}))
+        assert result.is_error is True
+        assert result[0].text == f"Error: {error}"
+
+    def test_unexpected_error_in_handler_propagates(self):
+        with patch("great_docs.mcp._handle_scan", side_effect=ZeroDivisionError("bug")):
+            with pytest.raises(ZeroDivisionError):
+                asyncio.run(call_tool("gd_scan", {}))
+
+    def test_missing_required_argument_returns_error_text(self):
+        with patch("great_docs.mcp._handle_add_page") as handler:
+            result = asyncio.run(call_tool("gd_add_page", {"section": "recipes"}))
+        handler.assert_not_called()
+        assert result.is_error is True
+        assert result[0].text == "Error: missing required argument: title"
+
+    def test_wrongly_typed_argument_returns_error_text(self):
+        with patch("great_docs.mcp._handle_lint") as handler:
+            result = asyncio.run(call_tool("gd_lint", {"checks": 5}))
+        handler.assert_not_called()
+        assert result.is_error is True
+        assert result[0].text == "Error: invalid argument checks: 5 is not of type 'array'"
+
+    def test_wrongly_typed_item_names_its_position(self):
+        result = asyncio.run(call_tool("gd_lint", {"checks": ["style", 5]}))
+        assert result.is_error is True
+        assert result[0].text.splitlines() == [
+            "Error: invalid argument checks[1]: 5 is not of type 'string'",
+            "Error: invalid argument checks[1]: 5 is not one of "
+            "['docstrings', 'cross-refs', 'style', 'directives', 'stale-versions']",
+        ]
+
+    def test_every_invalid_argument_is_reported(self):
+        with patch("great_docs.mcp._handle_add_page") as handler:
+            result = asyncio.run(call_tool("gd_add_page", {"section": "bogus"}))
+        handler.assert_not_called()
+        assert result.is_error is True
+        assert result[0].text.splitlines() == [
+            "Error: missing required argument: title",
+            "Error: invalid argument section: 'bogus' is not one of "
+            "['user_guide', 'recipes', 'custom']",
+        ]
+
     def test_successful_call_does_not_mark_is_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -250,22 +334,21 @@ class TestCallTool:
         assert getattr(result, "is_error", False) is False
 
 
-@pytest.mark.skipif(
-    mcp_module._MCP_V1, reason="_on_call_tool only exists on the mcp v2 handler path"
-)
 class TestOnCallToolIsError:
     """CallToolResult.is_error must reflect a failed dispatch (issue: it never did)."""
 
-    def _params(self, name: str, arguments: dict):
-        params = MagicMock()
-        params.name = name
-        params.arguments = arguments
-        return params
+    def _params(self, name: str, arguments: dict[str, Any]) -> CallToolRequestParams:
+        return CallToolRequestParams(name=name, arguments=arguments)
 
     def test_unknown_tool_sets_is_error(self):
         result = asyncio.run(mcp_module._on_call_tool(None, self._params("bogus_tool_name", {})))
         assert result.is_error is True
         assert "Unknown tool" in result.content[0].text
+
+    def test_invalid_argument_sets_is_error(self):
+        result = asyncio.run(mcp_module._on_call_tool(None, self._params("gd_lint", {"checks": 5})))
+        assert result.is_error is True
+        assert "checks" in result.content[0].text
 
     def test_handler_exception_sets_is_error(self):
         params = self._params("gd_build", {"project_path": "/does/not/exist"})
@@ -278,6 +361,149 @@ class TestOnCallToolIsError:
         monkeypatch.chdir(tmp_path)
         result = asyncio.run(mcp_module._on_call_tool(None, self._params("gd_status", {})))
         assert result.is_error is False
+
+
+class TestServerRequests:
+    """MCP request handling through an in-process client"""
+
+    def _ask(self, request: Callable[[Any], Any]) -> Any:
+        """Send a client request and return the protocol result"""
+        from mcp.client import Client
+
+        async def run() -> Any:
+            # Legacy mode exercises the initialisation handshake and JSON-RPC
+            # messages used over stdio.
+            async with Client(mcp_module.server, mode="legacy") as client:
+                return await request(client)
+
+        return asyncio.run(run())
+
+    def test_initialisation_advertises_instructions(self):
+        async def instructions(client: Any) -> str | None:
+            return client.instructions
+
+        assert self._ask(instructions) == mcp_module._INSTRUCTIONS
+
+    def test_lists_capabilities(self):
+        async def names(client: Any) -> dict[str, list[str]]:
+            return {
+                "tools": [tool.name for tool in (await client.list_tools()).tools],
+                "prompts": [prompt.name for prompt in (await client.list_prompts()).prompts],
+                "resources": [
+                    str(resource.uri) for resource in (await client.list_resources()).resources
+                ],
+                "templates": [
+                    template.uri_template
+                    for template in (await client.list_resource_templates()).resource_templates
+                ],
+            }
+
+        result = self._ask(names)
+        assert result["tools"] == [tool.name for tool in asyncio.run(list_tools())]
+        assert result["prompts"] == [prompt.name for prompt in asyncio.run(list_prompts())]
+        assert result["resources"] == [str(r.uri) for r in asyncio.run(list_resources())]
+        assert result["templates"] == [
+            template.uri_template for template in asyncio.run(list_resource_templates())
+        ]
+
+    def test_call_tool_reports_whether_the_call_failed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        unknown = self._ask(lambda client: client.call_tool("bogus_tool_name", {}))
+        status = self._ask(lambda client: client.call_tool("gd_status", {}))
+        assert unknown.is_error is True
+        assert unknown.content[0].text == "Unknown tool: bogus_tool_name"
+        assert status.is_error is False
+        assert status.content[0].text.startswith(f"Project: {tmp_path.name}")
+
+    def test_get_prompt_returns_the_prompt(self):
+        result = self._ask(
+            lambda client: client.get_prompt("write-user-guide", {"topic": "Installation"})
+        )
+        assert "Installation" in result.messages[0].content.text
+
+    def test_read_resource_returns_text(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        result = self._ask(lambda client: client.read_resource("gd://config"))
+        expected = asyncio.run(read_resource("gd://config"))
+        assert [(str(c.uri), c.text) for c in result.contents] == [("gd://config", expected)]
+
+    def test_completion_returns_suggestions(self):
+        ref = PromptReference(type="ref/prompt", name="write-user-guide")
+        result = self._ask(lambda client: client.complete(ref, {"name": "audience", "value": "b"}))
+        assert result.completion.values == ["beginner"]
+
+    def test_completion_uses_context_arguments(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        project = tmp_path / "project"
+        (project / "user_guide").mkdir(parents=True)
+        (project / "user_guide/intro.qmd").write_text("Intro\n")
+        monkeypatch.chdir(tmp_path)
+        ref = ResourceTemplateReference(type="ref/resource", uri="gd://page/{path}")
+        result = self._ask(
+            lambda client: client.complete(
+                ref, {"name": "path", "value": ""}, context_arguments={"project_path": str(project)}
+            )
+        )
+        assert result.completion.values == ["user_guide/intro.qmd"]
+
+    def test_completion_without_suggestions_is_empty(self):
+        ref = PromptReference(type="ref/prompt", name="no-such-prompt")
+        result = self._ask(lambda client: client.complete(ref, {"name": "topic", "value": ""}))
+        assert result.completion.values == []
+
+
+# ---------------------------------------------------------------------------
+# Server entry point
+# ---------------------------------------------------------------------------
+
+
+def test_server_answers_a_client_over_stdio():
+    import sys
+
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    async def list_tool_names() -> list[str]:
+        params = StdioServerParameters(command=sys.executable, args=["-m", "great_docs.mcp"])
+        async with stdio_client(params) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await asyncio.wait_for(session.initialize(), 30)
+                result = await asyncio.wait_for(session.list_tools(), 30)
+        return [tool.name for tool in result.tools]
+
+    assert "gd_build" in asyncio.run(list_tool_names())
+
+
+def test_run_mcp_server_serves_stdio_until_input_ends(monkeypatch: pytest.MonkeyPatch):
+    from contextlib import asynccontextmanager
+
+    import anyio
+    from mcp import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+
+    async def list_tool_names() -> list[str]:
+        async with create_client_server_memory_streams() as (client_streams, server_streams):
+
+            @asynccontextmanager
+            async def memory_stdio():
+                yield server_streams
+
+            monkeypatch.setattr(mcp_module, "stdio_server", memory_stdio)
+            with anyio.fail_after(30):
+                async with anyio.create_task_group() as task_group:
+                    task_group.start_soon(mcp_module.run_mcp_server)
+                    async with ClientSession(*client_streams) as session:
+                        await session.initialize()
+                        result = await session.list_tools()
+                    # The server returns on end-of-input; close the client's output
+                    # to let it finish.
+                    await client_streams[1].aclose()
+        return [tool.name for tool in result.tools]
+
+    assert "gd_build" in asyncio.run(list_tool_names())
 
 
 # ---------------------------------------------------------------------------
@@ -354,15 +580,15 @@ class TestHandleStatus:
     ):
         (tmp_path / "great-docs.yml").write_text("project:\n  name: test\n", encoding="utf-8")
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypackage"
-        mock_docs._config.cli_enabled = False
-        mock_docs._config.mcp_enabled = False
-        mock_docs._config.__getitem__ = lambda self, key: (
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, "mypackage")
+        mock_exports.config = mock_config(cli_enabled=False, mcp_enabled=False, sections=[])
+        mock_exports.config.__getitem__ = lambda self, key: (
             [] if key in ("user_guide", "versions") else None
         )
-        mock_docs._config.sections = []
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, Path.cwd())
+        ):
             result = asyncio.run(_handle_status({}))
         assert "✓" in result[0].text
 
@@ -391,6 +617,15 @@ class TestHandleAddPage:
         result = asyncio.run(_handle_add_page({"title": "My Guide"}))
         assert (tmp_path / "user_guide" / "my-guide.qmd").exists()
         assert "Created page" in result[0].text
+
+    def test_creates_user_guide_page_in_the_configured_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "great-docs.yml").write_text("user_guide: guides\n", encoding="utf-8")
+        (tmp_path / "guides").mkdir()
+        asyncio.run(_handle_add_page({"title": "My Guide"}))
+        assert (tmp_path / "guides" / "my-guide.qmd").exists()
 
     def test_creates_recipes_page(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
@@ -422,7 +657,7 @@ class TestHandleAddPage:
         monkeypatch.chdir(tmp_path)
         asyncio.run(_handle_add_page({"title": "Hello World"}))
         content = (tmp_path / "user_guide" / "hello-world.qmd").read_text(encoding="utf-8")
-        assert 'title: "Hello World"' in content
+        assert "title: Hello World\n" in content
 
     def test_initial_content_written_to_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
@@ -462,6 +697,17 @@ class TestCallToolDispatch:
         result = asyncio.run(call_tool("gd_add_page", {"title": "Test"}))
         assert "Created" in result[0].text
 
+    def test_gd_add_page_quotes_the_title(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Preserve quotes and colons in the MCP page title after a YAML round trip"""
+        monkeypatch.chdir(tmp_path)
+        title = 'Say "hi": now'
+
+        result = asyncio.run(call_tool("gd_add_page", {"title": title}))
+
+        created = result[0].text.split("Created page: ")[1].splitlines()[0]
+        front_matter, _ = split_front_matter((tmp_path / created).read_text(encoding="utf-8"))
+        assert front_matter.get("title") == title
+
     def test_dispatches_gd_build(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
         mock_docs = MagicMock()
@@ -472,9 +718,11 @@ class TestCallToolDispatch:
 
     def test_dispatches_gd_scan(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = None
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, None)
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, tmp_path)
+        ):
             result = asyncio.run(call_tool("gd_scan", {}))
         assert result[0].text
 
@@ -482,15 +730,17 @@ class TestCallToolDispatch:
         monkeypatch.chdir(tmp_path)
         mock_result = MagicMock()
         mock_result.issues = []
-        with patch("great_docs._lint.run_lint", return_value=mock_result):
+        with patch("great_docs._checks.lint.run_lint", return_value=mock_result):
             result = asyncio.run(call_tool("gd_lint", {}))
         assert result[0].text
 
     def test_dispatches_gd_api_diff(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = None
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, None)
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, Path.cwd())
+        ):
             result = asyncio.run(call_tool("gd_api_diff", {}))
         assert result[0].text
 
@@ -520,10 +770,30 @@ class TestHandleBuild:
 
         mock_docs = MagicMock()
         mock_docs.build = MagicMock()
+        mock_docs.layout = Layout.make(tmp_path)
         with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
             asyncio.run(_handle_build({"clean": True}))
 
         assert not old_dir.exists()
+
+    def test_clean_keeps_a_foreign_build_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "great-docs").mkdir()
+        (tmp_path / "great-docs" / "notes.md").write_text("mine\n")
+        old_dir = tmp_path / "great-docs-0.1"
+        old_dir.mkdir()
+        (old_dir / "_quarto.yml").write_text(QUARTO_YML_HEADER + "project:\n  type: website\n")
+
+        mock_docs = MagicMock()
+        mock_docs.layout = Layout.make(tmp_path)
+        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+            with pytest.raises(ValueError, match="not a Great Docs-generated"):
+                asyncio.run(_handle_build({"clean": True}))
+
+        assert old_dir.is_dir()
+        mock_docs.build.assert_not_called()
 
     def test_explicit_project_path(self, tmp_path: Path):
         mock_docs = MagicMock()
@@ -531,6 +801,23 @@ class TestHandleBuild:
         with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
             result = asyncio.run(_handle_build({"project_path": str(tmp_path)}))
         assert "Build complete" in result[0].text
+
+    def test_failed_build_returns_error_with_log(self, tmp_path: Path):
+        """Return the failure message and build log in an MCP error response"""
+        from great_docs import BuildError
+
+        def fail() -> None:
+            print("Step 16 FAIL Quarto render failed")
+            raise BuildError("Quarto render failed")
+
+        mock_docs = MagicMock()
+        mock_docs.build = MagicMock(side_effect=fail)
+        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+            result = asyncio.run(call_tool("gd_build", {"project_path": str(tmp_path)}))
+
+        assert getattr(result, "is_error", False)
+        assert result[0].text.startswith("Build failed: Quarto render failed")
+        assert "Step 16 FAIL Quarto render failed" in result[0].text
 
 
 # ---------------------------------------------------------------------------
@@ -541,53 +828,58 @@ class TestHandleBuild:
 class TestHandleScan:
     def test_no_package_name_returns_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = None
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, None)
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, tmp_path)
+        ):
             result = asyncio.run(_handle_scan({}))
         assert "Could not detect" in result[0].text
 
     def test_no_exports_returns_message(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
-        mock_docs._get_package_exports.return_value = []
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.config = mock_config()
+        mock_exports.names.return_value = []
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, tmp_path)
+        ):
             result = asyncio.run(_handle_scan({}))
         assert "No exports" in result[0].text
 
     def test_with_function_exports(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
-        mock_docs._get_package_exports.return_value = ["do_thing", "helper"]
-        mock_docs._categorize_api_objects.return_value = {
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.config = mock_config()
+        mock_exports.names.return_value = ["do_thing", "helper"]
+        mock_exports.categorise.return_value = {
             "functions": ["do_thing", "helper"],
             "classes": [],
         }
-        mock_docs._config.reference = []
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+        mock_exports.config = mock_config(reference=[])
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, tmp_path)
+        ):
             result = asyncio.run(_handle_scan({}))
         assert "do_thing" in result[0].text
         assert "Functions" in result[0].text
 
     def test_with_class_exports_and_verbose(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
-        mock_docs._get_package_exports.return_value = ["MyClass"]
-        mock_docs._categorize_api_objects.return_value = {
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.config = mock_config()
+        mock_exports.names.return_value = ["MyClass"]
+        mock_exports.categorise.return_value = {
             "classes": ["MyClass"],
             "class_method_names": {"MyClass": ["method_a"]},
         }
-        mock_docs._config.reference = []
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+        mock_exports.config = mock_config(reference=[])
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, tmp_path)
+        ):
             result = asyncio.run(_handle_scan({"verbose": True}))
         assert "MyClass" in result[0].text
         assert "method_a" in result[0].text
@@ -596,14 +888,15 @@ class TestHandleScan:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
-        mock_docs._get_package_exports.return_value = ["do_thing"]
-        mock_docs._categorize_api_objects.return_value = {"functions": ["do_thing"]}
-        mock_docs._config.reference = [{"contents": ["do_thing"]}]
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.config = mock_config()
+        mock_exports.names.return_value = ["do_thing"]
+        mock_exports.categorise.return_value = {"functions": ["do_thing"]}
+        mock_exports.config = mock_config(reference=[{"contents": ["do_thing"]}])
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, tmp_path)
+        ):
             result = asyncio.run(_handle_scan({}))
         assert "[x]" in result[0].text
 
@@ -620,7 +913,7 @@ class TestHandleLint:
         monkeypatch.chdir(tmp_path)
         mock_result = MagicMock()
         mock_result.issues = []
-        with patch("great_docs._lint.run_lint", return_value=mock_result):
+        with patch("great_docs._checks.lint.run_lint", return_value=mock_result):
             result = asyncio.run(_handle_lint({}))
         assert "No lint issues" in result[0].text
 
@@ -633,7 +926,7 @@ class TestHandleLint:
         issue.message = "Missing docstring"
         mock_result = MagicMock()
         mock_result.issues = [issue]
-        with patch("great_docs._lint.run_lint", return_value=mock_result):
+        with patch("great_docs._checks.lint.run_lint", return_value=mock_result):
             result = asyncio.run(_handle_lint({}))
         assert "ERROR" in result[0].text
         assert "Missing docstring" in result[0].text
@@ -647,7 +940,7 @@ class TestHandleLint:
         issue.message = "Inconsistent style"
         mock_result = MagicMock()
         mock_result.issues = [issue]
-        with patch("great_docs._lint.run_lint", return_value=mock_result):
+        with patch("great_docs._checks.lint.run_lint", return_value=mock_result):
             result = asyncio.run(_handle_lint({}))
         assert "Inconsistent style" in result[0].text
 
@@ -655,7 +948,7 @@ class TestHandleLint:
         monkeypatch.chdir(tmp_path)
         mock_result = MagicMock()
         mock_result.issues = []
-        with patch("great_docs._lint.run_lint", return_value=mock_result) as mock_lint:
+        with patch("great_docs._checks.lint.run_lint", return_value=mock_result) as mock_lint:
             asyncio.run(_handle_lint({"checks": ["docstrings"]}))
         _, kwargs = mock_lint.call_args
         assert kwargs["checks"] == {"docstrings"}
@@ -667,20 +960,25 @@ class TestHandleLint:
 
 
 class TestHandleStatusWithConfig:
-    def _mock_docs(self, pkg="mypkg", features=None):
+    def _mock_exports(self, pkg="mypkg", features=None):
         mock = MagicMock()
-        mock._detect_package_name.return_value = pkg
+        write_pyproject(Path.cwd(), pkg)
         cfg = features or {}
-        mock._config.cli_enabled = cfg.get("cli", False)
-        mock._config.mcp_enabled = cfg.get("mcp", False)
-        mock._config.__getitem__ = lambda self, key: cfg.get(key, [])
-        mock._config.sections = cfg.get("sections", [])
+        mock.config = mock_config(
+            cli_enabled=cfg.get("cli", False),
+            mcp_enabled=cfg.get("mcp", False),
+            sections=cfg.get("sections", []),
+        )
+        mock.config.__getitem__ = lambda self, key: cfg.get(key, [])
         return mock
 
     def test_shows_package_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
         (tmp_path / "great-docs.yml").write_text("project:\n  name: test\n")
-        with patch("great_docs.mcp._get_great_docs", return_value=self._mock_docs()):
+        with patch(
+            "great_docs.mcp._get_exports",
+            side_effect=_reading_project(self._mock_exports(), Path.cwd()),
+        ):
             result = asyncio.run(_handle_status({}))
         assert "mypkg" in result[0].text
 
@@ -688,7 +986,8 @@ class TestHandleStatusWithConfig:
         monkeypatch.chdir(tmp_path)
         (tmp_path / "great-docs.yml").write_text("project:\n  name: test\n")
         with patch(
-            "great_docs.mcp._get_great_docs", return_value=self._mock_docs(features={"cli": True})
+            "great_docs.mcp._get_exports",
+            side_effect=_reading_project(self._mock_exports(features={"cli": True}), Path.cwd()),
         ):
             result = asyncio.run(_handle_status({}))
         assert "CLI docs" in result[0].text
@@ -697,7 +996,8 @@ class TestHandleStatusWithConfig:
         monkeypatch.chdir(tmp_path)
         (tmp_path / "great-docs.yml").write_text("project:\n  name: test\n")
         with patch(
-            "great_docs.mcp._get_great_docs", return_value=self._mock_docs(features={"mcp": True})
+            "great_docs.mcp._get_exports",
+            side_effect=_reading_project(self._mock_exports(features={"mcp": True}), Path.cwd()),
         ):
             result = asyncio.run(_handle_status({}))
         assert "MCP docs" in result[0].text
@@ -706,8 +1006,10 @@ class TestHandleStatusWithConfig:
         monkeypatch.chdir(tmp_path)
         (tmp_path / "great-docs.yml").write_text("project:\n  name: test\n")
         with patch(
-            "great_docs.mcp._get_great_docs",
-            return_value=self._mock_docs(features={"user_guide": ["page.qmd"]}),
+            "great_docs.mcp._get_exports",
+            side_effect=_reading_project(
+                self._mock_exports(features={"user_guide": ["page.qmd"]}), Path.cwd()
+            ),
         ):
             result = asyncio.run(_handle_status({}))
         assert "User Guide" in result[0].text
@@ -716,8 +1018,10 @@ class TestHandleStatusWithConfig:
         monkeypatch.chdir(tmp_path)
         (tmp_path / "great-docs.yml").write_text("project:\n  name: test\n")
         with patch(
-            "great_docs.mcp._get_great_docs",
-            return_value=self._mock_docs(features={"sections": ["s1", "s2"]}),
+            "great_docs.mcp._get_exports",
+            side_effect=_reading_project(
+                self._mock_exports(features={"sections": ["s1", "s2"]}), Path.cwd()
+            ),
         ):
             result = asyncio.run(_handle_status({}))
         assert "2 custom section" in result[0].text
@@ -726,8 +1030,10 @@ class TestHandleStatusWithConfig:
         monkeypatch.chdir(tmp_path)
         (tmp_path / "great-docs.yml").write_text("project:\n  name: test\n")
         with patch(
-            "great_docs.mcp._get_great_docs",
-            return_value=self._mock_docs(features={"versions": ["0.1", "0.2"]}),
+            "great_docs.mcp._get_exports",
+            side_effect=_reading_project(
+                self._mock_exports(features={"versions": ["0.1", "0.2"]}), Path.cwd()
+            ),
         ):
             result = asyncio.run(_handle_status({}))
         assert "Multi-version" in result[0].text
@@ -738,66 +1044,69 @@ class TestHandleStatusWithConfig:
 # ---------------------------------------------------------------------------
 
 
+def _git(root: Path, *args: str) -> None:
+    """
+    Run `git *args` in `root`, raising `CalledProcessError` on a non-zero exit
+    """
+    subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+
+@pytest.fixture
+def tagged_project(tmp_path: Path) -> Path:
+    """
+    Create a tagged package with uncommitted API changes
+
+    Relative to tag `v0.1.0`, the working tree adds `added`, removes `dropped`
+    and gives `kept` a second required parameter.
+    """
+    write_pyproject(tmp_path, "diffpkg")
+    init = tmp_path / "diffpkg" / "__init__.py"
+    init.parent.mkdir()
+    init.write_text("def kept(a): ...\n\n\ndef dropped(): ...\n", encoding="utf-8")
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.email", "t@t.co")
+    _git(tmp_path, "config", "user.name", "t")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-m", "v0.1.0")
+    _git(tmp_path, "tag", "v0.1.0")
+    init.write_text("def kept(a, b): ...\n\n\ndef added(): ...\n", encoding="utf-8")
+    return tmp_path
+
+
 class TestHandleApiDiff:
     def test_no_package_name_returns_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = None
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, None)
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, Path.cwd())
+        ):
             result = asyncio.run(_handle_api_diff({}))
         assert "Could not detect" in result[0].text
 
-    def _patched_docs(self):
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
-        return mock_docs
+    def test_base_ref_diffs_working_tree(self, tagged_project: Path):
+        arguments = {"project_path": str(tagged_project), "base": "v0.1.0"}
+        text = asyncio.run(_handle_api_diff(arguments))[0].text
+        assert "v0.1.0 → HEAD" in text
+        assert "Added (1):\n  + added" in text
+        assert "Removed (1):\n  - dropped" in text
+        assert "Changed (1):\n  ~ kept" in text
 
-    def _mock_snapshot(self, symbols=None):
-        snap = MagicMock()
-        snap.symbols = symbols or {}
-        return snap
+    def test_no_refs_shows_current_api(self, tagged_project: Path):
+        text = asyncio.run(_handle_api_diff({"project_path": str(tagged_project)}))[0].text
+        assert "function: added" in text
+        assert "function: kept" in text
+        assert "dropped" not in text
 
-    def test_no_refs_shows_current_api(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        from great_docs._api_diff import ApiSnapshot
+    def test_unknown_base_ref_returns_message(self, tagged_project: Path):
+        arguments = {"project_path": str(tagged_project), "base": "v9.9.9"}
+        text = asyncio.run(_handle_api_diff(arguments))[0].text
+        assert "Could not build an API snapshot at 'v9.9.9'" in text
 
-        monkeypatch.chdir(tmp_path)
-        snap = self._mock_snapshot({"MyClass": MagicMock(kind="class")})
-        with (
-            patch("great_docs.mcp._get_great_docs", return_value=self._patched_docs()),
-            patch.object(ApiSnapshot, "from_live", return_value=snap, create=True),
-        ):
-            result = asyncio.run(_handle_api_diff({}))
-        assert "MyClass" in result[0].text
-
-    def test_base_ref_without_snapshot_returns_message(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
-        from great_docs._api_diff import ApiSnapshot
-
-        monkeypatch.chdir(tmp_path)
-        snap = self._mock_snapshot()
-        with (
-            patch("great_docs.mcp._get_great_docs", return_value=self._patched_docs()),
-            patch.object(ApiSnapshot, "from_live", return_value=snap, create=True),
-        ):
-            result = asyncio.run(_handle_api_diff({"base": "v0.1"}))
-        assert "No snapshot found" in result[0].text
-
-    def test_provide_base_message_when_only_head(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
-        from great_docs._api_diff import ApiSnapshot
-
-        monkeypatch.chdir(tmp_path)
-        snap = self._mock_snapshot()
-        with (
-            patch("great_docs.mcp._get_great_docs", return_value=self._patched_docs()),
-            patch.object(ApiSnapshot, "from_live", return_value=snap, create=True),
-        ):
-            result = asyncio.run(_handle_api_diff({"head": "HEAD"}))
-        assert "Provide a base ref" in result[0].text
+    def test_provide_base_message_when_only_head(self, tagged_project: Path):
+        arguments = {"project_path": str(tagged_project), "head": "HEAD"}
+        text = asyncio.run(_handle_api_diff(arguments))[0].text
+        assert "Provide a base ref" in text
 
 
 # ---------------------------------------------------------------------------
@@ -875,90 +1184,90 @@ class TestReadResource:
             (tmp_path / "great-docs.yml").write_text("module: wrong_module\n")
         monkeypatch.chdir(tmp_path)
         query = urlencode({"config_path": selection})
-        result = asyncio.run(read_resource(AnyUrl(f"gd://{resource}?{query}")))
+        result = asyncio.run(read_resource(f"gd://{resource}?{query}"))
         assert expected in result
         if resource == "status":
             assert selection in result
 
-    def _uri(self, s: str) -> AnyUrl:
-        return AnyUrl(s)
-
     def test_config_when_file_exists(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         (tmp_path / "great-docs.yml").write_text("project:\n  name: test\n")
         monkeypatch.chdir(tmp_path)
-        result = asyncio.run(read_resource(self._uri("gd://config")))
+        result = asyncio.run(read_resource("gd://config"))
         assert "project:" in result
 
     def test_config_when_file_missing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        result = asyncio.run(read_resource(self._uri("gd://config")))
+        result = asyncio.run(read_resource("gd://config"))
         assert "No great-docs.yml" in result
 
     def test_build_log_with_build_dirs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         (tmp_path / "great-docs").mkdir()
         monkeypatch.chdir(tmp_path)
-        result = asyncio.run(read_resource(self._uri("gd://build-log")))
+        result = asyncio.run(read_resource("gd://build-log"))
         assert "great-docs" in result
 
     def test_build_log_without_build_dirs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        result = asyncio.run(read_resource(self._uri("gd://build-log")))
+        result = asyncio.run(read_resource("gd://build-log"))
         assert "No build output" in result
 
     def test_status_resource_delegates_to_handle_status(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         monkeypatch.chdir(tmp_path)
-        result = asyncio.run(read_resource(self._uri("gd://status")))
-        assert result  # returns non-empty status text
+        result = asyncio.run(read_resource("gd://status"))
+        assert result
 
     def test_pyproject_when_file_exists(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         (tmp_path / "pyproject.toml").write_text("[project]\nname = 'mypkg'\n")
         monkeypatch.chdir(tmp_path)
-        result = asyncio.run(read_resource(self._uri("gd://pyproject")))
+        result = asyncio.run(read_resource("gd://pyproject"))
         assert "mypkg" in result
 
     def test_pyproject_when_file_missing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        result = asyncio.run(read_resource(self._uri("gd://pyproject")))
+        result = asyncio.run(read_resource("gd://pyproject"))
         assert "No pyproject.toml" in result
 
     def test_page_resource_returns_content(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         (tmp_path / "my-page.qmd").write_text("---\ntitle: Hello\n---\n")
         monkeypatch.chdir(tmp_path)
-        result = asyncio.run(read_resource(self._uri("gd://page/my-page.qmd")))
+        result = asyncio.run(read_resource("gd://page/my-page.qmd"))
         assert "Hello" in result
 
     def test_page_resource_missing_returns_not_found(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         monkeypatch.chdir(tmp_path)
-        result = asyncio.run(read_resource(self._uri("gd://page/missing.qmd")))
+        result = asyncio.run(read_resource("gd://page/missing.qmd"))
         assert "not found" in result.lower()
 
     def test_unknown_uri_returns_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        result = asyncio.run(read_resource(self._uri("gd://unknown-thing")))
+        result = asyncio.run(read_resource("gd://unknown-thing"))
         assert "Unknown resource" in result
 
     def test_api_surface_no_package(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = None
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
-            result = asyncio.run(read_resource(self._uri("gd://api-surface")))
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, None)
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, tmp_path)
+        ):
+            result = asyncio.run(read_resource("gd://api-surface"))
         assert "Could not detect" in result
 
     def test_api_surface_with_exports(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
-        mock_docs._get_package_exports.return_value = ["do_thing"]
-        mock_docs._categorize_api_objects.return_value = {"functions": ["do_thing"]}
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
-            result = asyncio.run(read_resource(self._uri("gd://api-surface")))
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.config = mock_config()
+        mock_exports.names.return_value = ["do_thing"]
+        mock_exports.categorise.return_value = {"functions": ["do_thing"]}
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, tmp_path)
+        ):
+            result = asyncio.run(read_resource("gd://api-surface"))
         assert "do_thing" in result
 
 
@@ -988,7 +1297,7 @@ class TestListResourceTemplates:
 
     def test_returns_reference_and_page_templates(self):
         templates = asyncio.run(list_resource_templates())
-        uri_templates = [t.uri_template for t in templates]
+        uri_templates = [str(t.model_dump(by_alias=True)["uriTemplate"]) for t in templates]
         assert any("reference" in u for u in uri_templates)
         assert any("page" in u for u in uri_templates)
 
@@ -1134,12 +1443,13 @@ class TestHandleCompletion:
         from mcp.types import CompletionArgument, PromptReference
 
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
-        mock_docs._get_package_exports.return_value = ["MyClass", "my_func", "other_func"]
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.config = mock_config()
+        mock_exports.names.return_value = ["MyClass", "my_func", "other_func"]
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, tmp_path)
+        ):
             ref = PromptReference(type="ref/prompt", name="improve-docstrings")
             arg = CompletionArgument(name="symbol", value="my")
             result = asyncio.run(handle_completion(ref, arg))
@@ -1150,7 +1460,7 @@ class TestHandleCompletion:
         """Completion for improve-docstrings + symbol arg returns None on exception."""
         from mcp.types import CompletionArgument, PromptReference
 
-        with patch("great_docs.mcp._get_great_docs", side_effect=RuntimeError("boom")):
+        with patch("great_docs.mcp._get_exports", side_effect=RuntimeError("boom")):
             ref = PromptReference(type="ref/prompt", name="improve-docstrings")
             arg = CompletionArgument(name="symbol", value="x")
             result = asyncio.run(handle_completion(ref, arg))
@@ -1161,12 +1471,13 @@ class TestHandleCompletion:
         from mcp.types import CompletionArgument, ResourceTemplateReference
 
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
-        mock_docs._get_package_exports.return_value = ["MyClass", "my_func"]
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.config = mock_config()
+        mock_exports.names.return_value = ["MyClass", "my_func"]
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, tmp_path)
+        ):
             ref = ResourceTemplateReference(type="ref/resource", uri="gd://reference/{symbol}")
             arg = CompletionArgument(name="symbol", value="My")
             result = asyncio.run(handle_completion(ref, arg))
@@ -1177,11 +1488,26 @@ class TestHandleCompletion:
         """ResourceTemplateReference symbol completion returns None on exception."""
         from mcp.types import CompletionArgument, ResourceTemplateReference
 
-        with patch("great_docs.mcp._get_great_docs", side_effect=RuntimeError("boom")):
+        with patch("great_docs.mcp._get_exports", side_effect=RuntimeError("boom")):
             ref = ResourceTemplateReference(type="ref/resource", uri="gd://reference/{symbol}")
             arg = CompletionArgument(name="symbol", value="x")
             result = asyncio.run(handle_completion(ref, arg))
         assert result is None
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            PromptReference(type="ref/prompt", name="improve-docstrings"),
+            ResourceTemplateReference(type="ref/resource", uri="gd://reference/{symbol}"),
+        ],
+    )
+    def test_symbol_completion_unexpected_error_propagates(
+        self, ref: PromptReference | ResourceTemplateReference
+    ):
+        arg = CompletionArgument(name="symbol", value="x")
+        with patch("great_docs.mcp._get_exports", side_effect=ZeroDivisionError("bug")):
+            with pytest.raises(ZeroDivisionError):
+                asyncio.run(handle_completion(ref, arg))
 
 
 # ---------------------------------------------------------------------------
@@ -1211,156 +1537,20 @@ class TestHandleScanRefConfigDictItem:
     ):
         """Reference config dict items (with 'name' key) are included in ref_items."""
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
-        mock_docs._get_package_exports.return_value = ["do_thing"]
-        mock_docs._categorize_api_objects.return_value = {"functions": ["do_thing"]}
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.config = mock_config()
+        mock_exports.names.return_value = ["do_thing"]
+        mock_exports.categorise.return_value = {"functions": ["do_thing"]}
         # Reference config uses dict items, not str items
-        mock_docs._config.reference = [{"contents": [{"name": "do_thing"}]}]
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
+        mock_exports.config.reference = [{"contents": [{"name": "do_thing"}]}]
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, tmp_path)
+        ):
             result = asyncio.run(_handle_scan({}))
         text = result[0].text
         assert "do_thing" in text
         assert "[x]" in text
-
-
-# ---------------------------------------------------------------------------
-# _handle_api_diff
-# ---------------------------------------------------------------------------
-
-
-class TestHandleApiDiffWithSnapshot:
-    def _patched_docs(self):
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
-        return mock_docs
-
-    def _mock_current_snapshot(self):
-        snap = MagicMock()
-        snap.symbols = {}
-        return snap
-
-    def test_with_added_symbols(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        """_handle_api_diff shows added symbols when base snapshot exists."""
-        from great_docs._api_diff import ApiSnapshot, SymbolChange
-
-        monkeypatch.chdir(tmp_path)
-        snap_dir = tmp_path / ".great-docs-snapshots"
-        snap_dir.mkdir()
-        (snap_dir / "v0.1.json").write_text("{}")
-
-        current = self._mock_current_snapshot()
-        added_sym = MagicMock(spec=SymbolChange)
-        added_sym.name = "new_func"
-        added_sym.kind = "function"
-        diff = MagicMock()
-        diff.added = [added_sym]
-        diff.removed = []
-        diff.changed = []
-        base_snap = MagicMock()
-        base_snap.diff.return_value = diff
-
-        with (
-            patch("great_docs.mcp._get_great_docs", return_value=self._patched_docs()),
-            patch.object(ApiSnapshot, "from_live", return_value=current, create=True),
-            patch.object(ApiSnapshot, "from_json", return_value=base_snap, create=True),
-        ):
-            result = asyncio.run(_handle_api_diff({"base": "v0.1"}))
-
-        assert "Added" in result[0].text
-        assert "new_func" in result[0].text
-
-    def test_with_removed_symbols(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        """_handle_api_diff shows removed symbols when base snapshot exists."""
-        from great_docs._api_diff import ApiSnapshot, SymbolChange
-
-        monkeypatch.chdir(tmp_path)
-        snap_dir = tmp_path / ".great-docs-snapshots"
-        snap_dir.mkdir()
-        (snap_dir / "v0.1.json").write_text("{}")
-
-        current = self._mock_current_snapshot()
-        removed_sym = MagicMock(spec=SymbolChange)
-        removed_sym.name = "old_func"
-        removed_sym.kind = "function"
-        diff = MagicMock()
-        diff.added = []
-        diff.removed = [removed_sym]
-        diff.changed = []
-        base_snap = MagicMock()
-        base_snap.diff.return_value = diff
-
-        with (
-            patch("great_docs.mcp._get_great_docs", return_value=self._patched_docs()),
-            patch.object(ApiSnapshot, "from_live", return_value=current, create=True),
-            patch.object(ApiSnapshot, "from_json", return_value=base_snap, create=True),
-        ):
-            result = asyncio.run(_handle_api_diff({"base": "v0.1"}))
-
-        assert "Removed" in result[0].text
-        assert "old_func" in result[0].text
-
-    def test_with_changed_symbols(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-        """_handle_api_diff shows changed symbols when base snapshot exists."""
-        from great_docs._api_diff import ApiSnapshot, SymbolChange
-
-        monkeypatch.chdir(tmp_path)
-        snap_dir = tmp_path / ".great-docs-snapshots"
-        snap_dir.mkdir()
-        (snap_dir / "v0.1.json").write_text("{}")
-
-        current = self._mock_current_snapshot()
-        changed_sym = MagicMock(spec=SymbolChange)
-        changed_sym.name = "changed_func"
-        changed_sym.change_type = "signature_changed"
-        diff = MagicMock()
-        diff.added = []
-        diff.removed = []
-        diff.changed = [changed_sym]
-        base_snap = MagicMock()
-        base_snap.diff.return_value = diff
-
-        with (
-            patch("great_docs.mcp._get_great_docs", return_value=self._patched_docs()),
-            patch.object(ApiSnapshot, "from_live", return_value=current, create=True),
-            patch.object(ApiSnapshot, "from_json", return_value=base_snap, create=True),
-        ):
-            result = asyncio.run(_handle_api_diff({"base": "v0.1"}))
-
-        assert "Changed" in result[0].text
-        assert "changed_func" in result[0].text
-
-    def test_no_diff_shows_no_changes_message(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ):
-        """_handle_api_diff shows 'No API changes detected' when diff is empty."""
-        from great_docs._api_diff import ApiSnapshot
-
-        monkeypatch.chdir(tmp_path)
-        snap_dir = tmp_path / ".great-docs-snapshots"
-        snap_dir.mkdir()
-        (snap_dir / "v0.1.json").write_text("{}")
-
-        current = self._mock_current_snapshot()
-        diff = MagicMock()
-        diff.added = []
-        diff.removed = []
-        diff.changed = []
-        base_snap = MagicMock()
-        base_snap.diff.return_value = diff
-
-        with (
-            patch("great_docs.mcp._get_great_docs", return_value=self._patched_docs()),
-            patch.object(ApiSnapshot, "from_live", return_value=current, create=True),
-            patch.object(ApiSnapshot, "from_json", return_value=base_snap, create=True),
-        ):
-            result = asyncio.run(_handle_api_diff({"base": "v0.1"}))
-
-        assert "No API changes detected" in result[0].text
 
 
 # ---------------------------------------------------------------------------
@@ -1369,33 +1559,36 @@ class TestHandleApiDiffWithSnapshot:
 
 
 class TestReadResourceApiSurface:
-    def _uri(self, s: str) -> AnyUrl:
-        return AnyUrl(s)
-
     def test_api_surface_no_exports_returns_message(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        """read_resource returns 'No exports discovered' when _get_package_exports is empty."""
+        """Verify that the API surface resource reports when the package exports nothing"""
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
-        mock_docs._get_package_exports.return_value = []
-        with patch("great_docs.mcp._get_great_docs", return_value=mock_docs):
-            result = asyncio.run(read_resource(self._uri("gd://api-surface")))
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.config = mock_config()
+        mock_exports.names.return_value = []
+        with patch(
+            "great_docs.mcp._get_exports", side_effect=_reading_project(mock_exports, tmp_path)
+        ):
+            result = asyncio.run(read_resource("gd://api-surface"))
 
         assert "No exports discovered" in result
 
     def test_api_surface_exception_returns_error_message(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        """read_resource returns error string when _get_great_docs raises an exception."""
+        """Check that API discovery failures return an error message"""
         monkeypatch.chdir(tmp_path)
-        with patch("great_docs.mcp._get_great_docs", side_effect=RuntimeError("pkg not found")):
-            result = asyncio.run(read_resource(self._uri("gd://api-surface")))
+        with patch("great_docs.mcp._get_exports", side_effect=RuntimeError("pkg not found")):
+            result = asyncio.run(read_resource("gd://api-surface"))
 
         assert "Error discovering API surface" in result
+
+    def test_api_surface_unexpected_error_propagates(self):
+        with patch("great_docs.mcp._get_exports", side_effect=ZeroDivisionError("bug")):
+            with pytest.raises(ZeroDivisionError):
+                asyncio.run(read_resource("gd://api-surface"))
 
 
 # ---------------------------------------------------------------------------
@@ -1404,61 +1597,187 @@ class TestReadResourceApiSurface:
 
 
 class TestReadResourceReference:
-    def _uri(self, s: str) -> AnyUrl:
-        return AnyUrl(s)
-
     def test_reference_symbol_found_returns_docstring(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        """gd://reference/symbol returns kind and docstring when symbol is found."""
+        """Check that a resolved reference includes the symbol's kind and docstring"""
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.config = mock_config()
 
-        # Build a module-like object that has `my_func` as an attribute
         mock_func = MagicMock()
         mock_func.__doc__ = "Does a thing."
         mock_mod = MagicMock()
 
-        # getattr(mock_mod, "my_func", None) returns mock_func via spec trick
         mock_mod.configure_mock(**{"my_func": mock_func})
 
         with (
-            patch("great_docs.mcp._get_great_docs", return_value=mock_docs),
+            patch(
+                "great_docs.mcp._get_exports",
+                side_effect=_reading_project(mock_exports, Path.cwd()),
+            ),
             patch("importlib.import_module", return_value=mock_mod),
         ):
-            result = asyncio.run(read_resource(self._uri("gd://reference/my_func")))
+            result = asyncio.run(read_resource("gd://reference/my_func"))
 
         assert "mypkg" in result or "my_func" in result or "Does a thing" in result
 
     def test_reference_symbol_not_found_returns_message(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        """gd://reference/symbol returns 'not found' message when getattr returns None."""
+        """Check that a missing reference returns a message saying it was not found"""
         monkeypatch.chdir(tmp_path)
-        mock_docs = MagicMock()
-        mock_docs._detect_package_name.return_value = "mypkg"
-        mock_docs._detect_module_name.return_value = "mypkg"
-        mock_docs._normalize_package_name.return_value = "mypkg"
+        mock_exports = MagicMock()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.config = mock_config()
 
-        mock_mod = MagicMock(spec=[])  # no attributes -> getattr returns None
+        # An empty spec makes the requested symbol unavailable.
+        mock_mod = MagicMock(spec=[])
 
         with (
-            patch("great_docs.mcp._get_great_docs", return_value=mock_docs),
+            patch(
+                "great_docs.mcp._get_exports",
+                side_effect=_reading_project(mock_exports, Path.cwd()),
+            ),
             patch("importlib.import_module", return_value=mock_mod),
         ):
-            result = asyncio.run(read_resource(self._uri("gd://reference/missing_sym")))
+            result = asyncio.run(read_resource("gd://reference/missing_sym"))
 
         assert "not found" in result.lower()
 
     def test_reference_exception_returns_error_message(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
-        """gd://reference/symbol returns error string on exception."""
+        """Check that a reference lookup failure returns an error message"""
         monkeypatch.chdir(tmp_path)
-        with patch("great_docs.mcp._get_great_docs", side_effect=RuntimeError("import fail")):
-            result = asyncio.run(read_resource(self._uri("gd://reference/any_sym")))
+        with patch("great_docs.mcp._get_exports", side_effect=RuntimeError("import fail")):
+            result = asyncio.run(read_resource("gd://reference/any_sym"))
 
         assert "Error reading reference" in result
+
+    def test_reference_invalid_configuration_returns_error_message(self, tmp_path: Path):
+        write_pyproject(tmp_path, "mypkg")
+        (tmp_path / "great-docs.yml").write_text("parser: nope\n", encoding="utf-8")
+        uri = f"gd://reference/any_sym?project_path={tmp_path}"
+        result = asyncio.run(read_resource(uri))
+
+        assert result.startswith("Error reading reference for 'any_sym':")
+        assert "parser: 'nope'" in result
+
+    def test_reference_unexpected_error_propagates(self):
+        with patch("great_docs.mcp._get_exports", side_effect=ZeroDivisionError("bug")):
+            with pytest.raises(ZeroDivisionError):
+                asyncio.run(read_resource("gd://reference/any_sym"))
+
+
+# ---------------------------------------------------------------------------
+# Projects without a detectable package
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def undetectable_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """
+    Create a project whose package name and module cannot be detected
+
+    Two package directories and no packaging files leave both the distribution name and
+    the module unknown.
+
+    Parameters
+    ----------
+    tmp_path
+        The project directory.
+    monkeypatch
+        The fixture for changing the working directory to the project.
+
+    Returns
+    -------
+    :
+        The project directory, which is also the working directory.
+    """
+    for package in ("first", "second"):
+        (tmp_path / package).mkdir()
+        (tmp_path / package / "__init__.py").write_text("")
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def test_reference_resource_without_a_package_reports_it(undetectable_project: Path):
+    result = asyncio.run(read_resource("gd://reference/Foo"))
+    assert result == "Error: Could not detect package name."
+
+
+def test_docstring_symbol_completion_without_a_package_offers_nothing(
+    undetectable_project: Path,
+):
+    from mcp.types import CompletionArgument, PromptReference
+
+    result = asyncio.run(
+        handle_completion(
+            PromptReference(type="ref/prompt", name="improve-docstrings"),
+            CompletionArgument(name="symbol", value=""),
+        )
+    )
+    assert result is not None
+    assert result.values == []
+
+
+def test_reference_symbol_completion_without_a_package_offers_nothing(
+    undetectable_project: Path,
+):
+    from mcp.types import CompletionArgument, ResourceTemplateReference
+
+    result = asyncio.run(
+        handle_completion(
+            ResourceTemplateReference(type="ref/resource", uri="gd://reference/{symbol}"),
+            CompletionArgument(name="symbol", value=""),
+        )
+    )
+    assert result is not None
+    assert result.values == []
+
+
+@pytest.fixture
+def bare_name_author(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A project documenting `json` whose `authors` entry is a bare name instead of a mapping"""
+    write_pyproject(tmp_path, "mypkg")
+    (tmp_path / "great-docs.yml").write_text(
+        "module: json\ndynamic: false\nauthors:\n  - Jane Doe\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def test_scan_tool_runs_with_a_bare_name_author(bare_name_author: Path):
+    result = asyncio.run(_handle_scan({}))
+    assert "Package: json" in result[0].text
+
+
+def test_api_surface_resource_runs_with_a_bare_name_author(bare_name_author: Path):
+    result = asyncio.run(read_resource("gd://api-surface"))
+    assert "Package: json" in result
+
+
+@pytest.mark.parametrize("template", ["prompt", "reference"])
+def test_symbol_completion_runs_with_a_bare_name_author(bare_name_author: Path, template: str):
+    from mcp.types import CompletionArgument, PromptReference, ResourceTemplateReference
+
+    ref = (
+        PromptReference(type="ref/prompt", name="improve-docstrings")
+        if template == "prompt"
+        else ResourceTemplateReference(type="ref/resource", uri="gd://reference/{symbol}")
+    )
+    result = asyncio.run(handle_completion(ref, CompletionArgument(name="symbol", value="dump")))
+    assert result is not None
+    assert "dumps" in result.values
+
+
+def test_status_tool_runs_with_a_bare_name_author(bare_name_author: Path):
+    result = asyncio.run(_handle_status({}))
+    assert "Package: mypkg" in result[0].text
+
+
+def test_reference_resource_runs_with_a_bare_name_author(bare_name_author: Path):
+    result = asyncio.run(read_resource("gd://reference/dumps"))
+    assert result.startswith("# json.dumps")

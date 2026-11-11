@@ -1,13 +1,13 @@
 import json
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import griffe as gf
 import pytest
 
 from great_docs._builtin.directives import DIRECTIVES
-from great_docs._interlinks import Source
-from great_docs._interlinks.sphinx_inventory import Inventory, InventoryEntry
-from great_docs._lint import (
+from great_docs._checks.lint import (
     LintIssue,
     LintResult,
     _check_config_keys,
@@ -21,7 +21,13 @@ from great_docs._lint import (
     _version_distance,
     run_lint,
 )
+from great_docs._interlinks import Source
+from great_docs._interlinks.sphinx_inventory import Inventory, InventoryEntry
+from great_docs._project import Project
+from great_docs._project.layout import Layout
 from great_docs._utils import QUARTO_YML_HEADER
+from great_docs.config import Config
+from tests.support import mock_config, write_pyproject
 
 
 @pytest.mark.parametrize("directory", [".", "docs", "website"])
@@ -34,12 +40,12 @@ def test_lint_includes_shared_sources(
     relative: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from great_docs._layout import Layout
-    from great_docs._lint import (
+    from great_docs._checks.lint import (
         _check_ambiguous_references,
         _check_stale_versions,
         _gather_prose,
     )
+    from great_docs._project.layout import Layout
 
     source = tmp_path / directory
     source.mkdir(exist_ok=True)
@@ -73,7 +79,12 @@ def test_lint_includes_shared_sources(
         )
         expected.add("README.md")
     else:
-        _check_stale_versions(project_root, result, layout)
+        _check_stale_versions(
+            Config(layout.package_root, config_path=layout.config_path),
+            project_root,
+            result,
+            layout,
+        )
     assert {
         issue.symbol.split(":")[0] for issue in result.issues if issue.check == check
     } == expected
@@ -231,20 +242,40 @@ class TestLostSections:
         assert _lost_sections(doc, "numpy") == {"google": {"examples"}}
 
 
-def _mock_docs() -> MagicMock:
+def _mock_exports() -> MagicMock:
     """
-    Create a mock project with no site pages
+    Create an export discovery mock with page checks disabled
 
-    Unset `MagicMock` attributes are truthy. Set explicit empty values to
-    prevent page checks from treating mocks as source paths.
+    Unset `MagicMock` attributes are truthy. Set empty defaults so page and
+    reference checks do not treat mocks as configured content.
     """
-    docs = MagicMock()
-    docs._config.seo_enabled = False
-    docs._config.sections = []
-    docs._find_user_guide_dir.return_value = None
-    docs._get_custom_page_sources.return_value = []
-    docs._find_index_source_file.return_value = (None, None)
-    return docs
+    exports = MagicMock()
+    exports.config = mock_config(seo_enabled=False, sections=[])
+    # The package documents nothing unless a test lists its documented objects.
+    exports.sections.return_value = None
+    return exports
+
+
+def _made_from(exports: MagicMock) -> Callable[[Layout], MagicMock]:
+    """
+    Create a factory that attaches current project facts to an export discovery mock
+
+    Parameters
+    ----------
+    exports
+        The mock to return, with the configuration used to read the project.
+
+    Returns
+    -------
+    :
+        A replacement for `Exports.make`.
+    """
+
+    def make(layout: Layout) -> MagicMock:
+        exports.project = Project.make(exports.config, layout)
+        return exports
+
+    return make
 
 
 def _make_griffe_obj(kind="function", docstring=None, members=None):
@@ -299,7 +330,62 @@ def _documented(*names):
     return [_make_documented_item(f"mypkg.{name}", (name,), "Documented.") for name in names]
 
 
+_UNRESOLVED_ALIAS_PACKAGE = {
+    "__init__.py": '''
+from mypkg.missing import Gone
+from mypkg.cycle import Loop
+
+class Klass:
+    """A class"""
+    from mypkg.missing import Gone
+    from mypkg.cycle import Loop
+
+    def method(self):
+        """
+        Do something
+
+        Args:
+            x: A value.
+
+        %seealso nowhere
+        %bogus
+        """
+
+    def bare(self):
+        pass
+''',
+    "cycle.py": "from mypkg.cycle2 import Loop\n",
+    "cycle2.py": "from mypkg.cycle import Loop\n",
+}
+"""
+A package whose exports and class members include aliases griffe cannot resolve
+
+`Gone` points at a missing module and `Loop` at an import cycle, both at the top
+level and inside `Klass`. Of the other members, `Klass.method` has a docstring
+that every docstring check flags and `Klass.bare` has none.
+"""
+
+_UNRESOLVED_ALIAS_EXPORTS = ["Gone", "Loop", "Klass"]
+"""The exports of the unresolved-alias package"""
+
+
+@pytest.fixture
+def unresolved_alias_package() -> Iterator[gf.Module]:
+    """Yield a griffe package with unresolved export and class-member aliases"""
+    with gf.temporary_visited_package("mypkg", _UNRESOLVED_ALIAS_PACKAGE) as package:
+        yield package
+
+
 class TestCheckMissingDocstrings:
+    def test_unresolved_member_aliases_are_skipped(self, unresolved_alias_package: gf.Module):
+        result = LintResult()
+        _check_missing_docstrings(
+            unresolved_alias_package, "mypkg", _UNRESOLVED_ALIAS_EXPORTS, result
+        )
+
+        members = {i.symbol for i in result.issues if i.symbol.startswith("Klass.")}
+        assert members == {"Klass.bare"}
+
     def test_export_with_docstring(self):
         pkg = _make_pkg({"func_a": _make_griffe_obj(docstring="Documented function.")})
         result = LintResult()
@@ -376,6 +462,23 @@ class TestCheckMissingDocstrings:
 
 
 class TestCheckCrossReferences:
+    def test_unresolved_aliases_are_skipped(self, unresolved_alias_package: gf.Module):
+        documented = _documented(
+            *_UNRESOLVED_ALIAS_EXPORTS, "Klass.Gone", "Klass.Loop", "Klass.method"
+        )
+        result = LintResult()
+        _check_cross_references(
+            unresolved_alias_package,
+            "mypkg",
+            _UNRESOLVED_ALIAS_EXPORTS,
+            documented,
+            _index(documented),
+            (),
+            result,
+        )
+
+        assert [(i.check, i.symbol) for i in result.issues] == [("broken-xref", "Klass.method")]
+
     def test_valid_seealso(self):
         pkg = _make_pkg(
             {
@@ -757,6 +860,14 @@ class TestSeealsoAgainstLinkedSources:
 
 
 class TestCheckDocstringStyle:
+    def test_unresolved_aliases_are_skipped(self, unresolved_alias_package: gf.Module):
+        result = LintResult()
+        _check_docstring_style(
+            unresolved_alias_package, "mypkg", _UNRESOLVED_ALIAS_EXPORTS, "numpy", result
+        )
+
+        assert [(i.check, i.symbol) for i in result.issues] == [("style-mismatch", "Klass.method")]
+
     def test_matching_style(self):
         doc = "Short.\n\nParameters\n----------\nx : int\n"
         pkg = _make_pkg({"func_a": _make_griffe_obj(docstring=doc)})
@@ -801,6 +912,16 @@ class TestCheckDocstringStyle:
 
 
 class TestCheckDirectiveConsistency:
+    def test_unresolved_aliases_are_skipped(self, unresolved_alias_package: gf.Module):
+        result = LintResult()
+        _check_directive_consistency(
+            unresolved_alias_package, "mypkg", _UNRESOLVED_ALIAS_EXPORTS, result
+        )
+
+        assert [(i.check, i.symbol) for i in result.issues] == [
+            ("unknown-directive", "Klass.method")
+        ]
+
     @pytest.mark.parametrize("directive", sorted(DIRECTIVES))
     def test_registered_directive_is_known(self, directive: str):
         doc = f"Short.\n\n%{directive}"
@@ -876,58 +997,31 @@ class TestRunLint:
         assert result.status == "fail"
         assert "Unknown check" in result.issues[0].message
 
-    @patch("great_docs.core.GreatDocs", side_effect=RuntimeError("constructor boom"))
-    def test_constructor_exception_propagates_when_not_quiet(self, mock_gd_cls, tmp_path):
-        """Exception from GreatDocs() when quiet=False is re-raised to caller."""
+    @patch("great_docs._checks.lint.Exports")
+    def test_constructor_exception_propagates_when_not_quiet(self, mock_exports_cls, tmp_path):
+        """Verify that project read errors propagate when quiet mode is disabled"""
+        mock_exports_cls.make.side_effect = RuntimeError("constructor boom")
         with pytest.raises(RuntimeError, match="constructor boom"):
             run_lint(tmp_path)
 
-    @patch("great_docs.core.GreatDocs")
-    def test_no_package_detected(self, mock_gd_cls, tmp_path):
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = None
-        mock_gd_cls.return_value = mock_gd
+    @patch("great_docs._checks.lint.Exports")
+    def test_no_package_detected(self, mock_exports_cls, tmp_path):
+        mock_exports = _mock_exports()
+        write_pyproject(tmp_path, None)
+        mock_exports_cls.make.side_effect = _made_from(mock_exports)
 
         result = run_lint(tmp_path)
 
         assert result.status == "fail"
         assert "Could not detect package name" in result.issues[0].message
 
-    @patch("great_docs.core.GreatDocs")
-    def test_griffe_import_error(self, mock_gd_cls, tmp_path):
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = "mypkg"
-        mock_gd._detect_module_name.return_value = None
-        mock_gd._normalize_package_name.return_value = "mypkg"
-        mock_gd_cls.return_value = mock_gd
-
-        with patch.dict("sys.modules", {"griffe": None}):
-            # Simulate ImportError for griffe
-            import builtins
-
-            original_import = builtins.__import__
-
-            def mock_import(name, *args, **kwargs):
-                if name == "griffe":
-                    raise ImportError("No module named 'griffe'")
-                return original_import(name, *args, **kwargs)
-
-            with patch("builtins.__import__", side_effect=mock_import):
-                result = run_lint(tmp_path)
-
-        assert result.status == "fail"
-        assert any("griffe" in i.message for i in result.issues)
-
-    @patch("griffe.load")
-    @patch("great_docs.core.GreatDocs")
-    def test_successful_lint_run(self, mock_gd_cls, mock_griffe_load, tmp_path):
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = "mypkg"
-        mock_gd._resolve_importable_name.return_value = "mypkg"
-        mock_gd._get_package_exports.return_value = ["func_a", "func_b"]
-        mock_gd._config.get.return_value = "numpy"
-        mock_gd._config.__getitem__.return_value = "numpy"
-        mock_gd_cls.return_value = mock_gd
+    @patch("great_docs._checks.lint.Exports")
+    def test_successful_lint_run(self, mock_exports_cls, tmp_path):
+        mock_exports = _mock_exports()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.names.return_value = ["func_a", "func_b"]
+        mock_exports.config.__getitem__.return_value = "numpy"
+        mock_exports_cls.make.side_effect = _made_from(mock_exports)
 
         func_a = _make_griffe_obj(docstring="Documented.\n\nParameters\n----------\nx : int\n")
         func_b = _make_griffe_obj(docstring=None)
@@ -935,7 +1029,7 @@ class TestRunLint:
 
         mock_pkg = MagicMock()
         mock_pkg.members = members
-        mock_griffe_load.return_value = mock_pkg
+        mock_exports.package.return_value = mock_pkg
 
         result = run_lint(tmp_path)
 
@@ -945,21 +1039,19 @@ class TestRunLint:
         # func_b has no docstring -> error
         assert any(i.check == "missing-docstring" and i.symbol == "func_b" for i in result.issues)
 
-    @patch("griffe.load")
-    @patch("great_docs.core.GreatDocs")
+    @patch("great_docs._reference.documented.objects")
+    @patch("great_docs._checks.lint.Exports")
     def test_ambiguity_check_respects_the_renderer_member_selection(
-        self, mock_gd_cls, mock_griffe_load, tmp_path
+        self, mock_exports_cls, mock_documented_objects, tmp_path
     ):
-        """A `members:` config narrowing NetCache must not make `flush` look ambiguous."""
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = "mypkg"
-        mock_gd._resolve_importable_name.return_value = "mypkg"
-        mock_gd._get_package_exports.return_value = ["StoreCache", "NetCache"]
-        mock_gd._config.get.return_value = "numpy"
-        mock_gd._config.__getitem__.return_value = "numpy"
+        """Verify that configured member selection does not make `flush` ambiguous"""
+        mock_exports = _mock_exports()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.names.return_value = ["StoreCache", "NetCache"]
+        mock_exports.config.__getitem__.return_value = "numpy"
         # The renderer documents NetCache itself but, per its `members: false`
         # config, none of its members — only StoreCache.flush gets a page.
-        mock_gd.documented_objects.return_value = [
+        mock_documented_objects.return_value = [
             _make_documented_item(
                 "mypkg.StoreCache", ("StoreCache",), "A store.\n\nSee [](`flush`)."
             ),
@@ -968,7 +1060,7 @@ class TestRunLint:
             ),
             _make_documented_item("mypkg.NetCache", ("NetCache",), "A connection."),
         ]
-        mock_gd_cls.return_value = mock_gd
+        mock_exports_cls.make.side_effect = _made_from(mock_exports)
 
         store_flush = _make_griffe_obj(kind="function", docstring="Flush buffered writes.")
         net_flush = _make_griffe_obj(kind="function", docstring="Flush the socket.")
@@ -980,78 +1072,65 @@ class TestRunLint:
         )
         mock_pkg = MagicMock()
         mock_pkg.members = {"StoreCache": store_cls, "NetCache": net_cls}
-        mock_griffe_load.return_value = mock_pkg
+        mock_exports.package.return_value = mock_pkg
 
         result = run_lint(tmp_path)
 
         assert not any(i.check == "ambiguous-xref" for i in result.issues)
 
-    @patch("great_docs._lint.load_sources")
-    @patch("griffe.load")
-    @patch("great_docs.core.GreatDocs")
+    @patch("great_docs._checks.lint.load_sources")
+    @patch("great_docs._checks.lint.Exports")
     def test_an_unresolvable_reference_reads_no_sources(
-        self, mock_gd_cls, mock_griffe_load, mock_load_sources, tmp_path
+        self, mock_exports_cls, mock_load_sources, tmp_path
     ):
-        """`load_sources` is the only thing that would put a lint run on the
-        network, so a run over a project whose reference resolves nothing
-        must never call it."""
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = "mypkg"
-        mock_gd._resolve_importable_name.return_value = "mypkg"
-        mock_gd._get_package_exports.return_value = ["func_a"]
-        mock_gd._config.get.return_value = "numpy"
-        mock_gd._config.__getitem__.return_value = "numpy"
-        mock_gd.documented_objects.return_value = []
-        mock_gd_cls.return_value = mock_gd
+        """
+        Verify that an unresolved reference triggers no source loading
+
+        Source loading is the only operation that could access the network during linting.
+        A reference that resolves no objects must therefore load no sources.
+        """
+        mock_exports = _mock_exports()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.names.return_value = ["func_a"]
+        mock_exports.config.__getitem__.return_value = "numpy"
+        mock_exports_cls.make.side_effect = _made_from(mock_exports)
 
         func_a = _make_griffe_obj(docstring="Docs.\n\n%seealso nope")
         mock_pkg = MagicMock()
         mock_pkg.members = {"func_a": func_a}
-        mock_griffe_load.return_value = mock_pkg
+        mock_exports.package.return_value = mock_pkg
 
         run_lint(tmp_path)
 
         mock_load_sources.assert_not_called()
 
-    @patch("griffe.load")
-    @patch("great_docs.core.GreatDocs")
-    def test_resolves_module_name_when_project_name_differs(
-        self, mock_gd_cls, mock_griffe_load, tmp_path
-    ):
-        """Regression: run_lint loads griffe by the importable module name, not the
-        dash-normalized PyPI project name, when the two diverge."""
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = "my-dist"
-        mock_gd._resolve_importable_name.return_value = "actual_module"
-        mock_gd._get_package_exports.return_value = ["func_a"]
-        mock_gd._config.get.return_value = "numpy"
-        mock_gd._config.__getitem__.return_value = "numpy"
-        mock_gd_cls.return_value = mock_gd
+    @patch("great_docs._checks.lint.Exports")
+    def test_resolves_module_name_when_project_name_differs(self, mock_exports_cls, tmp_path):
+        """Verify that lint loads the importable module when its name differs from the project"""
+        mock_exports = _mock_exports()
+        write_pyproject(tmp_path, "my-dist")
+        mock_exports.config = mock_config(seo_enabled=False, sections=[], module="actual_module")
+        mock_exports.names.return_value = ["func_a"]
+        mock_exports.config.__getitem__.return_value = "numpy"
+        mock_exports_cls.make.side_effect = _made_from(mock_exports)
 
         func_a = _make_griffe_obj(docstring="Documented.\n\nParameters\n----------\nx : int\n")
         mock_pkg = MagicMock()
         mock_pkg.members = {"func_a": func_a}
-        mock_griffe_load.return_value = mock_pkg
+        mock_exports.package.return_value = mock_pkg
 
         result = run_lint(tmp_path)
 
-        mock_gd._resolve_importable_name.assert_called_once_with("my-dist")
-        mock_griffe_load.assert_called_once_with(
-            "actual_module", search_paths=mock_gd._griffe_search_paths.return_value
-        )
+        mock_exports.package.assert_called_once_with("actual_module")
         assert result.package_name == "actual_module"
 
-    @patch("griffe.load")
-    @patch("great_docs.core.GreatDocs")
-    def test_selective_checks(self, mock_gd_cls, mock_griffe_load, tmp_path):
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = "mypkg"
-        mock_gd._detect_module_name.return_value = None
-        mock_gd._normalize_package_name.return_value = "mypkg"
-        mock_gd._get_package_exports.return_value = ["func_a"]
-        mock_gd._config.get.return_value = "numpy"
-        mock_gd._config.__getitem__.return_value = "numpy"
-        mock_gd_cls.return_value = mock_gd
+    @patch("great_docs._checks.lint.Exports")
+    def test_selective_checks(self, mock_exports_cls, tmp_path):
+        mock_exports = _mock_exports()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.names.return_value = ["func_a"]
+        mock_exports.config.__getitem__.return_value = "numpy"
+        mock_exports_cls.make.side_effect = _made_from(mock_exports)
 
         # func_a has Google-style docstring (triggers style-mismatch) and no xref issues
         func_a = _make_griffe_obj(docstring="Docs.\n\nArgs:\n    x: val.\n")
@@ -1059,33 +1138,31 @@ class TestRunLint:
 
         mock_pkg = MagicMock()
         mock_pkg.members = members
-        mock_griffe_load.return_value = mock_pkg
+        mock_exports.package.return_value = mock_pkg
 
-        # Only run docstrings check — should find no issue (func_a has a docstring)
+        # A documented function passes the presence check even when its style differs.
         result = run_lint(tmp_path, checks={"docstrings"})
 
         assert all(i.check != "style-mismatch" for i in result.issues)
 
-        # Only run style check — should find style mismatch
+        # The style check detects the mismatch independently of docstring presence.
         result = run_lint(tmp_path, checks={"style"})
 
         assert any(i.check == "style-mismatch" for i in result.issues)
 
-    @patch("griffe.load")
-    @patch("great_docs.core.GreatDocs")
-    def test_config_check_runs_alone(self, mock_gd_cls, mock_griffe_load, tmp_path):
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = "mypkg"
-        mock_gd._normalize_package_name.return_value = "mypkg"
-        mock_gd._get_package_exports.return_value = ["func_a"]
-        mock_gd._config.__getitem__.return_value = "numpy"
-        mock_gd._config._user_config = {"site": {"language": "fr"}}
-        mock_gd_cls.return_value = mock_gd
+    @patch("great_docs._checks.lint.Exports")
+    def test_config_check_runs_alone(self, mock_exports_cls, tmp_path):
+        mock_exports = _mock_exports()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.names.return_value = ["func_a"]
+        mock_exports.config.__getitem__.return_value = "numpy"
+        mock_exports.config.user_settings = {"site": {"language": "fr"}}
+        mock_exports_cls.make.side_effect = _made_from(mock_exports)
 
         # func_a has no docstring, so the docstrings check would report it.
         mock_pkg = MagicMock()
         mock_pkg.members = {"func_a": _make_griffe_obj(docstring=None)}
-        mock_griffe_load.return_value = mock_pkg
+        mock_exports.package.return_value = mock_pkg
 
         result = run_lint(tmp_path, checks={"config"})
 
@@ -1099,35 +1176,30 @@ class TestRunLint:
 
         assert result.issues == []
 
-    @patch("griffe.load")
-    @patch("great_docs.core.GreatDocs")
-    def test_no_exports(self, mock_gd_cls, mock_griffe_load, tmp_path):
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = "mypkg"
-        mock_gd._normalize_package_name.return_value = "mypkg"
-        mock_gd._get_package_exports.return_value = None
-        mock_gd._config.get.return_value = "numpy"
-        mock_gd._config.__getitem__.return_value = "numpy"
-        mock_gd_cls.return_value = mock_gd
+    @patch("great_docs._checks.lint.Exports")
+    def test_no_exports(self, mock_exports_cls, tmp_path):
+        mock_exports = _mock_exports()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.names.return_value = None
+        mock_exports.config.__getitem__.return_value = "numpy"
+        mock_exports_cls.make.side_effect = _made_from(mock_exports)
 
         mock_pkg = MagicMock()
         mock_pkg.members = {}
-        mock_griffe_load.return_value = mock_pkg
+        mock_exports.package.return_value = mock_pkg
 
         result = run_lint(tmp_path)
 
         assert result.status == "pass"
         assert result.exports_count == 0
 
-    @patch("griffe.load")
-    @patch("great_docs.core.GreatDocs")
-    def test_griffe_load_failure(self, mock_gd_cls, mock_griffe_load, tmp_path):
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = "mypkg"
-        mock_gd._normalize_package_name.return_value = "mypkg"
-        mock_gd_cls.return_value = mock_gd
+    @patch("great_docs._checks.lint.Exports")
+    def test_griffe_load_failure(self, mock_exports_cls, tmp_path):
+        mock_exports = _mock_exports()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports_cls.make.side_effect = _made_from(mock_exports)
 
-        mock_griffe_load.side_effect = Exception("Module not found")
+        mock_exports.package.side_effect = ImportError("Module not found")
 
         result = run_lint(tmp_path)
 
@@ -1158,31 +1230,28 @@ class TestJsonOutput:
 class TestRunLintQuiet:
     """Tests that exercise the quiet=True branches for stdout suppression."""
 
-    @patch("griffe.load")
-    @patch("great_docs.core.GreatDocs")
-    def test_quiet_suppresses_output(self, mock_gd_cls, mock_griffe_load, tmp_path, capsys):
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = "mypkg"
-        mock_gd._normalize_package_name.return_value = "mypkg"
-        mock_gd._get_package_exports.return_value = ["func_a"]
-        mock_gd._config.get.return_value = "numpy"
-        mock_gd._config.__getitem__.return_value = "numpy"
-        mock_gd_cls.return_value = mock_gd
+    @patch("great_docs._checks.lint.Exports")
+    def test_quiet_suppresses_output(self, mock_exports_cls, tmp_path, capsys):
+        mock_exports = _mock_exports()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports.names.return_value = ["func_a"]
+        mock_exports.config.__getitem__.return_value = "numpy"
+        mock_exports_cls.make.side_effect = _made_from(mock_exports)
 
         func_a = _make_griffe_obj(docstring="Documented.")
         mock_pkg = MagicMock()
         mock_pkg.members = {"func_a": func_a}
-        mock_griffe_load.return_value = mock_pkg
+        mock_exports.package.return_value = mock_pkg
 
         result = run_lint(tmp_path, quiet=True)
 
         assert result.status == "pass"
 
-    @patch("great_docs.core.GreatDocs")
-    def test_quiet_no_package_restores_stdout(self, mock_gd_cls, tmp_path):
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = None
-        mock_gd_cls.return_value = mock_gd
+    @patch("great_docs._checks.lint.Exports")
+    def test_quiet_no_package_restores_stdout(self, mock_exports_cls, tmp_path):
+        mock_exports = _mock_exports()
+        write_pyproject(tmp_path, None)
+        mock_exports_cls.make.side_effect = _made_from(mock_exports)
 
         import sys
 
@@ -1193,43 +1262,13 @@ class TestRunLintQuiet:
         assert sys.stdout is original_stdout
         assert result.status == "fail"
 
-    @patch("great_docs.core.GreatDocs")
-    def test_quiet_griffe_import_error_restores_stdout(self, mock_gd_cls, tmp_path):
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = "mypkg"
-        mock_gd._normalize_package_name.return_value = "mypkg"
-        mock_gd_cls.return_value = mock_gd
+    @patch("great_docs._checks.lint.Exports")
+    def test_quiet_griffe_load_failure_restores_stdout(self, mock_exports_cls, tmp_path):
+        mock_exports = _mock_exports()
+        write_pyproject(tmp_path, "mypkg")
+        mock_exports_cls.make.side_effect = _made_from(mock_exports)
 
-        import builtins
-        import sys
-
-        original_import = builtins.__import__
-        original_stdout = sys.stdout
-
-        def mock_import(name, *args, **kwargs):
-            if name == "griffe":
-                raise ImportError("No module named 'griffe'")
-            return original_import(name, *args, **kwargs)
-
-        with patch.dict("sys.modules", {"griffe": None}):
-            with patch("builtins.__import__", side_effect=mock_import):
-                result = run_lint(tmp_path, quiet=True)
-
-        assert sys.stdout is original_stdout
-        assert result.status == "fail"
-        assert any("griffe" in i.message for i in result.issues)
-
-    @patch("griffe.load")
-    @patch("great_docs.core.GreatDocs")
-    def test_quiet_griffe_load_failure_restores_stdout(
-        self, mock_gd_cls, mock_griffe_load, tmp_path
-    ):
-        mock_gd = _mock_docs()
-        mock_gd._detect_package_name.return_value = "mypkg"
-        mock_gd._normalize_package_name.return_value = "mypkg"
-        mock_gd_cls.return_value = mock_gd
-
-        mock_griffe_load.side_effect = RuntimeError("Cannot load")
+        mock_exports.package.side_effect = RuntimeError("Cannot load")
 
         import sys
 
@@ -1239,10 +1278,10 @@ class TestRunLintQuiet:
         assert sys.stdout is original_stdout
         assert result.status == "fail"
 
-    @patch("great_docs.core.GreatDocs")
-    def test_quiet_constructor_exception_restores_stdout(self, mock_gd_cls, tmp_path):
-        """When GreatDocs() constructor raises, stdout is restored before re-raising."""
-        mock_gd_cls.side_effect = RuntimeError("constructor boom")
+    @patch("great_docs._checks.lint.Exports")
+    def test_quiet_constructor_exception_restores_stdout(self, mock_exports_cls, tmp_path):
+        """Verify that quiet mode restores standard output before propagating project read errors"""
+        mock_exports_cls.make.side_effect = RuntimeError("constructor boom")
 
         import sys
 
@@ -1254,31 +1293,9 @@ class TestRunLintQuiet:
 
 
 class TestHelperEdgeCases:
-    def test_get_docstring_exception(self):
-        """Test _get_docstring when accessing docstring raises an exception."""
-        from great_docs._lint import _get_docstring
-
-        obj = MagicMock()
-        obj.docstring = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
-        # Make hasattr+access raise
-        type(obj).docstring = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
-        result = _get_docstring(obj)
-
-        assert result is None
-
-    def test_iter_public_members_exception(self):
-        """Test _iter_public_members when members.items() raises."""
-        from great_docs._lint import _iter_public_members
-
-        obj = MagicMock()
-        obj.members.items.side_effect = RuntimeError("broken")
-        members = list(_iter_public_members(obj))
-
-        assert members == []
-
     def test_iter_public_members_yields_dunders(self):
         """Test that public dunders (not __init__) are yielded."""
-        from great_docs._lint import _iter_public_members
+        from great_docs._checks.lint import _iter_public_members
 
         method_repr = MagicMock()
         method_init = MagicMock()
@@ -1300,28 +1317,6 @@ class TestHelperEdgeCases:
 
 
 class TestCheckMissingDocstringsEdgeCases:
-    def test_class_member_kind_exception(self):
-        """When member.kind.value raises, skip that member gracefully."""
-        broken_member = MagicMock()
-        broken_member.kind.value = property(
-            lambda self: (_ for _ in ()).throw(RuntimeError("boom"))
-        )
-        # Make kind.value raise
-        type(broken_member.kind).value = property(
-            lambda self: (_ for _ in ()).throw(RuntimeError("boom"))
-        )
-
-        cls = _make_griffe_obj(
-            kind="class",
-            docstring="Documented class.",
-            members={"broken": broken_member},
-        )
-        pkg = _make_pkg({"MyClass": cls})
-        result = LintResult()
-        _check_missing_docstrings(pkg, "mypkg", ["MyClass"], result)
-
-        assert all(i.symbol != "MyClass.broken" for i in result.issues)
-
     def test_class_member_non_function_skipped(self):
         """Attributes (non-function members) should not generate missing-docstring warnings."""
         attr = _make_griffe_obj(kind="attribute", docstring=None)
@@ -1335,15 +1330,6 @@ class TestCheckMissingDocstringsEdgeCases:
         _check_missing_docstrings(pkg, "mypkg", ["MyClass"], result)
 
         assert len(result.issues) == 0
-
-    def test_class_outer_exception(self):
-        """When obj.kind.value raises, the outer except catches it."""
-        obj = _make_griffe_obj(docstring="Has docstring.")
-        # Override kind to raise on value access
-        type(obj.kind).value = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
-        pkg = _make_pkg({"weird_obj": obj})
-        result = LintResult()
-        _check_missing_docstrings(pkg, "mypkg", ["weird_obj"], result)
 
     def test_class_method_with_docstring_loop_continues(self):
         """Class method WITH a docstring: no issue added, loop continues."""
@@ -1458,42 +1444,6 @@ class TestCheckCrossReferencesEdgeCases:
         assert result.issues[0].symbol == "MyClass.my_method"
         assert "ghost_func" in result.issues[0].message
 
-    def test_class_kind_exception_while_scanning(self):
-        """When obj.kind.value raises while scanning a docstring, skip gracefully."""
-        obj = _make_griffe_obj(docstring="Doc.")
-        type(obj.kind).value = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
-        pkg = _make_pkg({"broken_cls": obj})
-        result = LintResult()
-        _check_cross_references(
-            pkg,
-            "mypkg",
-            ["broken_cls"],
-            _documented("broken_cls"),
-            _index(_documented("broken_cls")),
-            (),
-            result,
-        )
-
-    def test_class_outer_exception_in_method_xref(self):
-        """When iterating class methods raises, the outer except catches it."""
-        obj = _make_griffe_obj(docstring="Doc.\n\n%seealso something")
-        # First call to kind.value works (for the top-level xref check),
-        # but accessing members raises
-        obj.kind.value = "class"
-        obj.members = MagicMock()
-        obj.members.items.side_effect = RuntimeError("boom")
-        pkg = _make_pkg({"MyClass": obj, "something": _make_griffe_obj(docstring="X.")})
-        result = LintResult()
-        _check_cross_references(
-            pkg,
-            "mypkg",
-            ["MyClass", "something"],
-            _documented("MyClass", "something"),
-            _index(_documented("MyClass", "something")),
-            (),
-            result,
-        )
-
 
 class TestMixedStyleDocstrings:
     """
@@ -1547,14 +1497,6 @@ class TestCheckDocstringStyleEdgeCases:
         _check_docstring_style(pkg, "mypkg", ["missing"], "numpy", result)
 
         assert len(result.issues) == 0
-
-    def test_class_method_style_exception(self):
-        """When class kind raises, outer except catches it."""
-        obj = _make_griffe_obj(docstring="Short.")
-        type(obj.kind).value = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
-        pkg = _make_pkg({"broken": obj})
-        result = LintResult()
-        _check_docstring_style(pkg, "mypkg", ["broken"], "numpy", result)
 
     def test_no_docstring_skipped(self):
         """Export with None docstring is skipped without error."""
@@ -1620,14 +1562,6 @@ class TestCheckDirectiveConsistencyEdgeCases:
 
         assert len(result.issues) == 0
 
-    def test_class_kind_exception(self):
-        """When class kind raises, outer except catches it."""
-        obj = _make_griffe_obj(docstring="Short.")
-        type(obj.kind).value = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
-        pkg = _make_pkg({"broken": obj})
-        result = LintResult()
-        _check_directive_consistency(pkg, "mypkg", ["broken"], result)
-
     def test_no_docstring_on_export(self):
         """Export with no docstring should be skipped."""
         pkg = _make_pkg({"func_a": _make_griffe_obj(docstring=None)})
@@ -1689,7 +1623,7 @@ class TestCheckStaleVersions:
         )
 
     def test_stale_badge_detected(self, tmp_path):
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -1701,14 +1635,14 @@ class TestCheckStaleVersions:
             },
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         stale = [i for i in result.issues if i.check == "stale-badge"]
         assert len(stale) == 1
         assert "0.3" in stale[0].message
         assert "4 releases behind" in stale[0].message
 
     def test_fresh_badge_not_flagged(self, tmp_path):
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -1720,12 +1654,12 @@ class TestCheckStaleVersions:
             },
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         stale = [i for i in result.issues if i.check == "stale-badge"]
         assert len(stale) == 0
 
     def test_stale_callout_detected(self, tmp_path):
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -1740,14 +1674,14 @@ class TestCheckStaleVersions:
             },
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         stale = [i for i in result.issues if i.check == "stale-callout"]
         assert len(stale) == 1
         assert "0.2" in stale[0].message
         assert stale[0].severity == "info"
 
     def test_fresh_callout_not_flagged(self, tmp_path):
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -1762,12 +1696,12 @@ class TestCheckStaleVersions:
             },
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         stale = [i for i in result.issues if i.check == "stale-callout"]
         assert len(stale) == 0
 
     def test_stale_upcoming_detected(self, tmp_path):
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -1777,14 +1711,14 @@ class TestCheckStaleVersions:
             },
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         stale = [i for i in result.issues if i.check == "stale-upcoming"]
         assert len(stale) == 1
         assert "0.5" in stale[0].message
         assert "already-released" in stale[0].message
 
     def test_valid_upcoming_not_flagged(self, tmp_path):
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -1794,12 +1728,12 @@ class TestCheckStaleVersions:
             },
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         stale = [i for i in result.issues if i.check == "stale-upcoming"]
         assert len(stale) == 0
 
     def test_deprecated_callout_stale(self, tmp_path):
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -1814,13 +1748,13 @@ class TestCheckStaleVersions:
             },
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         stale = [i for i in result.issues if i.check == "stale-callout"]
         assert len(stale) == 1
         assert "version-deprecated" in stale[0].message
 
     def test_custom_thresholds(self, tmp_path):
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         # Use a very high threshold so nothing is flagged
         config = (
@@ -1839,19 +1773,19 @@ class TestCheckStaleVersions:
             '::: {.version-note version="0.1"}\nOld.\n:::\n'
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         assert len(result.issues) == 0
 
     def test_no_versions_config_skips(self, tmp_path):
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         (tmp_path / "great-docs.yml").write_text("theme: default\n")
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         assert len(result.issues) == 0
 
     def test_skips_underscore_dirs(self, tmp_path):
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -1861,7 +1795,7 @@ class TestCheckStaleVersions:
             },
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         assert len(result.issues) == 0
 
     def test_skips_versioned_build_dirs(self, tmp_path):
@@ -1872,7 +1806,7 @@ class TestCheckStaleVersions:
         `great-docs-<tag>/`. Scanning those copies would duplicate each finding,
         while a nested user directory must remain in scope.
         """
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -1896,13 +1830,13 @@ class TestCheckStaleVersions:
             encoding="utf-8",
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         stale = [i for i in result.issues if i.check == "stale-badge"]
         assert len(stale) == 1
         assert "great-docs-examples" in stale[0].symbol
 
     def test_checks_unmarked_root_directory_with_build_like_name(self, tmp_path):
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -1913,14 +1847,14 @@ class TestCheckStaleVersions:
         )
 
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
 
         stale = [i for i in result.issues if i.check == "stale-badge"]
         assert len(stale) == 1
         assert "great-docs-notes" in stale[0].symbol
 
     def test_line_numbers_correct(self, tmp_path):
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -1932,34 +1866,43 @@ class TestCheckStaleVersions:
             },
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         stale = [i for i in result.issues if i.check == "stale-badge"]
         assert len(stale) == 1
         assert stale[0].symbol == "user_guide/page.qmd:7"
 
     def test_yaml_parse_error_skips(self, tmp_path):
         """Invalid YAML in great-docs.yml returns silently."""
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         (tmp_path / "great-docs.yml").write_text("versions: [\n  unclosed bracket")
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
+        assert result.issues == []
+
+    def test_configuration_that_is_not_a_mapping_skips(self, tmp_path):
+        """Report no stale versions when configuration is a YAML list"""
+        from great_docs._checks.lint import _check_stale_versions
+
+        (tmp_path / "great-docs.yml").write_text("- 0.2\n- 0.1\n")
+        result = LintResult()
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         assert result.issues == []
 
     def test_empty_versions_after_parse_skips(self, tmp_path):
         """When parse_versions_config returns empty list, returns silently."""
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         (tmp_path / "great-docs.yml").write_text("versions:\n  - tag: v0.1\n    label: '0.1'\n")
         result = LintResult()
-        with patch("great_docs._versioning.parse_versions_config", return_value=[]):
-            _check_stale_versions(tmp_path, result)
+        with patch("great_docs._versions.model.parse_versions_config", return_value=[]):
+            _check_stale_versions(Config(tmp_path), tmp_path, result)
         assert result.issues == []
 
     def test_no_latest_marked_falls_back_to_first_nonprerelease(self, tmp_path):
         """No version has latest=True: fallback loop sets latest_entry to first non-prerelease."""
-        from great_docs._lint import _check_stale_versions
-        from great_docs._versioning import VersionEntry
+        from great_docs._checks.lint import _check_stale_versions
+        from great_docs._versions.model import VersionEntry
 
         # Return versions with no latest=True so the fallback loop (lines 584-587) is exercised
         versions_no_latest = [
@@ -1969,13 +1912,15 @@ class TestCheckStaleVersions:
         ]
         (tmp_path / "great-docs.yml").write_text("versions:\n  - tag: '0.5'\n    label: '0.5'\n")
         result = LintResult()
-        with patch("great_docs._versioning.parse_versions_config", return_value=versions_no_latest):
-            _check_stale_versions(tmp_path, result)
+        with patch(
+            "great_docs._versions.model.parse_versions_config", return_value=versions_no_latest
+        ):
+            _check_stale_versions(Config(tmp_path), tmp_path, result)
         # Ran without error; latest_entry was set to 0.5 via fallback loop
 
     def test_only_prerelease_versions_skips(self, tmp_path):
         """When all versions are prerelease, latest_entry stays None and returns."""
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         versions_yaml = '  - label: "dev"\n    tag: dev\n    prerelease: true\n'
         self._make_project(
@@ -1984,12 +1929,12 @@ class TestCheckStaleVersions:
             {"page.qmd": "---\ntitle: T\n---\n\nContent.\n"},
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         assert result.issues == []
 
     def test_version_field_added_to_released_set(self, tmp_path):
         """Non-prerelease version with a version field: version string added to released set."""
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         versions_yaml = (
             '  - label: "0.7"\n'
@@ -2006,7 +1951,7 @@ class TestCheckStaleVersions:
             {"page.qmd": '---\ntitle: T\nupcoming: "0.7.0"\n---\n\nContent.\n'},
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         stale = [i for i in result.issues if i.check == "stale-upcoming"]
         assert len(stale) == 1
         assert "0.7.0" in stale[0].message
@@ -2015,7 +1960,7 @@ class TestCheckStaleVersions:
         """Files that raise OSError when read are silently skipped."""
         from pathlib import Path
 
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -2031,12 +1976,12 @@ class TestCheckStaleVersions:
 
         result = LintResult()
         with patch.object(Path, "read_text", _raise_for_qmd):
-            _check_stale_versions(tmp_path, result)
+            _check_stale_versions(Config(tmp_path), tmp_path, result)
         assert result.issues == []
 
     def test_badge_without_version_number_skipped(self, tmp_path):
         """Badge with no version arg ([version-badge new]) is skipped."""
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -2044,26 +1989,26 @@ class TestCheckStaleVersions:
             {"page.qmd": "---\ntitle: T\n---\n\n[version-badge new]\n"},
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         assert not any(i.check == "stale-badge" for i in result.issues)
 
     def test_expired_new_badge_advice(self, tmp_path):
         """Expired 'new' badge shows 'consider removing' advice."""
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         config = f"versions:\n{self._versions_yaml}\nnew_is_old: '3 releases'\n"
         (tmp_path / "great-docs.yml").write_text(config)
         qmd = tmp_path / "page.qmd"
         qmd.write_text("---\ntitle: T\n---\n\n[version-badge new 0.1]\n")
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         stale = [i for i in result.issues if i.check == "stale-badge"]
         assert len(stale) == 1
         assert "consider removing" in stale[0].message
 
     def test_stale_changed_badge(self, tmp_path):
         """Stale 'changed' badge uses 'still displays in all versions' advice."""
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -2071,14 +2016,14 @@ class TestCheckStaleVersions:
             {"page.qmd": "---\ntitle: T\n---\n\n[version-badge changed 0.1]\n"},
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         stale = [i for i in result.issues if i.check == "stale-badge"]
         assert len(stale) == 1
         assert "still displays in all versions" in stale[0].message
 
     def test_version_note_without_version_attr_skipped(self, tmp_path):
         """::: {.version-note} without a version= attribute is skipped."""
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -2086,12 +2031,12 @@ class TestCheckStaleVersions:
             {"page.qmd": "---\ntitle: T\n---\n\n::: {.version-note}\nSome note.\n:::\n"},
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         assert not any(i.check == "stale-callout" for i in result.issues)
 
     def test_deprecated_callout_without_version_attr_skipped(self, tmp_path):
         """::: {.version-deprecated} without a version= attribute is skipped."""
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -2099,12 +2044,12 @@ class TestCheckStaleVersions:
             {"page.qmd": "---\ntitle: T\n---\n\n::: {.version-deprecated}\nUse new().\n:::\n"},
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         assert not any(i.check == "stale-callout" for i in result.issues)
 
     def test_fresh_deprecated_callout_not_flagged(self, tmp_path):
         """Deprecated callout that is within the threshold is not reported."""
-        from great_docs._lint import _check_stale_versions
+        from great_docs._checks.lint import _check_stale_versions
 
         self._make_project(
             tmp_path,
@@ -2120,7 +2065,7 @@ class TestCheckStaleVersions:
             },
         )
         result = LintResult()
-        _check_stale_versions(tmp_path, result)
+        _check_stale_versions(Config(tmp_path), tmp_path, result)
         assert not any(i.check == "stale-callout" for i in result.issues)
 
 
@@ -2133,7 +2078,7 @@ class TestVersionDistance:
     """Tests for the _version_distance() helper."""
 
     def _entry(self, tag: str, prerelease: bool = False):
-        from great_docs._versioning import VersionEntry
+        from great_docs._versions.model import VersionEntry
 
         return VersionEntry(tag=tag, label=tag, prerelease=prerelease)
 
@@ -2175,14 +2120,33 @@ class TestExtractFrontmatterUpcoming:
         assert result == "0.9"
 
 
+def _read_project(root: Path) -> tuple[Config, Layout]:
+    """
+    Read a project's configuration and directories from its files
+
+    Parameters
+    ----------
+    root
+        The project directory.
+
+    Returns
+    -------
+    :
+        The configuration and the directories.
+    """
+    layout = Layout.make(root)
+    config = layout.load_config()
+    return config, layout
+
+
 class TestCheckPageDescriptions:
     """Pages an author writes are flagged when they fall back to the default description."""
 
     LONG = "This page explains how the package adds numbers together."
 
-    def _project(self, tmp_path: Path, *, description: str = "Adds numbers", seo: bool = True):
-        from great_docs.core import GreatDocs
-
+    def _project(
+        self, tmp_path: Path, *, description: str = "Adds numbers", seo: bool = True
+    ) -> tuple[Config, Layout]:
         (tmp_path / "pyproject.toml").write_text(
             f'[project]\nname = "pkg"\nversion = "1.0"\ndescription = "{description}"\n'
         )
@@ -2196,13 +2160,13 @@ class TestCheckPageDescriptions:
         (guide / "03-own.qmd").write_text("---\ndescription: Own\n---\n\n```python\nx\n```\n")
         (guide / "_partial.qmd").write_text("```python\nx = 1\n```\n")
         (tmp_path / "README.md").write_text("# pkg\n\n- a list\n")
-        return GreatDocs(project_path=str(tmp_path))
+        return _read_project(tmp_path)
 
     def _issues(self, tmp_path: Path, **kwargs) -> list[LintIssue]:
-        from great_docs._lint import _check_page_descriptions
+        from great_docs._checks.lint import _check_page_descriptions
 
         result = LintResult()
-        _check_page_descriptions(self._project(tmp_path, **kwargs), tmp_path, result)
+        _check_page_descriptions(*self._project(tmp_path, **kwargs), tmp_path, result)
         return result.issues
 
     def test_flags_each_fallback_with_its_reason(self, tmp_path: Path):
@@ -2227,13 +2191,28 @@ class TestCheckPageDescriptions:
     def test_nothing_is_flagged_when_seo_is_disabled(self, tmp_path: Path):
         assert self._issues(tmp_path, seo=False) == []
 
+    def test_homepage_is_described_without_its_badges(self, tmp_path: Path):
+        from great_docs._checks.lint import _check_page_descriptions
+
+        config, layout = self._project(tmp_path)
+        (tmp_path / "logo-hero.svg").write_text("<svg/>")
+        (tmp_path / "README.md").write_text(
+            '<div align="center">\n\n[![CI](https://img.shields.io/ci)](https://ci)\n\n</div>\n\n'
+            f"{self.LONG}\n"
+        )
+        result = LintResult()
+
+        _check_page_descriptions(config, layout, tmp_path, result)
+
+        assert "README.md" not in {issue.symbol for issue in result.issues}
+        assert not layout.build_dir.exists()
+
 
 class TestCheckFrontMatter:
     """Warnings for Great Docs front matter values with unsupported types"""
 
     def _issues(self, tmp_path: Path, pages: dict[str, str]) -> list[LintIssue]:
-        from great_docs._lint import _check_front_matter
-        from great_docs.core import GreatDocs
+        from great_docs._checks.lint import _check_front_matter
 
         (tmp_path / "pyproject.toml").write_text('[project]\nname = "pkg"\nversion = "1.0"\n')
         (tmp_path / "pkg").mkdir()
@@ -2243,7 +2222,7 @@ class TestCheckFrontMatter:
         for name, front_matter in pages.items():
             (guide / name).write_text(f"---\n{front_matter}---\n\nText\n")
         result = LintResult()
-        _check_front_matter(GreatDocs(project_path=str(tmp_path)), tmp_path, result)
+        _check_front_matter(*_read_project(tmp_path), tmp_path, result)
         return result.issues
 
     def test_flags_each_key_of_the_wrong_type(self, tmp_path: Path):

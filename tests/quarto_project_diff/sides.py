@@ -1,0 +1,510 @@
+"""
+Checkouts and controlled build environments for the two sides of a comparison
+
+A side is a checkout with its own virtual environment. The base side is a detached worktree
+of the base commit, kept in the cache directory with a virtual environment synced from the
+test checkout's `uv.lock`. Every build command runs with a stub `quarto` first on `PATH`,
+the side's `bin` directory next, a failing HTTP proxy and a fixed hash seed.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import shlex
+import shutil
+import subprocess
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+# Report the minimum supported Quarto version so builds pass the normal version check.
+STUB_QUARTO_VERSION = "1.9.18"
+
+# Fail proxied GitHub and PyPI requests consistently, regardless of network availability.
+DEAD_PROXY = "http://127.0.0.1:9"
+
+# Variables passed through from this process's environment, besides `LC_*`.
+INHERITED_VARIABLES = ("HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "TERM")
+
+# The stub `quarto` reads these variables without importing this package.
+QUARTO_LOG_VARIABLE = "GREAT_DOCS_QUARTO_PROJECT_DIFF_QUARTO_LOG"
+RENDER_PAGES_VARIABLE = "GREAT_DOCS_QUARTO_PROJECT_DIFF_RENDER_PAGES"
+PREVIEW_HOLD_VARIABLE = "GREAT_DOCS_QUARTO_PROJECT_DIFF_PREVIEW_HOLD"
+PREVIEW_DIRECTORY_VARIABLE = "GREAT_DOCS_QUARTO_PROJECT_DIFF_PREVIEW_DIRECTORY"
+
+_STUB_TEMPLATE = """\
+#!/bin/sh
+# Quarto stand-in written by the great-docs Quarto project diff. `render` and `preview`
+# succeed without output; every other subcommand runs the real Quarto. When ${pages} is
+# set, `render` writes a placeholder `_site/` page for each page that Quarto would render.
+# When ${served} is set, `preview` writes its working directory, the project it serves, to
+# that file. When ${hold} is set, `preview` runs for that many seconds, as a server would.
+if [ -n "${log}" ]; then
+  printf '%s\\n' "$*" >> "${log}"
+fi
+case "$1" in
+  --version) echo "{version}"; exit 0 ;;
+  render)
+    if [ -n "${pages}" ]; then
+      find . -name '*.qmd' ! -path '*/_*' | while IFS= read -r page; do
+        target="_site/${{page#./}}"
+        target="${{target%.qmd}}.html"
+        mkdir -p "${{target%/*}}"
+        printf '<html><body>%s</body></html>\\n' "${{page#./}}" > "$target"
+      done
+    fi
+    exit 0 ;;
+  preview)
+    if [ -n "${served}" ]; then
+      pwd > "${served}.tmp" && mv "${served}.tmp" "${served}"
+    fi
+    if [ -n "${hold}" ]; then
+      exec sleep "${hold}"
+    fi
+    exit 0 ;;
+esac
+exec {real} "$@"
+"""
+
+
+class RequirementError(RuntimeError):
+    """An unmet requirement that prevents a run or recording"""
+
+
+@dataclass(frozen=True)
+class Side:
+    """
+    A checkout and the virtual environment that builds it
+
+    Attributes
+    ----------
+    label :
+        `base` or `test`; names the recording directory.
+    checkout :
+        Root of the checkout.
+    venv :
+        Its virtual environment.
+    facts :
+        Recorded commit, interpreter, tool versions and installed distributions.
+    """
+
+    label: str
+    checkout: Path
+    venv: Path
+    facts: Mapping[str, Any] = field(default_factory=dict[str, Any])
+
+    @property
+    def bin(self) -> Path:
+        """Directory of the environment's executables"""
+        return self.venv / "bin"
+
+    @property
+    def great_docs_dir(self) -> Path:
+        """Source directory of the `great_docs` package in the checkout"""
+        return self.checkout / "great_docs"
+
+
+def run_checked(argv: Sequence[str], cwd: Path, env: Mapping[str, str] | None = None) -> str:
+    """
+    Run a helper command and return its standard output
+
+    Parameters
+    ----------
+    argv :
+        Command and arguments.
+    cwd :
+        Working directory.
+    env :
+        Environment; this process's own when `None`.
+
+    Returns
+    -------
+    :
+        Standard output with surrounding whitespace removed.
+
+    Raises
+    ------
+    RequirementError
+        If the command cannot start or exits non-zero.
+    """
+    try:
+        proc = subprocess.run(
+            list(argv),
+            cwd=cwd,
+            env=None if env is None else dict(env),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise RequirementError(f"Cannot run {shlex.join(argv)}: {exc}") from exc
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout).strip()[-2000:]
+        raise RequirementError(f"{shlex.join(argv)} exited {proc.returncode}:\n{tail}")
+    return proc.stdout.strip()
+
+
+def own_checkout() -> Path:
+    """
+    Locate the checkout that holds this tool
+
+    Returns
+    -------
+    :
+        Its root directory.
+    """
+    return Path(__file__).resolve().parents[2]
+
+
+def checkout_side(checkout: Path) -> Side:
+    """
+    Describe a checkout that already has a virtual environment
+
+    Parameters
+    ----------
+    checkout :
+        Root of the checkout; its `.venv` must hold `great-docs`.
+
+    Returns
+    -------
+    :
+        The side, labelled `test`, without facts.
+
+    Raises
+    ------
+    RequirementError
+        If the checkout has no `.venv/bin/great-docs`.
+    """
+    checkout = checkout.resolve()
+    venv = checkout / ".venv"
+    if not (venv / "bin" / "great-docs").exists():
+        raise RequirementError(
+            f"{checkout} has no .venv/bin/great-docs; run "
+            "`env -u VIRTUAL_ENV uv sync --extra dev --frozen` there first"
+        )
+    return Side("test", checkout, venv)
+
+
+def branch_point(checkout: Path) -> str:
+    """
+    Find the commit where the checkout's `HEAD` branched from `main`
+
+    Comparing with this commit rather than with `main`'s tip keeps commits that landed on
+    `main` after the branch point out of the report.
+
+    Parameters
+    ----------
+    checkout :
+        The checkout under test.
+
+    Returns
+    -------
+    :
+        The merge base of `main` and `HEAD`, which is `main`'s tip when `HEAD` is up to date
+        with it.
+
+    Raises
+    ------
+    RequirementError
+        If `main` is unknown or shares no history with `HEAD`.
+    """
+    return run_checked(["git", "merge-base", "main", "HEAD"], checkout)
+
+
+def base_side(checkout: Path, ref: str, cache: Path, python_version: str) -> Side:
+    """
+    Prepare a clean worktree of a base commit with its own virtual environment
+
+    The worktree lives in `cache/worktrees/<sha>` and is reused by later runs against the
+    same commit; a lock file serialises its preparation between concurrent runs. The
+    environment is synced from the checkout's `uv.lock` with the given interpreter.
+
+    Parameters
+    ----------
+    checkout :
+        The checkout under test; supplies the repository and `uv.lock`.
+    ref :
+        Base revision, for example `main`.
+    cache :
+        The cache directory.
+    python_version :
+        Interpreter version for the environment, matching the test side.
+
+    Returns
+    -------
+    :
+        The side, labelled `base`, without facts.
+
+    Raises
+    ------
+    RequirementError
+        If the revision is unknown, `uv.lock` or `uv` is missing, the worktree has local
+        changes, or the sync fails.
+    """
+    sha = run_checked(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], checkout)
+    lock_file = checkout / "uv.lock"
+    if not lock_file.is_file():
+        raise RequirementError(f"{checkout} has no uv.lock to copy into the base worktree")
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RequirementError("`uv` is not on PATH; the base worktree needs it")
+    worktrees = cache / "worktrees"
+    worktrees.mkdir(parents=True, exist_ok=True)
+    tree = worktrees / sha[:12]
+    with (worktrees / f"{sha[:12]}.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not tree.exists():
+            _ = run_checked(
+                ["git", "worktree", "add", "--force", "--detach", str(tree), sha], checkout
+            )
+        if run_checked(["git", "rev-parse", "HEAD"], tree) != sha:
+            raise RequirementError(f"{tree} is not at {sha}; remove it with `git worktree remove`")
+        if run_checked(["git", "status", "--porcelain"], tree):
+            raise RequirementError(
+                f"{tree} has local changes; remove it with `git worktree remove`"
+            )
+        _ = shutil.copyfile(lock_file, tree / "uv.lock")
+        env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+        _ = run_checked(
+            [uv, "sync", "--extra", "dev", "--frozen", "--python", python_version, "--quiet"],
+            tree,
+            env,
+        )
+    return Side("base", tree, tree / ".venv")
+
+
+def write_stub(directory: Path, real_quarto: str) -> Path:
+    """
+    Write the stub `quarto` executable
+
+    Parameters
+    ----------
+    directory :
+        Directory that will be first on the build's `PATH`.
+    real_quarto :
+        Path of the real Quarto, which runs every subcommand except `render`, `preview`
+        and `--version`.
+
+    Returns
+    -------
+    :
+        The stub's path.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    stub = directory / "quarto"
+    _ = stub.write_text(
+        _STUB_TEMPLATE.format(
+            log=QUARTO_LOG_VARIABLE,
+            pages=RENDER_PAGES_VARIABLE,
+            hold=PREVIEW_HOLD_VARIABLE,
+            served=PREVIEW_DIRECTORY_VARIABLE,
+            version=STUB_QUARTO_VERSION,
+            real=shlex.quote(real_quarto),
+        ),
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def search_path(side: Side, stub_dir: Path) -> str:
+    """
+    Compose the `PATH` of a side's commands
+
+    Parameters
+    ----------
+    side :
+        The side whose environment comes second.
+    stub_dir :
+        Directory of the stub `quarto`, which comes first.
+
+    Returns
+    -------
+    :
+        The search path, ending with this process's own `PATH`.
+    """
+    return os.pathsep.join([str(stub_dir), str(side.bin), os.environ.get("PATH", "")])
+
+
+def child_environment(side: Side, stub_dir: Path) -> dict[str, str]:
+    """
+    Compose the environment shared by every command a side runs
+
+    Only an allowlist of this process's variables passes through, so tokens, coverage and
+    virtual-environment settings of the caller do not reach the build.
+
+    Parameters
+    ----------
+    side :
+        The side to build with.
+    stub_dir :
+        Directory of the stub `quarto`.
+
+    Returns
+    -------
+    :
+        The shared environment. The recorder adds `PYTHONPATH` for each package and
+        variables for each command.
+    """
+    env = {k: v for k, v in os.environ.items() if k in INHERITED_VARIABLES or k.startswith("LC_")}
+    env.update(
+        PATH=search_path(side, stub_dir),
+        PYTHONHASHSEED="0",
+        PYTHONIOENCODING="utf-8",
+        HTTPS_PROXY=DEAD_PROXY,
+        HTTP_PROXY=DEAD_PROXY,
+        https_proxy=DEAD_PROXY,
+        http_proxy=DEAD_PROXY,
+    )
+    return env
+
+
+def real_quarto() -> str:
+    """
+    Find the real Quarto on this process's `PATH`
+
+    Returns
+    -------
+    :
+        Its path.
+
+    Raises
+    ------
+    RequirementError
+        If Quarto is missing; `quarto pandoc` converts some packages' README files.
+    """
+    found = shutil.which("quarto")
+    if found is None:
+        raise RequirementError("Quarto is not on PATH; the stub passes `quarto pandoc` to it")
+    return found
+
+
+_DISTRIBUTIONS = (
+    "import importlib.metadata as m, json, platform, re; "
+    "d = {re.sub(r'[-_.]+', '-', (x.metadata['Name'] or '').lower()): x.version "
+    "for x in m.distributions()}; "
+    "print(json.dumps({'python': platform.python_version(), 'distributions': d}))"
+)
+
+
+def describe(side: Side, stub_dir: Path) -> Side:
+    """
+    Record the facts a comparison depends on, refusing a side that lacks a required tool
+
+    Parameters
+    ----------
+    side :
+        The side to describe.
+    stub_dir :
+        Directory of the stub `quarto`, used to compose the side's `PATH`.
+
+    Returns
+    -------
+    :
+        The side with its facts: commit, local changes, interpreter, installed
+        distributions, and the versions of `d2`, `ruff`, Git, the real Quarto and the stub.
+
+    Raises
+    ------
+    RequirementError
+        If `d2` or `ruff` is missing from the side's `PATH`.
+    """
+    path = search_path(side, stub_dir)
+    versions: dict[str, str] = {}
+    # Missing tools silently change output: `d2` diagrams remain as code fences and
+    # signatures lack `ruff` formatting.
+    for tool in ("d2", "ruff"):
+        found = shutil.which(tool, path=path)
+        if found is None:
+            raise RequirementError(f"`{tool}` is not on the {side.label} side's PATH ({path})")
+        versions[tool] = run_checked([found, "--version"], side.checkout)
+    versions["quarto"] = run_checked([real_quarto(), "--version"], side.checkout)
+    versions["git"] = run_checked(["git", "--version"], side.checkout)
+    probe = json.loads(run_checked([str(side.bin / "python"), "-c", _DISTRIBUTIONS], side.checkout))
+    python = str(probe["python"])
+    distributions = {
+        name: version for name, version in probe["distributions"].items() if name != "great-docs"
+    }
+    facts = {
+        "checkout": str(side.checkout),
+        "commit": run_checked(["git", "rev-parse", "HEAD"], side.checkout),
+        "local_changes": bool(run_checked(["git", "status", "--porcelain"], side.checkout)),
+        "python": python,
+        "stub_quarto_version": STUB_QUARTO_VERSION,
+        "tools": versions,
+        "distributions": dict(sorted(distributions.items())),
+    }
+    return Side(side.label, side.checkout, side.venv, facts)
+
+
+def python_version(side: Side) -> str:
+    """
+    Report the interpreter version of a side's environment
+
+    Parameters
+    ----------
+    side :
+        The side.
+
+    Returns
+    -------
+    :
+        The version, for example `3.13.11`.
+    """
+    return run_checked(
+        [str(side.bin / "python"), "-c", "import platform; print(platform.python_version())"],
+        side.checkout,
+    )
+
+
+def environment_differences(base: Mapping[str, Any], test: Mapping[str, Any]) -> list[str]:
+    """
+    List the facts that differ between two sides and would change build output
+
+    Parameters
+    ----------
+    base, test :
+        Facts of the two sides.
+
+    Returns
+    -------
+    :
+        One line per difference; empty when the environments agree.
+    """
+    lines: list[str] = []
+    for key in ("python", "stub_quarto_version", "tools"):
+        if base.get(key) != test.get(key):
+            lines.append(f"{key}: {base.get(key)!r} != {test.get(key)!r}")
+    base_dists: Mapping[str, str] = base.get("distributions", {})
+    test_dists: Mapping[str, str] = test.get("distributions", {})
+    for name in sorted(set(base_dists) | set(test_dists)):
+        if base_dists.get(name) != test_dists.get(name):
+            lines.append(f"distribution {name}: {base_dists.get(name)} != {test_dists.get(name)}")
+    return lines
+
+
+def outside_git(path: Path) -> None:
+    """
+    Reject a work directory inside a Git repository
+
+    `great-docs` reads the remote and branch of the repository around a package, so a
+    package generated inside one would build differently.
+
+    Parameters
+    ----------
+    path :
+        Directory where packages are generated.
+
+    Raises
+    ------
+    RequirementError
+        If the directory or one of its parents holds `.git`.
+    """
+    resolved = path.resolve()
+    for directory in (resolved, *resolved.parents):
+        if (directory / ".git").exists():
+            raise RequirementError(f"{path} is inside the git repository at {directory}")

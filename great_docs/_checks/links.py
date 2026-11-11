@@ -1,0 +1,346 @@
+"""
+Link checks for package sources and documentation pages
+
+The checker collects URLs from Python files and `.qmd` and `.md` pages and probes them over HTTP.
+"""
+
+from __future__ import annotations
+
+import re
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from functools import partial
+from typing import TYPE_CHECKING, Literal, TypedDict
+
+import requests
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+    from pathlib import Path
+
+
+__all__ = ["BrokenLink", "LinkReport", "Redirect", "check"]
+
+# Balanced parentheses can be part of a URL, as in Wikipedia links.
+_URL = re.compile(r'https?://[^\s<>"\'\]}`\\]+', re.IGNORECASE)
+
+# Matches `http://example.com{.gd-no-link}` and `` `http://example.com`{.gd-no-link} ``
+_NO_LINK = re.compile(r'`?(https?://[^\s<>"\'\]}`\\{]+)`?\{\.gd-no-link\}', re.IGNORECASE)
+
+_HEADERS = {"User-Agent": "great-docs-link-checker/1.0"}
+
+_WORKERS = 16
+
+
+class Redirect(TypedDict):
+    """A URL with a 3xx response and the files containing it"""
+
+    url: str
+    """The URL found in the scanned files"""
+
+    status: int | None
+    """The HTTP status code of the 3xx response"""
+
+    location: str | None
+    """The redirect target, or `"Unknown"` if the response has no `Location` header"""
+
+    files: list[str]
+    """Paths of files containing the URL, relative to the project root and in scan order"""
+
+
+class BrokenLink(TypedDict):
+    """A URL with a status outside 2xx and 3xx or a failed request"""
+
+    url: str
+    """The URL found in the scanned files"""
+
+    status: int | None
+    """The HTTP status code, or `None` if the request failed"""
+
+    error: str | None
+    """The HTTP status or request failure that made the link broken"""
+
+    files: list[str]
+    """Paths of files containing the URL, relative to the project root and in scan order"""
+
+
+class LinkReport(TypedDict):
+    """The unique URLs found in scanned files and their check results"""
+
+    total: int
+    """The number of unique URLs found, including skipped URLs"""
+
+    ok: list[str]
+    """URLs with a 2xx response, in discovery order"""
+
+    redirects: list[Redirect]
+    """Results for URLs with a 3xx response, in discovery order"""
+
+    broken: list[BrokenLink]
+    """Results for URLs with a status outside 2xx and 3xx or a failed request, in discovery order"""
+
+    skipped: list[str]
+    """URLs excluded from requests by an ignore pattern, in discovery order"""
+
+    by_file: dict[str, list[str]]
+    """URLs found in each file, keyed by file path relative to the project root"""
+
+
+@dataclass(frozen=True)
+class _Probe:
+    """The outcome of requesting one URL"""
+
+    kind: Literal["ok", "redirects", "broken"]
+    """The result list the URL belongs in"""
+
+    message: str
+    """The progress line reported for the URL"""
+
+    status: int | None = None
+    """The HTTP status code, or `None` if no response arrived"""
+
+    location: str | None = None
+    """The redirect target of a 3xx response"""
+
+    error: str | None = None
+    """Why the URL counts as broken"""
+
+
+def check(
+    files: Sequence[Path],
+    root: Path,
+    *,
+    timeout: float,
+    ignore_patterns: Sequence[str],
+    report: Callable[[str], None],
+) -> LinkReport:
+    """
+    Check the URLs found in files
+
+    URLs in whole-line Python comments and in fenced or inline code in `.qmd` and `.md`
+    files are excluded. URLs containing `{`, such as f-string placeholders, are also
+    excluded. In `.qmd` and `.md` files, `{.gd-no-link}` excludes the preceding URL throughout
+    the file, including unmarked repeats.
+
+    URLs retain balanced parentheses. Trailing punctuation and closing parentheses without
+    matching opening parentheses in the URL are removed repeatedly from the end of the URL.
+    Each unique URL that matches no ignore pattern is probed with `HEAD` and retried with
+    `GET` on a 405 response. Redirects are not followed.
+
+    File reads that raise `OSError` produce a warning through `report`. Requests that raise
+    `requests.RequestException` mark the URL as broken. Other errors propagate.
+
+    Parameters
+    ----------
+    files
+        The files to scan, in the order their URLs are reported.
+    root
+        The project root; file paths in the results are relative to it.
+    timeout
+        Timeout in seconds for each HTTP request.
+    ignore_patterns
+        Regular expressions matched case-insensitively against each URL; a matching URL is
+        skipped. A pattern that is not a valid regular expression matches literally.
+    report
+        A callback that receives a line for each unreadable file, the number of URLs found and
+        the outcome of each URL.
+
+    Returns
+    -------
+    :
+        A report of every unique URL found, including skipped URLs, and the check
+        results. URL lists preserve discovery order. Each redirect and broken-link
+        entry includes `files`: paths of files containing the URL, relative to the
+        project root and in scan order.
+    """
+    ignore = [_compile_ignore(pattern) for pattern in ignore_patterns]
+    url_to_files: dict[str, list[str]] = {}
+    by_file: dict[str, list[str]] = {}
+
+    for file_path in files:
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError as e:
+            report(f"Warning: Could not read {file_path}: {e}")
+            continue
+        if urls := _urls_in(content, file_path.suffix):
+            rel_path = str(file_path.relative_to(root))
+            by_file[rel_path] = urls
+            for url in urls:
+                url_to_files.setdefault(url, []).append(rel_path)
+
+    ok: list[str] = []
+    redirects: list[Redirect] = []
+    broken: list[BrokenLink] = []
+    skipped: list[str] = []
+
+    report(f"\n🔍 Found {len(url_to_files)} unique URLs to check\n")
+
+    skipped_urls = {url for url in url_to_files if any(p.search(url) for p in ignore)}
+    urls_to_check = [url for url in url_to_files if url not in skipped_urls]
+
+    with ThreadPoolExecutor(max_workers=_WORKERS) as executor:
+        probes = iter(executor.map(partial(_probe, timeout=timeout), urls_to_check))
+        for url in url_to_files:
+            if url in skipped_urls:
+                skipped.append(url)
+                report(f"⏭️  Skipped: {url}")
+                continue
+
+            probe = next(probes)
+            if probe.kind == "ok":
+                ok.append(url)
+            elif probe.kind == "redirects":
+                redirects.append(
+                    {
+                        "url": url,
+                        "status": probe.status,
+                        "location": probe.location,
+                        "files": url_to_files[url],
+                    }
+                )
+            else:
+                broken.append(
+                    {
+                        "url": url,
+                        "status": probe.status,
+                        "error": probe.error,
+                        "files": url_to_files[url],
+                    }
+                )
+            report(probe.message)
+
+    return {
+        "total": len(url_to_files),
+        "ok": ok,
+        "redirects": redirects,
+        "broken": broken,
+        "skipped": skipped,
+        "by_file": by_file,
+    }
+
+
+def _compile_ignore(pattern: str) -> re.Pattern[str]:
+    """
+    Compile a case-insensitive ignore pattern
+
+    Parameters
+    ----------
+    pattern
+        The regular expression to compile, or literal text if the expression is invalid.
+
+    Returns
+    -------
+    :
+        A case-insensitive pattern.
+    """
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return re.compile(re.escape(pattern), re.IGNORECASE)
+
+
+def _urls_in(content: str, suffix: str) -> list[str]:
+    """
+    Extract the URLs to check from a file's text
+
+    Parameters
+    ----------
+    content
+        The text of the file.
+    suffix
+        The file's suffix, which selects the content excluded from scanning.
+
+    Returns
+    -------
+    :
+        The URLs in the order they appear, without trailing punctuation.
+    """
+    excluded: set[str] = set()
+    if suffix in (".qmd", ".md"):
+        # `{.gd-no-link}` excludes the same URL throughout the file, including unmarked repeats.
+        excluded = {match.group(1) for match in _NO_LINK.finditer(content)}
+        # Read markers before removing example code: a marker may follow a URL in inline code.
+        content = re.sub(r"```[^`]*```", "", content, flags=re.DOTALL)
+        content = re.sub(r"`[^`]+`", "", content)
+
+    if suffix == ".py":
+        # Blank whole-line comments only; a `#` after code may sit inside a string
+        content = "\n".join(
+            "" if line.lstrip().startswith("#") else line for line in content.split("\n")
+        )
+
+    urls: list[str] = []
+    for url in map(_trim, _URL.findall(content)):
+        if "{" in url or url in excluded:
+            continue
+        urls.append(url)
+    return urls
+
+
+def _trim(url: str) -> str:
+    """
+    Remove trailing punctuation and unmatched closing parentheses from a URL
+
+    Balanced parentheses are preserved. Trimming repeats until no trailing punctuation
+    or unmatched closing parenthesis remains.
+
+    Parameters
+    ----------
+    url
+        The URL extracted from the text.
+
+    Returns
+    -------
+    :
+        The URL with trailing punctuation and unmatched closing parentheses removed.
+    """
+    while True:
+        trimmed = url.rstrip(".,;:!?")
+        if trimmed.endswith(")") and trimmed.count(")") > trimmed.count("("):
+            trimmed = trimmed[:-1]
+        if trimmed == url:
+            return url
+        url = trimmed
+
+
+def _probe(url: str, timeout: float) -> _Probe:
+    """
+    Request a URL and classify the response
+
+    Parameters
+    ----------
+    url
+        The URL to request.
+    timeout
+        Timeout in seconds for each request.
+
+    Returns
+    -------
+    :
+        A probe result with `kind` set to `ok` for a 2xx response, `redirects` for a 3xx
+        response, or `broken` for any other status or a `requests.RequestException`.
+    """
+    try:
+        response = requests.head(url, timeout=timeout, allow_redirects=False, headers=_HEADERS)
+        if response.status_code == 405:
+            response = requests.get(
+                url, timeout=timeout, allow_redirects=False, headers=_HEADERS, stream=True
+            )
+            response.close()
+
+        status = response.status_code
+        if 200 <= status < 300:
+            return _Probe("ok", f"✅ {status} {url}", status)
+        if 300 <= status < 400:
+            location = response.headers.get("Location", "Unknown")
+            return _Probe("redirects", f"↪️  {status} {url} -> {location}", status, location)
+        return _Probe("broken", f"❌ {status} {url}", status, error=f"HTTP {status}")
+    except requests.exceptions.Timeout:
+        return _Probe("broken", f"⏱️  Timeout: {url}", error="Timeout")
+    except requests.exceptions.SSLError as e:
+        return _Probe("broken", f"🔐 SSL Error: {url}", error=f"SSL Error: {str(e)[:50]}")
+    except requests.exceptions.ConnectionError:
+        return _Probe("broken", f"🔌 Connection failed: {url}", error="Connection failed")
+    except requests.RequestException as e:
+        return _Probe("broken", f"⚠️  Error: {url} - {e}", error=str(e)[:100])

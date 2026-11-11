@@ -22,6 +22,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
+from dotenv import dotenv_values, find_dotenv
+
+from ._build import serve
+from ._project import Project
+from ._project.github import GithubRepo, token_from_env
+from ._project.layout import Layout
+
 GITHUB_API = "https://api.github.com"
 DEFAULT_WORKFLOW_NAME = "CI Docs"
 DEFAULT_ARTIFACT = "docs-html"
@@ -40,32 +47,6 @@ class PreviewError(Exception):
 # ---------------------------------------------------------------------------
 # GitHub URL / repo parsing
 # ---------------------------------------------------------------------------
-
-
-def parse_github_url(url: str | None) -> tuple[str, str] | None:
-    """Parse a GitHub URL into `(owner, repo)`.
-
-    Handles the common shapes:
-
-        https://github.com/owner/repo
-        https://github.com/owner/repo.git
-        git@github.com:owner/repo.git
-
-    Returns `None` if the string is not a GitHub URL.
-    """
-    if not url or "github.com" not in url:
-        return None
-    match = re.search(r"github\.com[/:]([^/]+)/([^/\s#?]+)", url)
-    if not match:
-        return None
-    owner = match.group(1)
-    repo = match.group(2)
-    if repo.endswith(".git"):
-        repo = repo[:-4]
-    repo = repo.rstrip("/")
-    if not owner or not repo:
-        return None
-    return owner, repo
 
 
 def _parse_owner_repo(value: str) -> tuple[str, str] | None:
@@ -91,21 +72,33 @@ def _git_remote_repo(project_path: str | Path | None) -> tuple[str, str] | None:
         return None
     if result.returncode != 0:
         return None
-    return parse_github_url(result.stdout.strip())
+    github = GithubRepo.parse(result.stdout.strip())
+    return (github.owner, github.name) if github else None
 
 
 def _config_repo(project_path: str | Path | None) -> tuple[str, str] | None:
-    """Fall back to repo info from great-docs.yml / pyproject via GreatDocs."""
-    try:
-        from .core import GreatDocs
+    """
+    Read the project's GitHub repository from `great-docs.yml` or its packaging files
 
-        docs = GreatDocs(project_path=project_path)
-        owner, repo, _ = docs._get_github_repo_info()
-        if owner and repo:
-            return owner, repo
-    except Exception:
+    Parameters
+    ----------
+    project_path
+        The project directory, or `None` for the current directory.
+
+    Returns
+    -------
+    :
+        The repository's owner and name, or `None` when no GitHub repository is identified
+        or the project's layout, configuration or files cannot be read.
+    """
+    try:
+        layout = Layout.make(Path(project_path or os.getcwd()))
+        config = layout.load_config()
+        github = Project.make(config, layout).github
+    except (ValueError, OSError):
+        # `LayoutError` and `ConfigError` are `ValueError`s.
         return None
-    return None
+    return (github.owner, github.name) if github else None
 
 
 def resolve_repo(
@@ -117,7 +110,8 @@ def resolve_repo(
     Precedence: `--repo` → `git remote origin` → great-docs.yml / pyproject.
     """
     if repo_override:
-        parsed = parse_github_url(repo_override) or _parse_owner_repo(repo_override)
+        github = GithubRepo.parse(repo_override)
+        parsed = (github.owner, github.name) if github else _parse_owner_repo(repo_override)
         if parsed:
             return parsed
         raise PreviewError(
@@ -165,14 +159,10 @@ def _gh_token(gh: str) -> str | None:
 
 
 def _token_from_dotenv(path: str | Path) -> str | None:
-    """Read GITHUB_TOKEN / GH_TOKEN from a specific `.env` file."""
-    try:
-        from dotenv import dotenv_values
-    except Exception:  # pragma: no cover - python-dotenv is a hard dependency
-        return None
+    """Read `GITHUB_TOKEN` or `GH_TOKEN` from a `.env` file, ignoring read and decoding errors"""
     try:
         values = dotenv_values(str(path))
-    except Exception:
+    except (OSError, UnicodeDecodeError):
         return None
     token = values.get("GITHUB_TOKEN") or values.get("GH_TOKEN")
     return token.strip() if token else None
@@ -194,22 +184,17 @@ def resolve_token(
             return token, f"{env_file}"
 
     # 2. Real environment variables.
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-    if token and token.strip():
-        return token.strip(), "GITHUB_TOKEN"
+    token = token_from_env()
+    if token:
+        return token, "GITHUB_TOKEN"
 
     # 3. Auto-detected .env files (project root, then cwd upward).
     candidates: list[Path] = []
     if project_path:
         candidates.append(Path(project_path) / ".env")
-    try:
-        from dotenv import find_dotenv
-
-        found = find_dotenv(usecwd=True)
-        if found:
-            candidates.append(Path(found))
-    except Exception:  # pragma: no cover
-        pass
+    found = find_dotenv(usecwd=True)
+    if found:
+        candidates.append(Path(found))
     seen: set[str] = set()
     for candidate in candidates:
         key = str(candidate)
@@ -769,6 +754,4 @@ def preview_pr(
 
     root = download_and_extract(client, run_id=info.run_id, artifact=chosen, refresh=refresh)
 
-    from .core import GreatDocs
-
-    GreatDocs.preview_site(root, port=port, open_path=path, open_browser=open_browser)
+    serve.site(root, port=port, open_path=path, open_browser=open_browser, report=print)

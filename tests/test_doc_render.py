@@ -10,6 +10,7 @@ import griffe as gf
 
 import great_docs._apiref._render.doc as docmod
 from great_docs._apiref._render.doc import RenderDoc
+from great_docs._apiref._settings import Settings, SourceLinks
 
 
 def _get_private_cls():
@@ -123,89 +124,69 @@ class TestRenderSeeAlsoSectionSkipEmpty:
         assert "bar" in result_str
 
 
+LINKED = SourceLinks(repo_url="https://github.com/user/repo")
+
+
 class TestSourceLinkCompiledExtension:
-    def test_so_extension_returns_none(self, monkeypatch):
+    def test_so_extension_returns_none(self):
         """When source path ends with .so, returns None."""
-        from great_docs._apiref import _globals
 
         cls = _get_private_cls()
 
-        monkeypatch.setenv("GITHUB_REPO_URL", "https://github.com/user/repo")
-        monkeypatch.setenv("GIT_REF", "main")
-        _globals.package_info.cache_clear()
-
         fake_self = types.SimpleNamespace(
-            _source_relative_path=lambda: "mymod.cpython-313-x86_64-linux-gnu.so"
+            _source_relative_path=lambda: "mymod.cpython-313-x86_64-linux-gnu.so",
+            settings=Settings(source_links=LINKED),
         )
 
         result = cls.__dict__["source_link"].func(fake_self)
 
         assert result is None
 
-        _globals.package_info.cache_clear()
-
-    def test_pyd_extension_returns_none(self, monkeypatch):
+    def test_pyd_extension_returns_none(self):
         """When source path ends with .pyd, returns None."""
-        from great_docs._apiref import _globals
 
         cls = _get_private_cls()
 
-        monkeypatch.setenv("GITHUB_REPO_URL", "https://github.com/user/repo")
-        monkeypatch.setenv("GIT_REF", "main")
-        _globals.package_info.cache_clear()
-
-        fake_self = types.SimpleNamespace(_source_relative_path=lambda: "mymod.pyd")
+        fake_self = types.SimpleNamespace(
+            _source_relative_path=lambda: "mymod.pyd", settings=Settings(source_links=LINKED)
+        )
 
         result = cls.__dict__["source_link"].func(fake_self)
 
         assert result is None
 
-        _globals.package_info.cache_clear()
-
 
 class TestSourceRelativePathValueError:
-    def test_relative_to_raises_value_error(self, monkeypatch):
-        """When filepath is not relative to PACKAGE_ROOT, falls through."""
-        from great_docs._apiref import _globals
+    def test_relative_to_raises_value_error(self):
+        """A file outside the repository root uses its package-relative path"""
 
         cls = _get_private_cls()
-
-        monkeypatch.delenv("SOURCE_PATH", raising=False)
-        monkeypatch.setenv("PACKAGE_ROOT", "/completely/different/root")
-        _globals.package_info.cache_clear()
 
         obj = types.SimpleNamespace(
             filepath="/unrelated/path/to/mod.py",
             relative_package_filepath="mod.py",
         )
-        fake_self = types.SimpleNamespace(obj=obj)
+        links = SourceLinks(package_root=Path("/completely/different/root"))
+        fake_self = types.SimpleNamespace(obj=obj, settings=Settings(source_links=links))
 
         result = cls.__dict__["_source_relative_path"](fake_self)
 
         assert result == "mod.py"
 
-        _globals.package_info.cache_clear()
-
 
 class TestSourceRelativePathNamespacePackage:
-    def test_list_filepath_falls_back_to_package_relative_path(self, monkeypatch):
+    def test_list_filepath_falls_back_to_package_relative_path(self):
         """Verify that a namespace package uses its package-relative source path"""
-        from great_docs._apiref import _globals
 
         cls = _get_private_cls()
-
-        monkeypatch.delenv("SOURCE_PATH", raising=False)
-        monkeypatch.setenv("PACKAGE_ROOT", "/repo")
-        _globals.package_info.cache_clear()
 
         obj = types.SimpleNamespace(
             filepath=[Path("/repo/a/ns"), Path("/repo/b/ns")],
             relative_package_filepath="ns",
         )
-        fake_self = types.SimpleNamespace(obj=obj)
+        links = SourceLinks(package_root=Path("/repo"))
+        fake_self = types.SimpleNamespace(obj=obj, settings=Settings(source_links=links))
 
         result = cls.__dict__["_source_relative_path"](fake_self)
 
         assert result == "ns"
-
-        _globals.package_info.cache_clear()

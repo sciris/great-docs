@@ -5,9 +5,10 @@ Rendered-output tests read sites under `test-packages/_rendered/`, but a fresh
 checkout contains no rendered sites. This module builds the citation fixtures
 required by a default test run without running a complete `make hub-build`.
 
-The builder runs only the project-preparation, API-reference, and Quarto render
-stages. It omits the discovery and refresh stages used by a complete Gauntlet
-build, so its output can differ from `make hub-build` output.
+The builder uses the preparation steps of `great-docs freeze`, then renders
+each project with Quarto. Preparation includes every build step before rendering
+except the changelog, which needs the network. The builder skips steps after
+rendering, such as SEO file generation, so its output can differ from `make hub-build`.
 """
 
 from __future__ import annotations
@@ -23,7 +24,8 @@ import warnings
 from pathlib import Path
 from typing import Callable, Iterable
 
-from great_docs._layout import Layout
+from great_docs import BuildError
+from great_docs._project.layout import Layout
 
 # These packages cover both citation backlink forms. The first has three
 # definitions and one reference, which produces a caret backlink. The second
@@ -36,15 +38,14 @@ CITATION_SITES: tuple[str, ...] = (
 _TEST_PACKAGES_DIR = Path(__file__).resolve().parent.parent / "test-packages"
 RENDERED_DIR = _TEST_PACKAGES_DIR / "_rendered"
 
-# Treat these exceptions as an unavailable rendered fixture. The dependent
-# tests already skip when a site is absent. Fatal API-reference configuration
-# errors raise `SystemExit`; any unlisted exception indicates a builder defect
-# and propagates.
+# Treat these failures as unavailable rendered fixtures; dependent tests skip
+# absent sites. Fatal API reference configuration errors raise `BuildError`.
+# Propagate unlisted exceptions as builder defects.
 BUILD_FAILURES: tuple[type[BaseException], ...] = (
     OSError,
     subprocess.SubprocessError,
     ImportError,
-    SystemExit,
+    BuildError,
     ValueError,
     KeyError,
 )
@@ -352,7 +353,8 @@ def build_site(rendered_dir: Path, name: str) -> Path:
     from synthetic.generator import generate_package
 
     from great_docs import GreatDocs
-    from great_docs._apiref.api_reference import APIReference
+    from great_docs._build import pipeline, quarto
+    from great_docs._build.log import BuildLog
 
     rendered_dir.mkdir(parents=True, exist_ok=True)
     staging = rendered_dir / f".building-{name}-{os.getpid()}"
@@ -361,23 +363,15 @@ def build_site(rendered_dir: Path, name: str) -> Path:
         _add_to_sys_path(pkg_dir)
 
         docs = GreatDocs(str(pkg_dir))
-        with contextlib.redirect_stdout(io.StringIO()):
-            docs._prepare_build_directory()
-
-        # API-reference paths resolve from the working directory. Run this
-        # stage from the generated documentation project.
-        original_dir = Path.cwd()
-        try:
-            os.chdir(docs.build_dir)
-            with contextlib.redirect_stdout(io.StringIO()):
-                APIReference(str(docs.build_dir / "_quarto.yml")).build()
-        finally:
-            os.chdir(original_dir)
+        output = io.StringIO()
+        log = BuildLog(stream=output)
+        with contextlib.redirect_stdout(output):
+            pipeline.prepare_for_freeze(docs._config, docs.layout, log, remote=docs._remote)
 
         result = subprocess.run(
             ["quarto", "render"],
-            cwd=docs.build_dir,
-            env=docs._get_quarto_env(),
+            cwd=docs.layout.build_dir,
+            env=quarto.environment(docs._config),
             capture_output=True,
             text=True,
             check=False,
@@ -393,10 +387,10 @@ def build_site(rendered_dir: Path, name: str) -> Path:
         # The docs layout renders Quarto's default `_site` inside the build
         # directory, separate from the public site. Mirror `GreatDocs.build()`
         # because this builder runs the render stages directly.
-        if docs.layout.site_dir != docs.build_dir / "_site":
-            from great_docs._versioned_build import assemble_site
+        if docs.layout.site_dir != docs.layout.build_dir / "_site":
+            from great_docs._versions.build import assemble_site
 
-            assemble_site(docs.build_dir, [], "", docs.layout.site_dir, layout=docs.layout)
+            assemble_site(docs.layout.build_dir, [], "", docs.layout.site_dir, layout=docs.layout)
 
         published = rendered_dir / name
         _clear_package_dir(rendered_dir, name)

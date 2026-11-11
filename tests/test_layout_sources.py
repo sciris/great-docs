@@ -1,15 +1,31 @@
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 from urllib.parse import quote, unquote, urlsplit
 
 import pytest
-from yaml12 import read_yaml, write_yaml
+from yaml12 import write_yaml
 
 from great_docs import GreatDocs
-from great_docs._layout import Layout
+from great_docs._build import content as content_steps
+from great_docs._build import freeze, prepare
+from great_docs._build.pipeline import Run
+from great_docs._build.steps import Outcome
+from great_docs._content import publish
+from great_docs._content.pages import output_destination, section_destination
+from great_docs._project.layout import Layout
 from great_docs._utils import QUARTO_YML_HEADER
-from great_docs._versioned_build import assemble_site, run_versioned_build
-from great_docs._versioning import VersionEntry, build_version_map, parse_versions_config
+from great_docs._versions.build import assemble_site, run_versioned_build
+from great_docs._versions.model import VersionEntry, build_version_map, parse_versions_config
+from great_docs._website.homepage import source as homepage_source
+from tests.support import (
+    custom_pages_step,
+    discover_user_guide,
+    make_run,
+    prepare_build_directory,
+    sections_step,
+    user_guide_step,
+)
 
 
 @pytest.fixture(params=[".", "docs", "website"])
@@ -24,6 +40,16 @@ def source_project(tmp_path: Path, request: pytest.FixtureRequest) -> tuple[Path
 
 def make_docs(root: Path, source: Path) -> GreatDocs:
     return GreatDocs(str(root), config_path=str(source / "great-docs.yml"))
+
+
+def rebase(gd: GreatDocs, content: str, source: Path, destination: Path) -> str:
+    return publish.rebase_references(
+        content,
+        source,
+        destination,
+        layout=gd.layout,
+        pages=content_steps.page_map(gd._config, gd.layout, discover_user_guide(gd)),
+    )
 
 
 def test_git_ref_does_not_rename_build(tmp_path: Path) -> None:
@@ -77,8 +103,15 @@ def test_version_collisions_precede_output(
     root, source = source_project
     gd = make_docs(root, source)
     with pytest.raises(ValueError):
-        run_versioned_build(gd.build_dir, root, tags, latest_only=latest_only, layout=gd.layout)
-    assert not gd.build_dir.exists()
+        run_versioned_build(
+            gd.layout.build_dir,
+            root,
+            tags,
+            latest_only=latest_only,
+            layout=gd.layout,
+            quarto_config={},
+        )
+    assert not gd.layout.build_dir.exists()
     assert not gd.layout.site_dir.exists()
 
 
@@ -89,21 +122,25 @@ def test_unsafe_historical_build_names(source_project: tuple[Path, Path], tag: s
         pytest.skip("Legacy sibling prefixes keep these names within the package")
     gd = make_docs(root, source)
     with pytest.raises(ValueError):
-        run_versioned_build(gd.build_dir, root, ["2.0", tag], latest_only=True, layout=gd.layout)
-    assert not gd.build_dir.parent.exists()
+        run_versioned_build(
+            gd.layout.build_dir,
+            root,
+            ["2.0", tag],
+            latest_only=True,
+            layout=gd.layout,
+            quarto_config={},
+        )
+    assert not gd.layout.build_dir.parent.exists()
 
 
-def test_freeze_round_trip(
-    source_project: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import runpy
+def cache_versions(gd: GreatDocs, caches: dict[str, dict[str, str]]) -> None:
+    """
+    Create versioned Quarto projects and their freeze caches
 
-    root, source = source_project
-    gd = make_docs(root, source)
-    for tag, files in [
-        ("1.0", {"guide/old.json": "old", "guide/shared.json": "historical"}),
-        ("2.0", {"guide/new.json": "new", "guide/shared.json": "latest"}),
-    ]:
+    Treat `2.0` as the latest version. Each version's mapping gives cache-relative
+    paths and their file contents.
+    """
+    for tag, files in caches.items():
         build = gd.layout.build_dir_for(tag, "2.0")
         build.mkdir(parents=True)
         (build / "_quarto.yml").write_text(QUARTO_YML_HEADER)
@@ -111,15 +148,63 @@ def test_freeze_round_trip(
             cache = build / "_freeze" / name
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(content)
-    assert gd._persist_freeze_cache() == 3
-    assert (gd.layout.freeze_dir / "guide/old.json").read_text() == "old"
-    assert (gd.layout.freeze_dir / "guide/shared.json").read_text() == "latest"
-    assert gd._persist_freeze_cache() == 3
-    monkeypatch.chdir(gd.layout.build_dir_for("1.0", "2.0"))
+
+
+def restore_freeze(gd: GreatDocs, tag: str, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """
+    Restore a version's freeze cache and return its directory
+
+    Treat `2.0` as the latest version. Run the script from the version's Quarto
+    project, matching Quarto's working directory for pre-render scripts.
+    """
+    import runpy
+
+    build = gd.layout.build_dir_for(tag, "2.0")
+    build.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(build)
     runpy.run_path(str(gd.assets_path / "restore-freeze.py"))
-    assert (Path.cwd() / "_freeze/guide/shared.json").read_text() == "latest"
+    return build / "_freeze"
+
+
+def test_freeze_round_trip(source_project: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch):
+    root, source = source_project
+    gd = make_docs(root, source)
+    cache_versions(
+        gd,
+        {
+            "1.0": {"guide/old.json": "old", "guide/shared.json": "1.0"},
+            "1.5": {"guide/shared.json": "1.5"},
+            "2.0": {"guide/shared.json": "2.0"},
+        },
+    )
+    assert freeze.save(gd.layout) == 4
+    assert freeze.save(gd.layout) == 4
+    assert (gd.layout.freeze_dir / "guide/shared.json").read_text() == "2.0"
+    assert not (gd.layout.freeze_dir / "guide/old.json").exists()
+    for tag in ("1.0", "1.5", "2.0"):
+        restored = restore_freeze(gd, tag, monkeypatch)
+        assert (restored / "guide/shared.json").read_text() == tag
+        assert (restored / "guide/old.json").exists() == (tag == "1.0")
+        assert not (restored / "_versions").exists()
     if root != source:
         assert not (root / "_freeze").exists()
+
+
+def test_freeze_restore_without_own_cache(
+    source_project: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+):
+    """
+    Restore the latest version's cache when a historical version has no cache
+
+    A historical version may have no separate cache after an upgrade or on its first build.
+    """
+    root, source = source_project
+    gd = make_docs(root, source)
+    cache_versions(gd, {"1.0": {"guide/shared.json": "1.0"}, "2.0": {"guide/shared.json": "2.0"}})
+    _ = freeze.save(gd.layout)
+    restored = restore_freeze(gd, "1.5", monkeypatch)
+    assert (restored / "guide/shared.json").read_text() == "2.0"
+    assert not (restored / "_versions").exists()
 
 
 @pytest.mark.parametrize("symlink", [False, True])
@@ -131,16 +216,16 @@ def test_latest_collision_preserves_source(
     original = source / "original"
     original.mkdir()
     (original / "keep.txt").write_text("keep")
-    gd.build_dir.parent.mkdir(parents=True, exist_ok=True)
+    gd.layout.build_dir.parent.mkdir(parents=True, exist_ok=True)
     if symlink:
-        gd.build_dir.symlink_to(original, target_is_directory=True)
+        gd.layout.build_dir.symlink_to(original, target_is_directory=True)
     else:
-        gd.build_dir.mkdir()
-        (gd.build_dir / "keep.txt").write_text("keep")
+        gd.layout.build_dir.mkdir()
+        (gd.layout.build_dir / "keep.txt").write_text("keep")
     with pytest.raises(ValueError):
-        gd._prepare_build_directory()
+        prepare_build_directory(gd, make_run(gd))
     assert (original / "keep.txt").read_text() == "keep"
-    assert (gd.build_dir / "keep.txt").read_text() == "keep"
+    assert (gd.layout.build_dir / "keep.txt").read_text() == "keep"
 
 
 def test_unowned_deployment_is_preserved(source_project: tuple[Path, Path]) -> None:
@@ -151,25 +236,25 @@ def test_unowned_deployment_is_preserved(source_project: tuple[Path, Path]) -> N
     gd.layout.site_dir.mkdir()
     (gd.layout.site_dir / "keep.txt").write_text("keep")
     with pytest.raises(ValueError):
-        assemble_site(gd.build_dir, [], "", gd.layout.site_dir, layout=gd.layout)
+        assemble_site(gd.layout.build_dir, [], "", gd.layout.site_dir, layout=gd.layout)
     assert (gd.layout.site_dir / "keep.txt").read_text() == "keep"
 
 
 def test_nonversion_assembly_and_uninstall(source_project: tuple[Path, Path]) -> None:
     root, source = source_project
     gd = make_docs(root, source)
-    gd._prepare_build_directory()
-    local_site = gd.build_dir / "_site"
+    prepare_build_directory(gd, make_run(gd))
+    local_site = gd.layout.build_dir / "_site"
     local_site.mkdir()
     (local_site / "index.html").write_text("home")
-    assemble_site(gd.build_dir, [], "", gd.layout.site_dir, layout=gd.layout)
+    assemble_site(gd.layout.build_dir, [], "", gd.layout.site_dir, layout=gd.layout)
     assert (gd.layout.site_dir / "index.html").read_text() == "home"
     assert (local_site / "index.html").read_text() == "home"
-    unrelated = gd.build_dir.parent / "great-docs-notes"
+    unrelated = gd.layout.build_dir.parent / "great-docs-notes"
     unrelated.mkdir()
     (unrelated / "notes.qmd").write_text("source")
     gd.uninstall()
-    assert not gd.build_dir.exists()
+    assert not gd.layout.build_dir.exists()
     assert not gd.layout.site_dir.exists()
     assert (unrelated / "notes.qmd").read_text() == "source"
 
@@ -182,19 +267,19 @@ def test_site_inventory_protects_added_content(
     if source == root:
         pytest.skip("Legacy deployment remains inside the generated project")
     gd = make_docs(root, source)
-    gd._prepare_build_directory()
-    (gd.build_dir / "_site").mkdir()
-    (gd.build_dir / "_site/index.html").write_text("home")
-    assemble_site(gd.build_dir, [], "", gd.layout.site_dir, layout=gd.layout)
+    prepare_build_directory(gd, make_run(gd))
+    (gd.layout.build_dir / "_site").mkdir()
+    (gd.layout.build_dir / "_site/index.html").write_text("home")
+    assemble_site(gd.layout.build_dir, [], "", gd.layout.site_dir, layout=gd.layout)
     (gd.layout.site_dir / "added.txt").write_text("keep")
     with pytest.raises(ValueError, match="unrecognised"):
         if operation == "build":
-            gd._prepare_build_directory()
+            prepare_build_directory(gd, make_run(gd))
         else:
             gd.uninstall()
     assert (gd.layout.site_dir / "added.txt").read_text() == "keep"
     assert gd.layout.config_path.is_file()
-    assert (gd.build_dir / "_site/index.html").read_text() == "home"
+    assert (gd.layout.build_dir / "_site/index.html").read_text() == "home"
 
 
 def test_build_collision_precedes_config_refresh(source_project: tuple[Path, Path]) -> None:
@@ -203,11 +288,11 @@ def test_build_collision_precedes_config_refresh(source_project: tuple[Path, Pat
     text = "module: sample\nversions: [v1.5.0, 1.5.0]\n"
     config.write_text(text)
     gd = make_docs(root, source)
-    with patch("great_docs.core._ensure_quarto_installed", side_effect=AssertionError("too late")):
+    with patch("great_docs._build.quarto.ensure_installed", side_effect=AssertionError("too late")):
         with pytest.raises(ValueError, match="URL segment"):
             gd.build(latest_only=True)
     assert config.read_text() == text
-    assert not gd.build_dir.exists()
+    assert not gd.layout.build_dir.exists()
 
 
 def test_freeze_custom_config_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -221,10 +306,10 @@ def test_freeze_custom_config_name(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     (source / "_freeze").mkdir()
     (source / "_freeze/result.json").write_text("cached")
     gd = GreatDocs(str(tmp_path), config_path=str(config))
-    gd._prepare_build_directory()
-    monkeypatch.chdir(gd.build_dir)
-    runpy.run_path(str(gd.build_dir / "scripts/restore-freeze.py"))
-    assert (gd.build_dir / "_freeze/result.json").read_text() == "cached"
+    prepare_build_directory(gd, make_run(gd))
+    monkeypatch.chdir(gd.layout.build_dir)
+    runpy.run_path(str(gd.layout.build_dir / "scripts/restore-freeze.py"))
+    assert (gd.layout.build_dir / "_freeze/result.json").read_text() == "cached"
 
 
 @pytest.mark.parametrize("explicit", [False, True])
@@ -264,12 +349,13 @@ def test_documentation_sources(source_project: tuple[Path, Path], explicit: bool
         source / "great-docs.yml",
     )
     gd = make_docs(root, source)
-    gd._prepare_build_directory()
-    gd._copy_assets()
-    gd._copy_user_guide_to_docs(gd._discover_user_guide())
-    gd._process_sections()
-    gd._process_custom_pages()
-    build = gd.build_dir
+    run = make_run(gd)
+    prepare_build_directory(gd, run)
+    content_steps.assets(run, gd._config, gd.layout, remote=gd._remote)
+    user_guide_step(gd, discover_user_guide(gd))
+    sections_step(gd, discover_user_guide(gd))
+    custom_pages_step(gd, discover_user_guide(gd))
+    build = gd.layout.build_dir
     assert build == (root / "great-docs" if root == source else source / "_quarto/default")
     assert not hasattr(gd, "project_path")
     assert not hasattr(gd, "docs_dir")
@@ -290,7 +376,7 @@ def test_documentation_sources(source_project: tuple[Path, Path], explicit: bool
         assert (build / name).is_file(), name
     guide_name = "01-start.qmd" if explicit else "start.qmd"
     assert (build / "user-guide" / guide_name).is_file()
-    config = read_yaml(build / "_quarto.yml")
+    config = run.quarto_config
     assert config["project"]["output-dir"] == "_site"
     assert "scripts/prepare.py" in config["project"]["pre-render"]
     assert config["bibliography"] == "references.bib"
@@ -309,19 +395,18 @@ def test_landing_precedence_and_shared_references(source_project: tuple[Path, Pa
     (root / "assets/logo.svg").write_text("shared logo")
     (root / "README.md").write_text("# Package\n![Logo](assets/logo.svg?raw=1#logo)")
     gd = make_docs(root, source)
-    gd.build_dir.mkdir(parents=True)
-    assert gd._find_index_source_file()[0] == root / "README.md"
+    gd.layout.build_dir.mkdir(parents=True)
+    assert homepage_source.find(gd.layout)[0] == root / "README.md"
     if source != root:
         (source / "index.md").write_text(
             '![Logo](../assets/logo.svg) <img src="../assets/logo.svg#mark"> [Download](../assets/logo.svg)'
         )
-        assert gd._find_index_source_file()[0] == source / "index.md"
-    page = gd._find_index_source_file()[0]
-    assert page is not None
-    content = gd._rebase_source_references(page.read_text(), page, gd.build_dir / "index.qmd")
+        assert homepage_source.find(gd.layout)[0] == source / "index.md"
+    page = homepage_source.find(gd.layout)[0]
+    content = rebase(gd, page.read_text(), page, gd.layout.build_dir / "index.qmd")
     assert "../assets" not in content
     assert "logo.svg" in content
-    assert list(gd.build_dir.rglob("*.svg"))
+    assert list(gd.layout.build_dir.rglob("*.svg"))
     assert not (source / "_quarto/assets").exists()
 
 
@@ -336,7 +421,7 @@ def test_duplicate_hook_names_fail_before_copy(source_project: tuple[Path, Path]
     )
     gd = make_docs(root, source)
     with pytest.raises(ValueError, match="hook|script"):
-        gd._prepare_build_directory()
+        prepare_build_directory(gd, make_run(gd))
 
 
 def test_nested_sources_and_shared_assets(source_project: tuple[Path, Path]) -> None:
@@ -348,26 +433,24 @@ def test_nested_sources_and_shared_assets(source_project: tuple[Path, Path]) -> 
     page = source / "user_guide/deep/example.qmd"
     page.write_text(f"---\ntitle: Example\n---\n![Plot]({prefix}../shared/plot.svg#panel)")
     gd = make_docs(root, source)
-    gd.build_dir.mkdir(parents=True)
-    gd._copy_user_guide_to_docs(gd._discover_user_guide())
-    generated = gd.build_dir / "user-guide/deep/example.qmd"
+    gd.layout.build_dir.mkdir(parents=True)
+    user_guide_step(gd, discover_user_guide(gd))
+    generated = gd.layout.build_dir / "user-guide/deep/example.qmd"
     content = generated.read_text()
     asset = "shared/plot.svg" if source == root else "_shared/shared/plot.svg"
     assert f"{asset}#panel" in content
-    assert (gd.build_dir / asset).read_text() == "plot"
+    assert (gd.layout.build_dir / asset).read_text() == "plot"
 
 
 def test_asset_collision_is_rejected(source_project: tuple[Path, Path]) -> None:
     root, source = source_project
     (source / "image.png").write_text("source")
     gd = make_docs(root, source)
-    gd.build_dir.mkdir(parents=True)
-    (gd.build_dir / "image.png").write_text("generated")
+    gd.layout.build_dir.mkdir(parents=True)
+    (gd.layout.build_dir / "image.png").write_text("generated")
     with pytest.raises(ValueError, match="conflict"):
-        gd._rebase_source_references(
-            "![Image](image.png)", source / "README.md", gd.build_dir / "index.qmd"
-        )
-    assert (gd.build_dir / "image.png").read_text() == "generated"
+        rebase(gd, "![Image](image.png)", source / "README.md", gd.layout.build_dir / "index.qmd")
+    assert (gd.layout.build_dir / "image.png").read_text() == "generated"
 
 
 def test_shared_section_keeps_slug_and_custom_output_is_contained(
@@ -376,12 +459,12 @@ def test_shared_section_keeps_slug_and_custom_output_is_contained(
     root, source = source_project
     gd = make_docs(root, source)
     configured = "recipes" if root == source else "../recipes"
-    assert gd._section_build_dir({"dir": configured}) == gd.build_dir / "recipes"
+    assert section_destination(gd.layout, {"dir": configured}) == gd.layout.build_dir / "recipes"
     nested = "guides/recipes" if root == source else "../guides/recipes"
-    assert gd._section_build_dir({"dir": nested}) == gd.build_dir / "guides/recipes"
+    assert section_destination(gd.layout, {"dir": nested}) == gd.layout.build_dir / "guides/recipes"
     for output in ("../escape", str(root / "escape")):
         with pytest.raises(ValueError, match="inside"):
-            gd._output_directory(output)
+            output_destination(gd.layout, output)
 
 
 def test_notebooks_use_documentation_root(source_project: tuple[Path, Path]) -> None:
@@ -396,8 +479,8 @@ def test_notebooks_use_documentation_root(source_project: tuple[Path, Path]) -> 
         patch("importlib.util.find_spec", return_value=object()),
         patch.dict("sys.modules", {"great_docs._marimo": marimo}),
     ):
-        gd._prepare_build_directory()
-    assert (gd.build_dir / "notebooks/data.json").read_text() == "{}"
+        prepare_build_directory(gd, make_run(gd))
+    assert (gd.layout.build_dir / "notebooks/data.json").read_text() == "{}"
 
 
 def test_api_reference_build_uses_selected_cwd(
@@ -411,19 +494,20 @@ def test_api_reference_build_uses_selected_cwd(
     root, source = source_project
     gd = make_docs(root, source)
     original_cwd = Path.cwd()
-    prepare = gd._prepare_build_directory
+    build_directory = prepare.build_directory
 
-    def prepare_reference() -> None:
-        prepare()
-        gd._has_api_reference = True
+    def prepare_reference(run: Run, *args: Any, **kwargs: Any) -> Outcome:
+        outcome = build_directory(run, *args, **kwargs)
+        run.has_api_reference = True
+        return outcome
 
     def check_cwd(ref: APIReference) -> None:
-        assert Path.cwd() == gd.build_dir
+        assert Path.cwd() == gd.layout.build_dir
         raise ReferenceReached
 
-    monkeypatch.setattr("great_docs.core._ensure_quarto_installed", lambda: None)
-    monkeypatch.setattr(gd, "_prepare_build_directory", prepare_reference)
-    monkeypatch.setattr(APIReference, "__init__", lambda self, path: None)
+    monkeypatch.setattr("great_docs._build.quarto.ensure_installed", lambda: None)
+    monkeypatch.setattr(prepare, "build_directory", prepare_reference)
+    monkeypatch.setattr(APIReference, "__init__", lambda self, config, source_links: None)
     monkeypatch.setattr(APIReference, "build", check_cwd)
     with pytest.raises(ReferenceReached):
         gd.build(refresh=False)
@@ -437,7 +521,7 @@ def test_landing_links_follow_generated_page_paths(source_project: tuple[Path, P
     gd = make_docs(root, source)
     content = "[Start](user_guide/01-start.qmd#intro)"
     assert (
-        gd._rebase_source_references(content, source / "index.md", gd.build_dir / "index.qmd")
+        rebase(gd, content, source / "index.md", gd.layout.build_dir / "index.qmd")
         == "[Start](user-guide/start.qmd#intro)"
     )
 
@@ -447,11 +531,8 @@ def test_rebasing_preserves_code_examples(source_project: tuple[Path, Path]) -> 
     (source / "logo.svg").write_text("logo")
     gd = make_docs(root, source)
     content = '```markdown\n![Logo](logo.svg)\n```\n`![Logo](logo.svg)`\n    <img src="logo.svg">\n<pre>![Logo](logo.svg)</pre>\n'
-    assert (
-        gd._rebase_source_references(content, source / "index.md", gd.build_dir / "index.qmd")
-        == content
-    )
-    assert not gd.build_dir.exists()
+    assert rebase(gd, content, source / "index.md", gd.layout.build_dir / "index.qmd") == content
+    assert not gd.layout.build_dir.exists()
 
 
 @pytest.mark.parametrize(
@@ -475,10 +556,10 @@ def test_static_reference_forms_copy_package_readme_assets(
     (root / "assets/other.svg").write_text("other")
     (root / "README.md").write_text(markup)
     gd = make_docs(root, source)
-    result = gd._rebase_source_references(markup, root / "README.md", gd.build_dir / "index.qmd")
+    result = rebase(gd, markup, root / "README.md", gd.layout.build_dir / "index.qmd")
     expected_path = "assets/plot.svg" if source == root else "_shared/assets/plot.svg"
     assert result == markup.replace("assets/plot.svg", expected_path)
-    assert (gd.build_dir / expected_path).read_text() == "plot"
+    assert (gd.layout.build_dir / expected_path).read_text() == "plot"
 
 
 @pytest.mark.parametrize(
@@ -492,9 +573,9 @@ def test_asset_references_preserve_url_escaping(
     gd = make_docs(root, source)
     reference = quote(filename) + "?raw=1#panel"
     markup = f"![Plot]({reference})"
-    result = gd._rebase_source_references(markup, source / "README.md", gd.build_dir / "index.qmd")
+    result = rebase(gd, markup, source / "README.md", gd.layout.build_dir / "index.qmd")
     assert result == markup
-    assert (gd.build_dir / filename).is_file()
+    assert (gd.layout.build_dir / filename).is_file()
 
 
 def test_page_references_preserve_url_escaping(source_project: tuple[Path, Path]) -> None:
@@ -502,10 +583,11 @@ def test_page_references_preserve_url_escaping(source_project: tuple[Path, Path]
     (source / "user_guide").mkdir()
     (source / "user_guide/01-start #?.qmd").write_text("# Start")
     gd = make_docs(root, source)
-    result = gd._rebase_source_references(
+    result = rebase(
+        gd,
         "[Start](user_guide/01-start%20%23%3F.qmd#intro)",
         source / "index.md",
-        gd.build_dir / "index.qmd",
+        gd.layout.build_dir / "index.qmd",
     )
     assert result == "[Start](user-guide/start%20%23%3F.qmd#intro)"
 
@@ -527,16 +609,18 @@ def test_blended_homepage_references_use_final_destination(
         {"module": "sample", "homepage": "user_guide", "hero": False}, source / "great-docs.yml"
     )
     gd = make_docs(root, source)
-    gd._prepare_build_directory()
-    info = gd._discover_user_guide()
-    copied = gd._copy_user_guide_to_docs(info)
-    gd._create_blended_index(info, copied)
-    result = (gd.build_dir / "index.qmd").read_text()
+    prepare_build_directory(gd, make_run(gd))
+    user_guide_step(gd, discover_user_guide(gd))
+    result = (gd.layout.build_dir / "index.qmd").read_text()
     path = result.split("![Plot](", 1)[1].split(")", 1)[0]
-    assert (gd.build_dir / unquote(urlsplit(path).path)).resolve().is_relative_to(gd.build_dir)
-    assert (gd.build_dir / unquote(urlsplit(path).path)).read_text() == "plot"
+    assert (
+        (gd.layout.build_dir / unquote(urlsplit(path).path))
+        .resolve()
+        .is_relative_to(gd.layout.build_dir)
+    )
+    assert (gd.layout.build_dir / unquote(urlsplit(path).path)).read_text() == "plot"
     assert "[Next](user-guide/next.qmd)" in result
-    assert "[Start](../index.qmd#top)" in (gd.build_dir / "user-guide/next.qmd").read_text()
+    assert "[Start](../index.qmd#top)" in (gd.layout.build_dir / "user-guide/next.qmd").read_text()
 
 
 def test_custom_html_rebases_local_assets(source_project: tuple[Path, Path]) -> None:
@@ -549,8 +633,8 @@ def test_custom_html_rebases_local_assets(source_project: tuple[Path, Path]) -> 
         f'---\nlayout: raw\n---\n<div>\n    <img\n      src="{prefix}assets/plot.svg">\n</div>'
     )
     gd = make_docs(root, source)
-    gd._prepare_build_directory()
-    gd._process_custom_pages()
-    result = (gd.build_dir / "custom/about.html").read_text()
+    prepare_build_directory(gd, make_run(gd))
+    custom_pages_step(gd, discover_user_guide(gd))
+    result = (gd.layout.build_dir / "custom/about.html").read_text()
     path = result.split('src="', 1)[1].split('"', 1)[0]
-    assert (gd.build_dir / "custom" / unquote(urlsplit(path).path)).read_text() == "plot"
+    assert (gd.layout.build_dir / "custom" / unquote(urlsplit(path).path)).read_text() == "plot"

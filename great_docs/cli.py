@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import zipfile
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -10,13 +11,30 @@ from typing import TYPE_CHECKING, Any, Callable
 import click
 
 from . import __version__
-from ._layout import CONVENTIONAL_DOC_DIRS, Layout, _find_package_root
-from ._subprocess import TEXT_MODE_KWARGS
+from ._build import freeze as freeze_cache
+from ._build import from_repo as repository
+from ._build import quarto, serve, site
+from ._build.steps import PROJECT_ERRORS, USER_CODE_ERRORS, BuildError, print_warning
+from ._content import user_guide
+from ._project import Project
+from ._project import manifest as _manifest
+from ._project.layout import CONVENTIONAL_DOC_DIRS, Layout, _find_package_root
+from ._project.manifest import ManifestError
+from ._project.remote import HttpRemote
+from ._project.scaffold import update_gitignore
+from ._reference.exports import Exports
+from ._website import changelog as changelog_page
+from ._website import quarto_yml
 from .config import ConfigError
 from .core import GreatDocs
 
 if TYPE_CHECKING:
     from ._layout_migration import Migration, Move, Note
+
+# Command handlers report `PROJECT_ERRORS` as `Error: <message>` or JSON and exit with
+# status 1. Handlers that load the project's package also report `USER_CODE_ERRORS`.
+# Commands may handle additional errors separately. Unhandled exceptions show a traceback
+# and exit with status 1.
 
 
 def _config_option(function: Callable[..., Any]) -> Callable[..., Any]:
@@ -54,55 +72,42 @@ def _config_option(function: Callable[..., Any]) -> Callable[..., Any]:
     return selected
 
 
-def _detect_python_version_from_pyproject(project_root: Path) -> str | None:
-    """Detect the minimum Python version from pyproject.toml.
-
-    Parses the `requires-python` field (e.g., '>=3.12', '>=3.10,<3.13')
-    and returns a suitable Python version string for CI (e.g., '3.12').
-
-    Returns None if pyproject.toml doesn't exist or has no version requirement.
+def _detect_python_version(project_root: Path) -> str | None:
     """
-    pyproject_path = project_root / "pyproject.toml"
-    if not pyproject_path.exists():
-        return None
+    Choose the Python version a documentation workflow runs on
 
+    Parameters
+    ----------
+    project_root
+        The directory holding the packaging files.
+
+    Returns
+    -------
+    :
+        A `major.minor` version from the project's Python requirement. For a requirement
+        containing `>=` or `~=`, the first version (the lower bound), such as `3.10` for
+        `>=3.10,<3.13`; otherwise, the highest version named. `None` when the project declares
+        no requirement, the requirement names no version, or the metadata cannot be read.
+    """
     try:
-        # Use tomllib (Python 3.11+) or tomli as fallback
-        try:
-            import tomllib
-        except ImportError:  # pragma: no cover
-            import tomli as tomllib  # pragma: no cover
-
-        with open(pyproject_path, "rb") as f:
-            data = tomllib.load(f)
-
-        requires_python = data.get("project", {}).get("requires-python")
-        if not requires_python:
-            return None
-
-        # Parse version specifier to find minimum version
-        # Common patterns: ">=3.12", ">=3.10,<3.13", "~=3.11", ">=3.9"
-        # Extract versions from specifiers
-        version_pattern = r"(\d+\.\d+)"
-        matches = re.findall(version_pattern, requires_python)
-
-        if not matches:
-            return None
-
-        # For >= specifiers, use the specified version
-        if ">=" in requires_python or "~=" in requires_python:
-            # Return the first (minimum) version found
-            return matches[0]
-
-        # For other specifiers, try to pick a reasonable version
-        # Find the highest version mentioned (likely the target)
-        versions = [tuple(map(int, v.split("."))) for v in matches]
-        max_version = max(versions)
-        return f"{max_version[0]}.{max_version[1]}"
-
-    except Exception:
-        # If parsing fails, return None to use default
+        requires_python = _manifest.read(project_root)["requires_python"]
+    except ManifestError:
         return None
+
+    # CI uses major.minor versions, for example from `>=3.12`, `>=3.10,<3.13`,
+    # `~=3.11` or `>=3.9`.
+    matches = re.findall(r"(\d+\.\d+)", requires_python)
+    if not matches:
+        return None
+
+    # Treat the first version as the lower bound for `>=` and `~=` requirements.
+    if ">=" in requires_python or "~=" in requires_python:
+        return matches[0]
+
+    # Other specifiers use the highest named version as the likely CI target.
+    versions = [tuple(map(int, v.split("."))) for v in matches]
+    max_version = max(versions)
+    return f"{max_version[0]}.{max_version[1]}"
 
 
 def _detect_package_manager(project_root: Path) -> str:
@@ -124,43 +129,29 @@ def _detect_package_manager(project_root: Path) -> str:
 
 
 def _detect_optional_dependencies(project_root: Path) -> list[str]:
-    """Detect optional dependency groups from pyproject.toml.
-
-    Returns a list of optional dependency group names that are likely
-    related to documentation or development (e.g., 'dev', 'docs', 'test').
-
-    This helps generate appropriate pip install commands like:
-    pip install -e ".[dev,docs]"
     """
-    pyproject_path = project_root / "pyproject.toml"
-    if not pyproject_path.exists():
-        return []
+    Choose the extras a documentation workflow installs
 
+    Parameters
+    ----------
+    project_root
+        The directory holding the packaging files.
+
+    Returns
+    -------
+    :
+        The sorted names of extras related to documentation, development or testing, such
+        as `dev`, `docs` or `test`, for a command like `pip install -e ".[dev,docs]"`. An empty
+        list when there are none or the project's metadata cannot be read.
+    """
     try:
-        try:
-            import tomllib
-        except ImportError:  # pragma: no cover
-            import tomli as tomllib  # pragma: no cover
-
-        with open(pyproject_path, "rb") as f:
-            data = tomllib.load(f)
-
-        optional_deps = data.get("project", {}).get("optional-dependencies", {})
-        if not optional_deps:
-            return []
-
-        # Look for common dev/docs dependency group names
-        doc_related_extras = []
-        for key in optional_deps.keys():
-            key_lower = key.lower()
-            # Include extras that are likely needed for documentation builds
-            if any(term in key_lower for term in ["dev", "doc", "notebook", "test", "all", "full"]):
-                doc_related_extras.append(key)
-
-        return sorted(doc_related_extras)
-
-    except Exception:
+        extras = _manifest.read(project_root)["optional_dependencies"]
+    except ManifestError:
         return []
+
+    # Documentation workflows may also need development, notebook or test dependencies.
+    terms = ["dev", "doc", "notebook", "test", "all", "full"]
+    return sorted(extra for extra in extras if any(term in extra.lower() for term in terms))
 
 
 class OrderedGroup(click.Group):
@@ -224,7 +215,7 @@ def init(project_path: str | None, force: bool, config_path: str | None = None) 
     try:
         docs = GreatDocs(project_path=project_path, config_path=config_path, create=True)
         docs.install(force=force)
-    except Exception as e:
+    except (*PROJECT_ERRORS, *USER_CODE_ERRORS, EOFError) as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -328,7 +319,8 @@ def build(
     Use '--config website/great-docs.yml' for a custom source directory.
 
     Use '--project-path' to point to a project in a different directory.
-    Use '--watch' to automatically rebuild when source files change.
+    Use '--watch' to serve the site with 'quarto preview' and rebuild after
+    changes to the documentation sources, 'great-docs.yml' or the package.
 
     Use '--no-refresh' to skip API discovery for faster rebuilds when your
     package's public API hasn't changed.
@@ -384,7 +376,7 @@ def build(
             version_tags = None
             if version_filter:
                 version_tags = [v.strip() for v in version_filter.split(",") if v.strip()]
-            built_site = GreatDocs.build_from_repo(
+            built_site = repository.build(
                 from_repo,
                 branch=branch,
                 output_dir=output_dir,
@@ -393,10 +385,10 @@ def build(
                 latest_only=latest_only,
                 shallow=shallow,
                 config_path=config_path,
+                report=click.echo,
             )
             if preview_after:
-                site_path = str(built_site)
-                GreatDocs.preview_site(site_path)
+                serve.site(built_site, report=click.echo)
         else:
             if branch:
                 click.echo("Warning: --branch is ignored without --from-repo", err=True)
@@ -421,7 +413,13 @@ def build(
             )
     except KeyboardInterrupt:
         click.echo("\n👋 Stopped watching")
-    except Exception as e:
+    except BuildError:
+        # Exit without repeating the build's failure report
+        sys.exit(1)
+    except serve.ServeError as e:
+        click.echo(f"❌ {e}")
+        sys.exit(1)
+    except (*PROJECT_ERRORS, *USER_CODE_ERRORS, ValueError) as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -452,7 +450,7 @@ def uninstall(project_path: str | None, config_path: str | None = None) -> None:
     try:
         docs = GreatDocs(project_path=project_path, config_path=config_path)
         docs.uninstall()
-    except Exception as e:
+    except (*PROJECT_ERRORS, ValueError) as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -609,17 +607,27 @@ def preview(
                     "Warning: --project-path is ignored when --site-dir is used",
                     err=True,
                 )
-            GreatDocs.preview_site(
-                site_dir, port=port, open_path=open_path, open_browser=not no_open
+            serve.site(
+                site_dir,
+                port=port,
+                open_path=open_path,
+                open_browser=not no_open,
+                report=click.echo,
             )
         else:
             docs = GreatDocs(project_path=project_path, config_path=config_path)
-            docs.preview(port=port)
+            docs.preview(port=port, open_path=open_path, open_browser=not no_open)
     except KeyboardInterrupt:
         click.echo("\n👋 Server stopped")
+    except serve.ServeError as e:
+        click.echo(f"❌ {e}")
+        sys.exit(1)
     except SystemExit:
         raise
-    except Exception as e:
+    except BuildError:
+        # Exit without repeating the build's failure report
+        sys.exit(1)
+    except (*PROJECT_ERRORS, *USER_CODE_ERRORS, ValueError, zipfile.BadZipFile) as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -668,14 +676,12 @@ def config(project_path: str | None, force: bool, config_path: str | None = None
         config_content = create_default_config()
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(config_content, encoding="utf-8")
-        GreatDocs(
-            project_path=str(layout.package_root), config_path=str(config_path)
-        )._update_project_gitignore(force=True)
+        update_gitignore(layout, report=click.echo)
         click.echo(f"✓ Created {config_path}")
         click.echo("\nEdit this file to customize your documentation settings.")
         click.echo("See https://posit-dev.github.io/great-docs/user-guide/configuration.html")
 
-    except Exception as e:
+    except PROJECT_ERRORS as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -1115,22 +1121,17 @@ def scan(
     """
 
     try:
-        docs = GreatDocs(project_path=project_path, config_path=config_path)
-
-        # Detect package name
-        package_name = docs._detect_package_name()
-        if not package_name:
+        package_exports = Exports.make(
+            Layout.make(
+                Path(project_path) if project_path else Path.cwd(),
+                Path(config_path) if config_path else None,
+            )
+        )
+        project = package_exports.project
+        importable_name = project.importable_name
+        if not project.name or not importable_name:
             click.echo("Error: Could not detect package name.", err=True)
             sys.exit(1)
-
-        # Use explicit module name from great-docs.yml (or auto-detection) when
-        # available; this handles namespace packages like "firebird.base" where
-        # the importable module name differs from the PyPI project name.
-        module_name = docs._detect_module_name()
-        if module_name:
-            importable_name = module_name
-        else:
-            importable_name = docs._normalize_package_name(package_name)
 
         # Section 1: Discovery
         click.echo("─" * 50)
@@ -1139,16 +1140,16 @@ def scan(
         click.echo(f"Package: {importable_name}\n")
 
         # Get discovered exports
-        exports = docs._get_package_exports(importable_name)
+        exports = package_exports.names(importable_name)
         if not exports:
             click.echo("No exports discovered.")
             sys.exit(0)
 
-        # Categorize exports
-        categories = docs._categorize_api_objects(importable_name, exports)
+        # Group exports for comparison with the configured reference.
+        categories = package_exports.categorise(importable_name, exports)
 
         # Build sets of what's in the reference config
-        reference_config = docs._config.reference
+        reference_config = package_exports.config.reference
         ref_items = set()  # Items explicitly listed
         ref_classes_with_members = set()  # Classes with members: true (or default)
         ref_classes_without_members = set()  # Classes with members: false
@@ -1249,7 +1250,7 @@ def scan(
             click.echo("           members: false     # Don't document methods")
             click.echo("         - SimpleClass        # Methods inline")
 
-    except Exception as e:
+    except (*PROJECT_ERRORS, *USER_CODE_ERRORS) as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -1258,15 +1259,15 @@ cli.add_command(scan)
 
 
 def _freeze_info(project_root: Path, persist_dir: Path, layout: Layout | None = None) -> None:
-    """Display freeze status: project-level setting and all cached pages."""
+    """
+    Display freeze settings and cached pages for the current version
+    """
     import json
     import re as _re
     from datetime import datetime
 
-    from great_docs.config import Config
-
     layout = layout or Layout.make(project_root)
-    cfg = Config(layout.package_root, config_path=layout.config_path, cache_dir=layout.cache_dir)
+    cfg = layout.load_config()
     project_mode = cfg.freeze
 
     click.echo()
@@ -1291,9 +1292,13 @@ def _freeze_info(project_root: Path, persist_dir: Path, layout: Layout | None = 
         return text[3:end]
 
     per_page_modes: dict[str, str] = {}
-    source_dirs = ["recipes", "user_guide"]
-    for src_dir in source_dirs:
-        src_path = layout.source_dir / src_dir
+    source_dirs = [layout.source_dir / "recipes"]
+    guide_dir = user_guide.find_dir(
+        cfg, layout, report=lambda message: click.echo(f"  ⚠️  {message}", err=True)
+    )
+    if guide_dir is not None:
+        source_dirs.append(guide_dir)
+    for src_path in source_dirs:
         if not src_path.is_dir():
             continue
         for qmd_file in sorted(src_path.rglob("*.qmd")):
@@ -1310,14 +1315,17 @@ def _freeze_info(project_root: Path, persist_dir: Path, layout: Layout | None = 
             click.echo(f"    {source}  (freeze: {mode})")
         click.echo()
 
-    # Report all cached entries from _freeze/
     if not persist_dir.is_dir():
         click.echo("  No freeze cache found yet (run a build to populate it).")
         return
 
-    cache_entries = sorted(persist_dir.rglob("execute-results/html.json"))
+    cache_entries = sorted(
+        cache_json
+        for cache_json in persist_dir.rglob("execute-results/html.json")
+        if not cache_json.is_relative_to(persist_dir / "_versions")
+    )
     if not cache_entries:
-        click.echo("  Freeze cache directory exists but contains no entries.")
+        click.echo("  Freeze cache directory exists but contains no current page entries.")
         return
 
     click.echo(f"  {len(cache_entries)} cached page(s):")
@@ -1341,7 +1349,9 @@ def _freeze_info(project_root: Path, persist_dir: Path, layout: Layout | None = 
                 timestamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
             click.echo(f"  ✓  {page_stem}")
             click.echo(f"       frozen at {timestamp}")
-        except Exception:
+        # An unreadable, undecodable or invalid cache file raises `OSError` or `ValueError`;
+        # JSON without a `result` mapping holding `markdown` text raises the other two
+        except (OSError, ValueError, AttributeError, TypeError):
             click.echo(f"  ?  {page_stem}")
             click.echo("       cache file exists but could not be parsed")
 
@@ -1374,7 +1384,7 @@ def _freeze_info(project_root: Path, persist_dir: Path, layout: Layout | None = 
     "--info",
     is_flag=True,
     default=False,
-    help="Show freeze status for all pages (which are frozen, cached, stale).",
+    help="Show freeze settings and cached pages for the current version.",
 )
 @_config_option
 def freeze(
@@ -1400,7 +1410,8 @@ def freeze(
     Use '--clean' to wipe the entire '_freeze/' cache before re-executing.
     This forces a full refresh of all specified pages from scratch.
 
-    Use '--info' to see the freeze status of all pages without rendering.
+    Use `--info` to see freeze settings and cached pages for the current
+    version without rendering.
 
     After running, the updated '_freeze/' entries are ready to commit to
     version control.
@@ -1414,7 +1425,6 @@ def freeze(
       great-docs freeze --info
     """
     import shutil
-    import subprocess
 
     project_root = Path(project_path) if project_path else Path.cwd()
     layout = Layout.make(project_root, Path(config_path) if config_path else None)
@@ -1435,6 +1445,12 @@ def freeze(
         for page in missing:
             click.echo(f"Error: Page not found: {page}", err=True)
         sys.exit(1)
+
+    # Check before `--clean` removes the cache that a failed render could not replace
+    try:
+        quarto.ensure_installed()
+    except (quarto.QuartoNotFoundError, quarto.QuartoVersionError) as error:
+        raise click.ClickException(str(error)) from error
 
     if clean:
         from ._utils import validate_layout_outputs, validate_tree_symlinks
@@ -1457,22 +1473,16 @@ def freeze(
         if build_freeze.exists():
             shutil.rmtree(build_freeze)
 
-    # Always re-prepare the build directory so file hashes match what a full
-    # build would produce (frontmatter normalization, tag expansion, etc.).
-    # This is fast (steps 1-14 only, no render) and ensures the freeze cache
-    # will be valid for subsequent full builds.
-    click.echo("Preparing build directory...")
-    try:
-        docs = GreatDocs(project_path=project_path, config_path=config_path)
-        docs._prepare_for_freeze()
-    except SystemExit:
-        pass  # Build prep may exit but that's OK
-    except Exception as e:
-        click.echo(f"Error during build prep: {e}", err=True)
-        sys.exit(1)
+    from ._build import pipeline
+    from ._build.log import BuildLog
 
-    if not (build_dir / "_quarto.yml").exists():
-        click.echo("Error: Build directory is not ready. Run 'great-docs build' first.", err=True)
+    config = layout.load_config()
+    try:
+        pipeline.prepare_for_freeze(
+            config, layout, BuildLog(), remote=HttpRemote(report=print_warning)
+        )
+    except BuildError:
+        # Exit without repeating the preparation failure report
         sys.exit(1)
 
     # Render each page individually (forces execution even with freeze)
@@ -1481,51 +1491,19 @@ def freeze(
     failed: list[str] = []
 
     for page in pages:
-        # Find the page's location in the build directory
-        # Match authored pages to their generated user-guide paths.
-        # Numeric prefixes are stripped (e.g., 24-freeze-demo.qmd -> freeze-demo.qmd)
-        page_path = Path(page)
-        qmd_name = page_path.name
-
-        # Search for the file in the build directory
-        candidates = list(build_dir.rglob(qmd_name))
-        if not candidates:
-            # Try replacing underscores with hyphens (user_guide -> user-guide)
-            alt_path = str(page_path).replace("_", "-")
-            candidates = list(build_dir.rglob(Path(alt_path).name))
-        if not candidates:
-            # Try stripping numeric prefix (e.g., 24-freeze-demo.qmd -> freeze-demo.qmd)
-            import re as _re
-
-            stripped_name = _re.sub(r"^\d+[-_]", "", qmd_name)
-            if stripped_name != qmd_name:
-                candidates = list(build_dir.rglob(stripped_name))
-        if not candidates:
-            # Try both: underscores to hyphens AND stripped prefix
-            stripped_alt = _re.sub(r"^\d+[-_]", "", Path(alt_path).name)
-            if stripped_alt != Path(alt_path).name:
-                candidates = list(build_dir.rglob(stripped_alt))
-
-        if not candidates:
+        target = freeze_cache.find_page(build_dir, page)
+        if target is None:
             click.echo(f"  ✗ {page} — not found in build directory", err=True)
             click.echo(
-                "    Hint: Run 'great-docs build' first to set up the build directory.",
+                "    Hint: The site does not publish this page. Freeze renders only pages of the\n"
+                "    user guide, the configured sections and the custom pages.",
                 err=True,
             )
             failed.append(page)
             continue
 
-        # Use the first match
-        target = candidates[0]
-        rel_target = target.relative_to(build_dir)
-
-        click.echo(f"  Rendering {page} → {rel_target} ...")
-        result = subprocess.run(
-            ["quarto", "render", str(rel_target)],
-            cwd=build_dir,
-            capture_output=True,
-            **TEXT_MODE_KWARGS,
-        )
+        click.echo(f"  Rendering {page} → {target.relative_to(build_dir)} ...")
+        result = freeze_cache.render_page(config, build_dir, target)
 
         if result.returncode != 0:
             click.echo(f"  ✗ {page} — render failed", err=True)
@@ -1544,20 +1522,7 @@ def freeze(
     if build_freeze.is_dir() and rendered:
         click.echo()
         click.echo(f"Persisting _freeze/ → {persist_dir.relative_to(project_root)}/")
-        persist_dir.mkdir(parents=True, exist_ok=True)
-
-        # Merge: copy only updated entries (don't wipe existing cache for other pages)
-        updated_files = 0
-        for item in build_freeze.iterdir():
-            dest = persist_dir / item.name
-            if item.is_dir():
-                if dest.exists():
-                    shutil.rmtree(dest)
-                shutil.copytree(item, dest)
-            else:
-                shutil.copy2(item, dest)
-            updated_files += sum(1 for _ in (dest.rglob("*") if dest.is_dir() else [dest]))
-
+        updated_files = freeze_cache.merge(build_freeze, persist_dir)
         click.echo(f"  Updated {updated_files} cached file(s)")
 
         # Show git status hint
@@ -1863,7 +1828,7 @@ def setup_github_pages(
         # Great Docs requires Python 3.11+, so we enforce that as the floor
         min_great_docs_version = (3, 11)
         if python_version is None:
-            detected_version = _detect_python_version_from_pyproject(project_root)
+            detected_version = _detect_python_version(project_root)
             if detected_version:
                 detected_tuple = tuple(int(x) for x in detected_version.split("."))
                 if detected_tuple < min_great_docs_version:
@@ -1996,7 +1961,7 @@ def setup_github_pages(
         click.echo("   • Automatically deploy to GitHub Pages on main branch")
         click.echo("   • Comment on pull requests with a 'great-docs preview' command")
 
-    except Exception as e:
+    except PROJECT_ERRORS as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -2175,7 +2140,7 @@ def check_links(
         click.echo(f"Error: {e}", err=True)
         click.echo("\nInstall the requests package with: pip install requests", err=True)
         sys.exit(1)
-    except Exception as e:
+    except PROJECT_ERRORS as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -2199,7 +2164,10 @@ cli.add_command(check_links)
     "--timeout",
     type=int,
     default=30,
-    help="Per-cell timeout in seconds (default: 30)",
+    help=(
+        "Seconds budgeted per cell. Each page's render stops after the cell count "
+        "times this value plus 60 seconds (default: 30)"
+    ),
 )
 @click.option(
     "--json-output",
@@ -2288,11 +2256,11 @@ def check_examples(
       great-docs check-examples --parallel --jobs 4
       great-docs check-examples --no-docstrings --timeout 60
     """
-    from ._build_log import Colors, MultiProgressBar, ProgressBar
-    from ._check_examples import (
+    from ._build.log import Colors, MultiProgressBar, ProgressBar
+    from ._checks.examples import (
         check_examples as run_check,
     )
-    from ._check_examples import (
+    from ._checks.examples import (
         format_console,
         format_json,
         write_log_file,
@@ -2415,14 +2383,14 @@ def changelog(
     Set 'GITHUB_TOKEN' or 'GH_TOKEN' to avoid API rate limits.
     """
     try:
-        docs = GreatDocs(project_path=project_path, config_path=config_path)
+        layout = Layout.make(
+            Path(project_path) if project_path else Path.cwd(),
+            Path(config_path) if config_path else None,
+        )
+        config = layout.load_config()
 
-        # Override max_releases in config if provided
-        if max_releases is not None:
-            docs._config._config.setdefault("changelog", {})["max_releases"] = max_releases
-
-        owner, repo, _base_url = docs._get_github_repo_info()
-        if not owner or not repo:
+        repo = Project.make(config, layout).github
+        if repo is None:
             click.echo(
                 "Error: No GitHub repository URL found in pyproject.toml. "
                 "Add a [project.urls] entry like:\n\n"
@@ -2431,14 +2399,24 @@ def changelog(
             )
             sys.exit(1)
 
-        result = docs._generate_changelog_page()
-        if result:
-            docs._add_changelog_to_navbar()
-            click.echo(f"✅ Changelog generated: {docs.build_dir / result}")
-        else:
+        contribution = changelog_page.write_page(
+            config,
+            layout,
+            repo,
+            HttpRemote(report=lambda message: print(f"   ⚠️  {message}")),
+            max_releases=max_releases,
+            report=click.echo,
+        )
+        if contribution is None:
             click.echo("No published releases found on GitHub.")
+        else:
+            # Link the page from a site that has been built
+            if quarto_yml.path(layout.build_dir).exists():
+                with quarto_yml.edit(layout.build_dir) as quarto_config:
+                    quarto_yml.apply(quarto_config, contribution, config)
+            click.echo(f"✅ Changelog generated: {layout.build_dir / changelog_page.FILENAME}")
 
-    except Exception as e:
+    except (*PROJECT_ERRORS, ValueError) as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -2577,6 +2555,7 @@ def proofread(
       great-docs proofread --json-output           # JSON output for CI
       great-docs proofread --ignore=SpellCheck     # Skip specific rules
       great-docs proofread README.md user_guide/*.qmd  # Specific files
+      great-docs proofread recipes/                # Pages in a directory
 
     \b
     Requires harper-cli to be installed:
@@ -2584,18 +2563,11 @@ def proofread(
       cargo install harper-cli # any platform
     """
     import json as json_module
-    import tempfile
     from collections import defaultdict
 
-    from ._harper import (
-        HarperError,
-        HarperNotFoundError,
-        check_harper_available,
-        get_builtin_dictionary,
-        get_default_ignore_rules,
-        run_harper,
-        run_harper_on_text,
-    )
+    from ._checks import inputs
+    from ._checks import proofread as proofreading
+    from ._checks.harper import HarperError, HarperNotFoundError, check_harper_available
 
     try:
         # Check if Harper is available
@@ -2604,53 +2576,40 @@ def proofread(
             click.echo(f"Error: {harper_info}", err=True)
             sys.exit(3)
 
-        if verbose and not json_output and not compact:
+        show_progress = verbose and not json_output and not compact
+        if show_progress:
             click.echo(f"\n🔍 Proofreading with {harper_info}...\n")
             if not strict:
                 click.echo("Using smart defaults for technical docs. Use --strict to disable.\n")
 
         # Determine files to check
-        docs = GreatDocs(project_path=project_path, config_path=config_path)
-        files_to_check: list[Path] = []
+        layout = Layout.make(
+            Path(project_path) if project_path else Path.cwd(),
+            Path(config_path) if config_path else None,
+        )
+        config = layout.load_config()
 
         if files:
-            # User specified files
-            files_to_check = [Path(f) for f in files]
+            files_to_check = inputs.expand_directories(Path(f) for f in files)
         else:
-            # Auto-discover documentation files
-            user_guide_dir = Path(docs_dir) if docs_dir else docs.layout.source_dir / "user_guide"
-            if user_guide_dir.exists():
-                files_to_check.extend(user_guide_dir.rglob("*.qmd"))
-                files_to_check.extend(user_guide_dir.rglob("*.md"))
-
-            # Check README
-            readme = docs.project_root / "README.md"
-            if readme.exists():
-                files_to_check.append(readme)
-
-            # Check recipes if they exist
-            recipes_dir = docs.layout.source_dir / "recipes"
-            if recipes_dir.exists():
-                files_to_check.extend(recipes_dir.rglob("*.qmd"))
-                files_to_check.extend(recipes_dir.rglob("*.md"))
+            if docs_dir:
+                files_to_check = inputs.find_pages_in(Path(docs_dir), layout)
+            else:
+                files_to_check = inputs.find_pages(
+                    config,
+                    layout,
+                    report=lambda message: click.echo(f"⚠️  {message}", err=True),
+                )
+            if include_docstrings:
+                project = Project.make(config, layout)
+                if project.importable_name:
+                    files_to_check += inputs.find_modules(layout, project.importable_name)
 
         if not files_to_check:
             click.echo("No documentation files found to check.", err=True)
             sys.exit(0)
 
-        # Build custom dictionary file
-        # Start with builtin dictionary unless disabled
-        dict_path = None
-        words = []
-
-        if not strict and not no_builtin_dictionary:
-            words.extend(get_builtin_dictionary())
-
-        # Add user-provided words
-        if custom_words:
-            words.extend(custom_words)
-
-        # Load from dictionary file if provided
+        words = list(custom_words)
         if dictionary_file:
             try:
                 with open(dictionary_file, "r", encoding="utf-8") as f:
@@ -2658,133 +2617,36 @@ def proofread(
                         word = line.strip()
                         if word and not word.startswith("#"):
                             words.append(word)
-            except Exception as e:
+            except (OSError, UnicodeDecodeError) as e:
                 click.echo(f"Warning: Could not read dictionary file: {e}", err=True)
 
-        if words:
-            # Create temporary dictionary file
-            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
-            tmp.write("\n".join(words))
-            tmp.close()
-            dict_path = tmp.name
-
-        # Build rule filters
-        only = None
-        ignore = None
-
-        # Start with default ignores for technical docs (unless --strict)
-        if not strict:
-            ignore = get_default_ignore_rules()
-
-        if spelling_only:
-            only = ["SpellCheck"]
-        elif grammar_only:
-            ignore = (ignore or []) + ["SpellCheck"]
-
+        only = ["SpellCheck"] if spelling_only else []
+        ignore = ["SpellCheck"] if grammar_only and not spelling_only else []
         if only_rules:
-            only = only_rules.split(",") if only is None else only + only_rules.split(",")
-
+            only.extend(only_rules.split(","))
         if ignore_rules:
-            ignore = ignore_rules.split(",") if ignore is None else ignore + ignore_rules.split(",")
+            ignore.extend(ignore_rules.split(","))
 
-        # Separate files by type (Harper doesn't recognize .qmd)
-        md_files = [f for f in files_to_check if f.suffix == ".md"]
-        qmd_files = [f for f in files_to_check if f.suffix == ".qmd"]
-        py_files = [f for f in files_to_check if f.suffix == ".py"]
-
-        all_results = []
-
-        # Check .md files directly
-        if md_files:
-            if verbose and not json_output and not compact:
-                click.echo(f"Checking {len(md_files)} Markdown file(s)...\n")
-
-            results = run_harper(
-                md_files,
-                dialect=dialect,
-                user_dict_path=dict_path,
-                ignore_rules=ignore,
-                only_rules=only,
-            )
-            all_results.extend(results)
-
-        # Check .qmd files via stdin (Harper doesn't recognize extension)
-        # We extract prose only (skip code blocks) to avoid false positives
-        for qmd_file in qmd_files:
-            if verbose and not json_output and not compact:
-                click.echo(f"Checking {qmd_file.name}...")
-
-            try:
-                from ._harper import extract_prose_from_markdown
-
-                content = qmd_file.read_text(encoding="utf-8")
-
-                # Extract prose sections, skipping fenced code blocks and frontmatter
-                prose_content, line_mapping = extract_prose_from_markdown(content)
-
-                lints = run_harper_on_text(
-                    prose_content,
-                    dialect=dialect,
-                    user_dict_path=dict_path,
-                    ignore_rules=ignore,
-                    only_rules=only,
-                )
-
-                # Convert to file result with proper path and remap line numbers
-                from ._harper import HarperFileResult
-
-                rel_path = str(qmd_file.relative_to(docs.project_root))
-                for lint in lints:
-                    lint.file = rel_path
-                    # Remap line number from prose content back to original file
-                    if lint.line in line_mapping:
-                        lint.line = line_mapping[lint.line]
-
-                all_results.append(
-                    HarperFileResult(
-                        file=rel_path,
-                        lint_count=len(lints),
-                        lints=lints,
-                        error=None,
-                    )
-                )
-            except Exception as e:
-                from ._harper import HarperFileResult
-
-                rel_path = str(qmd_file.relative_to(docs.project_root))
-                all_results.append(
-                    HarperFileResult(
-                        file=rel_path,
-                        lint_count=0,
-                        lints=[],
-                        error=str(e),
-                    )
-                )
-
-        # Check Python files if requested
-        if include_docstrings and py_files:
-            if verbose and not json_output and not compact:
-                click.echo(f"\nChecking {len(py_files)} Python file(s) for docstrings...\n")
-
-            results = run_harper(
-                py_files,
-                dialect=dialect,
-                user_dict_path=dict_path,
-                ignore_rules=ignore,
-                only_rules=only,
-            )
-            all_results.extend(results)
-
-        # Clean up temp dictionary file
-        if dict_path:
-            try:
-                Path(dict_path).unlink()
-            except Exception:
-                pass
+        options = proofreading.Options(
+            dialect=dialect,
+            words=words,
+            only_rules=only,
+            ignore_rules=ignore,
+            builtin_dictionary=not strict and not no_builtin_dictionary,
+            default_ignores=not strict,
+        )
+        # Harper checks Python files only when docstring checking is requested.
+        checked_suffixes = {".md", ".qmd", ".py"} if include_docstrings else {".md", ".qmd"}
+        checked_files = [f for f in files_to_check if f.suffix in checked_suffixes]
+        all_results = proofreading.check(
+            checked_files,
+            layout.package_root,
+            options,
+            report=click.echo if show_progress else lambda _line: None,
+        )
 
         # Aggregate results
-        total_issues = sum(r.lint_count for r in all_results)
-        files_with_issues = sum(1 for r in all_results if r.lint_count > 0)
+        total_issues = sum(len(r.issues) for r in all_results)
 
         # Group by kind and rule
         by_kind = defaultdict(int)
@@ -2792,7 +2654,7 @@ def proofread(
         all_lints = []
 
         for result in all_results:
-            for lint in result.lints:
+            for lint in result.issues:
                 by_kind[lint.kind] += 1
                 by_rule[lint.rule] += 1
                 all_lints.append(lint)
@@ -2803,7 +2665,7 @@ def proofread(
                 "version": "1.0.0",
                 "harper_version": harper_info.split()[-1] if harper_info else "unknown",
                 "dialect": dialect,
-                "files_checked": len(files_to_check),
+                "files_checked": len(checked_files),
                 "total_issues": total_issues,
                 "summary": {
                     "by_kind": dict(by_kind),
@@ -2838,9 +2700,9 @@ def proofread(
             # Human-readable output
             if all_results:
                 for result in all_results:
-                    if result.lint_count > 0:
-                        click.echo(f"\n📄 {result.file} ({result.lint_count} issue(s))")
-                        for lint in result.lints:
+                    if result.issues:
+                        click.echo(f"\n📄 {result.file} ({len(result.issues)} issue(s))")
+                        for lint in result.issues:
                             # Clean up suggestion format
                             suggestion = ""
                             if lint.suggestions:
@@ -2910,7 +2772,7 @@ def proofread(
     except HarperError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(2)
-    except Exception as e:
+    except PROJECT_ERRORS as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -2965,15 +2827,21 @@ def seo(
     import json
     import xml.etree.ElementTree as ET
 
+    from ._website.seo import robots, sitemap
+
     try:
-        docs = GreatDocs(project_path=project_path, config_path=config_path)
-        site_dir = docs.layout.site_dir
+        layout = Layout.make(
+            Path(project_path) if project_path else Path.cwd(),
+            Path(config_path) if config_path else None,
+        )
+        config = layout.load_config()
+        site_dir = layout.site_dir
 
         if not site_dir.exists():
             click.echo("Error: Site not built. Run 'great-docs build' first.", err=True)
             sys.exit(1)
 
-        separate_site = docs.layout.source_dir != docs.layout.package_root
+        separate_site = layout.source_dir != layout.package_root
         if fix and separate_site:
             from ._utils import validate_site_dir
 
@@ -2989,6 +2857,9 @@ def seo(
         issues = []
         warnings = []
         info = []
+
+        identity = site.identity(config, layout, Project.make(config, layout))
+        canonical_base = identity.base_url
 
         # ── Check sitemap.xml ────────────────────────────────────────────
         sitemap_path = site_dir / "sitemap.xml"
@@ -3008,7 +2879,7 @@ def seo(
         else:
             issues.append("❌ sitemap.xml not found")
             if fix:
-                docs._generate_sitemap_xml()
+                sitemap.write(site_dir, config, canonical_base, report=click.echo)
                 record_generated_file("sitemap.xml")
                 info.append("   → Generated sitemap.xml")
 
@@ -3025,7 +2896,7 @@ def seo(
         else:
             issues.append("❌ robots.txt not found")
             if fix:
-                docs._generate_robots_txt()
+                robots.write(site_dir, config, canonical_base, report=click.echo)
                 record_generated_file("robots.txt")
                 info.append("   → Generated robots.txt")
 
@@ -3038,13 +2909,11 @@ def seo(
         pages_with_json_ld = 0
         images_missing_alt = 0
 
-        canonical_base = docs._get_canonical_base_url()
-
         # The audit requires the site name only when a string template contains
         # `{site_name}`. A missing placeholder or non-string value skips this
         # check.
-        title_template = docs._config.seo_title_template
-        site_name = docs._get_site_name()
+        title_template = config.seo_title_template
+        site_name = identity.name
         if not isinstance(title_template, str) or "{site_name}" not in title_template:
             site_name = ""
 
@@ -3150,7 +3019,7 @@ def seo(
             else:
                 click.echo("✅ All SEO checks passed!")
 
-    except Exception as e:
+    except (*PROJECT_ERRORS, ValueError) as e:
         if json_output:
             click.echo(json.dumps({"status": "error", "error": str(e)}))
         else:
@@ -3236,7 +3105,7 @@ def lint(
     import json
     import textwrap
 
-    from ._lint import run_lint
+    from ._checks.lint import run_lint
 
     try:
         project_root = Path(project_path) if project_path else Path.cwd()
@@ -3308,8 +3177,8 @@ def lint(
                     click.echo(f"⚠️  {n_warnings} warning(s)")
 
             try:
-                from ._layout import Layout
-                from ._layout_notice import layout_notice
+                from ._layout_migration.notice import layout_notice
+                from ._project.layout import Layout
 
                 layout = Layout.make(
                     project_root,
@@ -3326,7 +3195,7 @@ def lint(
         if result.errors:
             sys.exit(1)
 
-    except Exception as e:
+    except (*PROJECT_ERRORS, *USER_CODE_ERRORS, ValueError) as e:
         if json_output:
             click.echo(json.dumps({"status": "error", "error": str(e)}))
         else:
@@ -3424,24 +3293,24 @@ def api_diff_cmd(
     import json
     import shutil
 
-    from ._api_diff import (
-        api_diff,
-        build_dependency_graph,
-        build_timeline,
+    from ._api_evolution.compare import api_diff
+    from ._api_evolution.history import build_dependency_graph, build_timeline, symbol_history
+    from ._api_evolution.render import (
         evolution_table_html,
         evolution_table_text,
-        snapshot_at_tag,
-        snapshot_from_griffe,
-        symbol_history,
         timeline_to_mermaid,
     )
+    from ._api_evolution.snapshot import _detect_package_name, snapshot_at_tag, snapshot_from_griffe
 
     project_root = Path(project_path) if project_path else Path.cwd()
+    importable_name = package or _detect_package_name(
+        project_root, Path(config_path) if config_path else None
+    )
 
     try:
         # --- Symbol history mode ---
         if symbol:
-            from ._api_diff import list_version_tags
+            from ._api_evolution.snapshot import list_version_tags
 
             all_tags = list_version_tags(project_root)
             # Filter to tags between old_version and new_version (inclusive)
@@ -3462,7 +3331,9 @@ def api_diff_cmd(
                 )
                 sys.exit(1)
 
-            hist = symbol_history(project_root, symbol, package_name=package, tags=selected_tags)
+            hist = symbol_history(
+                project_root, symbol, package_name=importable_name, tags=selected_tags
+            )
             if hist is None:
                 click.echo("Could not determine package name.", err=True)
                 sys.exit(1)
@@ -3519,7 +3390,7 @@ def api_diff_cmd(
 
         # --- Timeline mode ---
         if timeline:
-            tl = build_timeline(project_root, package or "")
+            tl = build_timeline(project_root, importable_name)
             if not tl:
                 click.echo("No version tags found or could not build snapshots.", err=True)
                 sys.exit(1)
@@ -3530,7 +3401,7 @@ def api_diff_cmd(
             return
 
         # --- Diff ---
-        result = api_diff(project_root, old_version, new_version, package_name=package)
+        result = api_diff(project_root, old_version, new_version, package_name=importable_name)
 
         if result is None:
             click.echo(
@@ -3542,12 +3413,19 @@ def api_diff_cmd(
 
         # --- Graph mode ---
         if graph:
-            from great_docs.core import GreatDocs
+            from great_docs._reference import documented as documented_reference
 
+            package_exports = Exports.make(
+                Layout.make(project_root, Path(config_path) if config_path else None)
+            )
+            project = package_exports.project
             documented = (
-                GreatDocs(
-                    project_path=str(project_root), config_path=config_path
-                ).documented_symbol_names(result.package_name)
+                documented_reference.symbol_names(
+                    package_exports.config,
+                    importable_name=project.module or result.package_name.replace("-", "_"),
+                    search_paths=project.search_paths(),
+                    create_sections=package_exports.sections,
+                )
                 or None
             )
             # Build graph for the new version
@@ -3646,7 +3524,7 @@ def api_diff_cmd(
 
         click.echo()
 
-    except Exception as e:
+    except (*PROJECT_ERRORS, *USER_CODE_ERRORS) as e:
         if json_output:
             click.echo(json.dumps({"status": "error", "error": str(e)}))
         else:
@@ -3680,14 +3558,13 @@ def versions(project_path: str | None, check: bool, config_path: str | None = No
       great-docs versions              # List all configured versions
       great-docs versions --check      # Validate configuration
     """
-    from great_docs._versioning import get_latest_version, parse_versions_config
-    from great_docs.config import Config
+    from great_docs._versions.model import get_latest_version, parse_versions_config
 
     try:
         project_root = Path(project_path or ".").resolve()
         layout = Layout.make(project_root, Path(config_path) if config_path else None)
         project_root = layout.package_root
-        cfg = Config(project_root, config_path=layout.config_path, cache_dir=layout.cache_dir)
+        cfg = layout.load_config()
 
         if not cfg.has_versions:
             click.echo("No versions configured in great-docs.yml.")
@@ -3733,7 +3610,7 @@ def versions(project_path: str | None, check: bool, config_path: str | None = No
 
         click.echo()
 
-    except Exception as e:
+    except PROJECT_ERRORS as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
@@ -3799,7 +3676,7 @@ def api_snapshot_cmd(
     \b
     Snapshots are saved to '.great-docs/snapshots/<version>.json' by default.
     """
-    from ._api_diff import (
+    from ._api_evolution.snapshot import (
         _detect_package_name,
         list_version_tags,
         snapshot_at_tag,
@@ -3809,7 +3686,9 @@ def api_snapshot_cmd(
     project_root = Path(project_path) if project_path else Path.cwd()
 
     # Resolve package name
-    pkg_name = package or _detect_package_name(project_root)
+    pkg_name = package or _detect_package_name(
+        project_root, Path(config_path) if config_path else None
+    )
     if not pkg_name:
         click.echo(
             "Could not detect package name. Pass --package or add [project] "
@@ -3818,14 +3697,25 @@ def api_snapshot_cmd(
         )
         sys.exit(1)
 
-    from great_docs.core import GreatDocs
+    from great_docs._reference import documented as documented_reference
 
-    documented = (
-        GreatDocs(project_path=str(project_root), config_path=config_path).documented_symbol_names(
-            pkg_name
+    try:
+        package_exports = Exports.make(
+            Layout.make(project_root, Path(config_path) if config_path else None)
         )
-        or None
-    )
+        project = package_exports.project
+        documented = (
+            documented_reference.symbol_names(
+                package_exports.config,
+                importable_name=project.module or pkg_name.replace("-", "_"),
+                search_paths=project.search_paths(),
+                create_sections=package_exports.sections,
+            )
+            or None
+        )
+    except BuildError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
 
     # Default snapshot directory
     snap_dir = project_root / ".great-docs" / "snapshots"
@@ -3872,7 +3762,7 @@ def api_snapshot_cmd(
             click.echo(f"  ✓  {tag}: {snap.symbol_count} symbols → {out_path}")
             saved += 1
 
-        except Exception as e:
+        except USER_CODE_ERRORS as e:
             click.echo(f"  ✗  {tag}: {e}", err=True)
             failed += 1
 
@@ -3985,7 +3875,7 @@ def skill_install(
         else:
             kwargs["package"] = source
     else:
-        # Try to detect current package from pyproject.toml
+        # Use the current project's declared package name when no source is supplied.
         project_root = Path.cwd()
         pkg_name = _detect_current_package(project_root)
         if pkg_name:
@@ -4121,22 +4011,23 @@ def skill_list(source: str | None, url: str | None) -> None:
 
 
 def _detect_current_package(project_root: Path) -> str | None:
-    """Detect the current package name from pyproject.toml."""
-    pyproject_path = project_root / "pyproject.toml"
-    if not pyproject_path.exists():
-        return None
+    """
+    Read the package name declared by a project
 
+    Parameters
+    ----------
+    project_root
+        The directory holding the packaging files.
+
+    Returns
+    -------
+    :
+        The distribution name as written, or `None` when the project declares no name or its
+        metadata cannot be read.
+    """
     try:
-        try:
-            import tomllib
-        except ImportError:
-            import tomli as tomllib  # type: ignore[no-redef]
-
-        with open(pyproject_path, "rb") as f:
-            data = tomllib.load(f)
-
-        return data.get("project", {}).get("name")
-    except Exception:
+        return _manifest.read(project_root)["name"]
+    except ManifestError:
         return None
 
 
@@ -4273,41 +4164,16 @@ def term_render(source: str, output_dir: str | None, interval: float, script: st
     produces SVG keyframes + a manifest.json for the player, along with
     the recording's transcript (_transcript.md).
     """
-    from ._term_player import apply_script, generate_manifest, parse_asciicast, parse_termshow
-    from ._term_player.script import load_script
-    from ._term_player.transcript import write_transcript
+    from ._term_player.prerender import load_recording, render_recording
+    from ._term_player.prerender import output_dir as recording_output_dir
 
     source_path = Path(source)
-
-    # Parse recording
-    if source_path.suffix == ".cast":
-        recording = parse_asciicast(source_path)
-    else:
-        recording = parse_termshow(source_path)
-
-    # Load and apply script
-    script_obj = None
-    if script:
-        script_obj = load_script(script)
-    else:
-        # Auto-detect script file
-        script_path = source_path.with_suffix(".termshow.yml")
-        if script_path.exists():
-            script_obj = load_script(script_path)
-
-    original = recording
-    if script_obj:
-        recording = apply_script(recording, script_obj)
-
-    # Determine output directory
+    recording, script_obj = load_recording(source_path, Path(script) if script else None)
     if output_dir is None:
-        output_dir = str(source_path.parent / "termshow" / source_path.stem)
-
-    # Generate manifest and frames
-    manifest = generate_manifest(
-        recording, script_obj, output_dir=output_dir, keyframe_interval=interval
-    )
-    write_transcript(original, script_obj, output_dir)
+        # The shortcode's fallback expects output beside the recording in
+        # `termshow/<name>/`.
+        output_dir = str(recording_output_dir(source_path, source_path.parent, source_path.parent))
+    manifest = render_recording(recording, script_obj, Path(output_dir), keyframe_interval=interval)
 
     stats = manifest.stats
     click.echo(
@@ -4402,23 +4268,18 @@ def term_play(source: str, speed: float, script: str | None, no_script: bool) ->
       great-docs termshow play demos/install.termshow
       great-docs termshow play demos/install.termshow --speed 2
     """
-    from ._term_player import apply_script, parse_asciicast, parse_termshow
+    from ._term_player import apply_script
     from ._term_player.playback import play_recording
-    from ._term_player.script import load_script
+    from ._term_player.prerender import load_recording
 
     if speed <= 0:
         raise click.BadParameter("must be greater than 0", param_hint="--speed")
 
-    source_path = Path(source)
-    if source_path.suffix == ".cast":
-        recording = parse_asciicast(source_path)
-    else:
-        recording = parse_termshow(source_path)
-
-    if not no_script:
-        script_path = Path(script) if script else source_path.with_suffix(".termshow.yml")
-        if script_path.exists():
-            recording = apply_script(recording, load_script(script_path))
+    recording, script_obj = load_recording(
+        Path(source), Path(script) if script else None, use_script=not no_script
+    )
+    if script_obj is not None:
+        recording = apply_script(recording, script_obj)
 
     try:
         play_recording(recording, speed=speed)
@@ -4552,6 +4413,7 @@ def term_export(
     from ._term_player import apply_script, generate_manifest
     from ._term_player.bundle import BUNDLE_SUFFIX
     from ._term_player.export import SIZE_WARNING_BYTES, export_svg, picture_snippet
+    from ._term_player.prerender import load_recording
     from ._term_player.video import VIDEO_FORMATS
 
     # The file extension of each format, and the format of each extension
@@ -4592,7 +4454,9 @@ def term_export(
         raise click.BadParameter("must be more than 0", param_hint="--max-idle")
 
     source_path = Path(source)
-    recording, script_obj = _load_term_source(source_path, script, no_script)
+    recording, script_obj = load_recording(
+        source_path, Path(script) if script else None, use_script=not no_script
+    )
 
     out_path = Path(output) if output else source_path.with_suffix(f".{extensions.get(fmt, fmt)}")
     if fmt == "cast":
@@ -4714,24 +4578,6 @@ def _export_bundle(recording, script, out_path: Path) -> None:
     click.echo(f'\nPlay it with <termshow-player src="{out_path.name}"></termshow-player>')
 
 
-def _load_term_source(source_path: Path, script: str | None, no_script: bool):
-    """Read a .cast or .termshow recording and its script (None with --no-script, or when
-    there's no script). The script isn't applied."""
-    from ._term_player import parse_asciicast, parse_termshow
-    from ._term_player.script import load_script
-
-    if source_path.suffix == ".cast":
-        recording = parse_asciicast(source_path)
-    else:
-        recording = parse_termshow(source_path)
-    script_obj = None
-    if not no_script:
-        script_path = Path(script) if script else source_path.with_suffix(".termshow.yml")
-        if script_path.exists():
-            script_obj = load_script(script_path)
-    return recording, script_obj
-
-
 def _export_cast(recording, script, source_path: Path, out_path: Path, *, version: int) -> None:
     """Write `termshow export --cast`'s file and report what went into it."""
     from ._term_player.cast import export_asciicast, left_out
@@ -4822,6 +4668,7 @@ def term_snap(
     """
     from ._term_player import apply_script, generate_manifest
     from ._term_player.export import picture_snippet
+    from ._term_player.prerender import load_recording
     from ._term_player.snap import SnapError, rasterize, snap_svg, snap_time
 
     if sum([at is not None, chapter is not None, end]) > 1:
@@ -4842,7 +4689,9 @@ def term_snap(
         raise click.BadParameter("must be more than 0", param_hint="--scale")
 
     source_path = Path(source)
-    recording, script_obj = _load_term_source(source_path, script, no_script)
+    recording, script_obj = load_recording(
+        source_path, Path(script) if script else None, use_script=not no_script
+    )
     if script_obj is not None:
         recording = apply_script(recording, script_obj)
     manifest = generate_manifest(recording, script_obj)
@@ -4929,10 +4778,13 @@ def term_transcript(
       great-docs termshow transcript demos/install.termshow -o install.md
       great-docs termshow transcript demos/install.termshow --vtt -o install.vtt
     """
+    from ._term_player.prerender import load_recording
     from ._term_player.transcript import transcript_markdown, transcript_vtt
 
     source_path = Path(source)
-    recording, script_obj = _load_term_source(source_path, script, no_script)
+    recording, script_obj = load_recording(
+        source_path, Path(script) if script else None, use_script=not no_script
+    )
     if fmt == "markdown":
         text = transcript_markdown(recording, script_obj)
         empty = "The recording shows no text." if not text else ""

@@ -352,15 +352,15 @@ class _Session:
         winsize = struct.pack("HHHH", self.settings.rows, self.settings.cols, 0, 0)
 
         pid, fd = pty.fork()
-        if pid == 0:  # pragma: no cover - the child process
-            # fd 1 is the terminal here (`sys.stdout` may have been replaced, as under pytest)
+        if pid == 0:
+            # Descriptor 1 is the PTY even when a test replaces `sys.stdout`.
             try:
                 fcntl.ioctl(1, termios.TIOCSWINSZ, winsize)
                 if self.settings.cwd is not None:
                     os.chdir(self.settings.cwd)
                 os.execvpe(argv[0], argv, env)
             except OSError as e:
-                # Shown on the screen, which the error message includes
+                # Write to the PTY so the recording includes the shell start-up error.
                 os.write(1, f"{argv[0]}: {e.strerror}\r\n".encode())
             os._exit(127)
 
@@ -473,10 +473,12 @@ class _Session:
     def cursor_line(self) -> str:
         """The text of the cursor's row, up to the cursor or to the last character."""
         screen = self.emulator.screen
-        text = "".join(c.char for c in screen.cells[screen.cursor_row])
-        stripped = text.rstrip()
-        # Keep spaces before the cursor, so the `$ ` of a prompt still ends in a space
-        return text[: screen.cursor_col] if screen.cursor_col > len(stripped) else stripped
+        row = screen.cells[screen.cursor_row]
+        stripped = "".join(c.char for c in row).rstrip()
+        # Keep spaces before the cursor, so the `$ ` of a prompt still ends in a space.
+        # Columns aren't string indices, as a cell can hold no character or several
+        before = "".join(c.char for c in row[: screen.cursor_col])
+        return before if before.rstrip() == stripped else stripped
 
     # Ending -----------------------------------------------------------------------------------
 

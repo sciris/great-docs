@@ -3,15 +3,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
-from yaml12 import parse_yaml
+from yaml12 import format_yaml, parse_yaml
 
-from great_docs._api_diff import ApiSnapshot, ParameterInfo, SymbolInfo
+from great_docs._api_evolution.model import ApiSnapshot, ParameterInfo, SymbolInfo
+from great_docs._project.layout import Layout
 from great_docs._utils import QUARTO_YML_HEADER, is_great_docs_build_dir
-from great_docs._versioned_build import (
-    _check_build_dir_collisions,
+from great_docs._versions.build import (
+    _adjust_quarto_config_for_version,
     _clean_stale_version_dirs,
     _compute_excluded_section_dirs,
     _in_excluded_section,
@@ -26,13 +27,12 @@ from great_docs._versioned_build import (
     _published_claims,
     _rebuild_api_from_snapshot,
     _redirect_page,
-    _rewrite_quarto_yml_for_version,
     _snapshot_cache_path,
     _validate_git_ref_is_tag,
     _version_build_dir,
-    _write_page_metadata,
     _write_snapshot_inventory,
     assemble_site,
+    check_build_dir_collisions,
     create_version_aliases,
     expand_version_badges,
     expand_version_callouts,
@@ -41,7 +41,8 @@ from great_docs._versioned_build import (
     run_versioned_build,
     write_version_map,
 )
-from great_docs._versioning import VersionEntry, parse_versions_config
+from great_docs._versions.model import VersionEntry, parse_versions_config
+from great_docs._website import page_metadata, quarto_yml
 
 if TYPE_CHECKING:
     from great_docs.config import Config
@@ -71,6 +72,25 @@ def _make_source_tree(root: Path, pages: dict[str, str]) -> None:
             "format:\n  html: {}\nwebsite:\n  title: Test\n",
             encoding="utf-8",
         )
+
+
+# Baseline site configuration for versioned builds
+_QUARTO_CONFIG: dict[str, Any] = {
+    "project": {"type": "website", "output-dir": "_site"},
+    "format": {"html": {}},
+    "website": {"title": "Test"},
+}
+
+
+def _make_project(tmp_path: Path, pages: dict[str, str]) -> Layout:
+    """Create a project layout with `pages` and a generated Quarto configuration"""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    layout = Layout.make(project_root)
+    layout.build_dir.mkdir()
+    quarto_yml.write(layout.build_dir, _QUARTO_CONFIG)
+    _make_source_tree(layout.build_dir, pages)
+    return layout
 
 
 # ---------------------------------------------------------------------------
@@ -110,13 +130,13 @@ class TestCheckBuildDirCollisions:
     def test_passes_for_distinct_tags(self, tmp_path: Path):
         source_dir = tmp_path / "great-docs"
         targets = parse_versions_config(["0.3", "0.2"])
-        _check_build_dir_collisions(source_dir, targets, "0.3")
+        check_build_dir_collisions(source_dir, targets, "0.3")
 
     def test_raises_when_tags_sanitise_to_one_name(self, tmp_path: Path):
         source_dir = tmp_path / "great-docs"
         targets = parse_versions_config(["2.0", "release/1.0", "release-1.0"])
         with pytest.raises(ValueError, match="both map to build directory"):
-            _check_build_dir_collisions(source_dir, targets, "2.0")
+            check_build_dir_collisions(source_dir, targets, "2.0")
 
 
 class TestCleanStaleVersionDirs:
@@ -205,7 +225,9 @@ class TestPreprocessVersion:
 
         versions = self._setup_versions()
         dest = tmp_path / "build"
-        pages = preprocess_version(source, dest, versions[0], versions)
+        pages = preprocess_version(
+            source, dest, versions[0], versions, layout=Layout.make(tmp_path), quarto_config={}
+        )
 
         assert "index.html" in pages
         assert "guide.html" in pages
@@ -226,12 +248,16 @@ class TestPreprocessVersion:
 
         # Build for 0.3 — should include new-feature
         dest1 = tmp_path / "build1"
-        pages1 = preprocess_version(source, dest1, versions[0], versions)
+        pages1 = preprocess_version(
+            source, dest1, versions[0], versions, layout=Layout.make(tmp_path), quarto_config={}
+        )
         assert "new-feature.html" in pages1
 
         # Build for 0.2 — should exclude new-feature
         dest2 = tmp_path / "build2"
-        pages2 = preprocess_version(source, dest2, versions[1], versions)
+        pages2 = preprocess_version(
+            source, dest2, versions[1], versions, layout=Layout.make(tmp_path), quarto_config={}
+        )
         assert "new-feature.html" not in pages2
         assert not (dest2 / "new-feature.qmd").exists()
 
@@ -257,14 +283,18 @@ class TestPreprocessVersion:
 
         # Build for 0.3
         dest1 = tmp_path / "build1"
-        preprocess_version(source, dest1, versions[0], versions)
+        preprocess_version(
+            source, dest1, versions[0], versions, layout=Layout.make(tmp_path), quarto_config={}
+        )
         content1 = (dest1 / "page.qmd").read_text()
         assert "New in 0.3!" in content1
         assert "Old content." not in content1
 
         # Build for 0.2
         dest2 = tmp_path / "build2"
-        preprocess_version(source, dest2, versions[1], versions)
+        preprocess_version(
+            source, dest2, versions[1], versions, layout=Layout.make(tmp_path), quarto_config={}
+        )
         content2 = (dest2 / "page.qmd").read_text()
         assert "New in 0.3!" not in content2
         assert "Old content." in content2
@@ -294,8 +324,16 @@ class TestPreprocessVersion:
         descriptions = []
         for i, entry in enumerate(versions[:2]):
             dest = tmp_path / f"build{i}"
-            preprocess_version(source, dest, entry, versions, config=config)
-            _write_page_metadata(dest, config, None, None)
+            preprocess_version(
+                source,
+                dest,
+                entry,
+                versions,
+                config=config,
+                layout=Layout.make(tmp_path),
+                quarto_config={},
+            )
+            page_metadata.write_to_pages(dest, {}, config, None, None)
             front_matter = (dest / "page.qmd").read_text().split("---")[1]
             descriptions.append(parse_yaml(front_matter)["description-meta"])
 
@@ -305,21 +343,28 @@ class TestPreprocessVersion:
         ]
 
     def test_skips_underscore_prefixed_files(self, tmp_path: Path):
+        # Version scoping would delete these files; skipping internal paths must
+        # preserve their contents and exclude them from the page list.
+        other_version = '---\ntitle: Internal\nversions: ["0.1"]\n---\n\nHi'
         source = tmp_path / "source"
         _make_source_tree(
             source,
             {
                 "index.qmd": "---\ntitle: Home\n---\n\nHi",
-                "_quarto.yml": "project:\n  type: website\n",
+                "_partial.qmd": other_version,
+                "_internal/notes.md": other_version,
             },
         )
 
         versions = self._setup_versions()
         dest = tmp_path / "build"
-        pages = preprocess_version(source, dest, versions[0], versions)
+        pages = preprocess_version(
+            source, dest, versions[0], versions, layout=Layout.make(tmp_path), quarto_config={}
+        )
 
-        # _quarto.yml should NOT be in pages (it starts with _)
-        assert all(not p.startswith("_") for p in pages)
+        assert pages == ["index.html"]
+        assert (dest / "_partial.qmd").read_text() == other_version
+        assert (dest / "_internal" / "notes.md").read_text() == other_version
 
     def test_snapshot_strategy_a(self, tmp_path: Path):
         source = tmp_path / "source"
@@ -369,6 +414,8 @@ class TestPreprocessVersion:
             versions[1],
             versions,
             project_root=tmp_path,
+            layout=Layout.make(tmp_path),
+            quarto_config={},
         )
 
         # Should have generated API reference pages
@@ -443,6 +490,8 @@ class TestPreprocessVersion:
             versions[1],
             versions,
             project_root=tmp_path,
+            layout=Layout.make(tmp_path),
+            quarto_config={},
         )
 
         assert "reference/MyClass.html" in pages
@@ -482,7 +531,15 @@ class TestPreprocessVersion:
         )
 
         dest = tmp_path / "build"
-        preprocess_version(source, dest, versions[1], versions, project_root=tmp_path)
+        preprocess_version(
+            source,
+            dest,
+            versions[1],
+            versions,
+            project_root=tmp_path,
+            layout=Layout.make(tmp_path),
+            quarto_config={},
+        )
 
         assert not (dest / "reference" / "new_func.qmd").exists()
         assert (dest / "reference" / "my_func.qmd").is_file()
@@ -493,10 +550,27 @@ class TestPreprocessVersion:
         _make_source_tree(source, {"index.qmd": "---\ntitle: Home\n---\n\nHome\n"})
         versions = self._setup_versions()
 
-        pages = preprocess_version(source, source, versions[0], versions)
+        pages = preprocess_version(
+            source, source, versions[0], versions, layout=Layout.make(tmp_path), quarto_config={}
+        )
 
         assert (source / "index.qmd").is_file()
         assert "index.html" in pages
+
+    def test_existing_destination_is_replaced(self, tmp_path: Path):
+        source = tmp_path / "source"
+        _make_source_tree(source, {"index.qmd": "---\ntitle: Home\n---\n\nHome\n"})
+        dest = tmp_path / "build"
+        _make_source_tree(dest, {"stale.qmd": "---\ntitle: Stale\n---\n\nOld\n"})
+        versions = self._setup_versions()
+
+        pages = preprocess_version(
+            source, dest, versions[1], versions, layout=Layout.make(tmp_path), quarto_config={}
+        )
+
+        assert pages == ["index.html"]
+        assert not (dest / "stale.qmd").exists()
+        assert (dest / "index.qmd").is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -655,23 +729,34 @@ class TestWriteVersionMap:
 
 
 class TestSectionVersionScoping:
-    def test_excluded_section_dirs(self):
+    def test_excluded_section_dirs(self, tmp_path: Path):
         sections = [
             {"dir": "recipes", "versions": ["0.3"]},
             {"dir": "migrations", "versions": ["0.2", "0.3"]},
             {"dir": "guide"},  # no versions key — always included
         ]
-        excluded = _compute_excluded_section_dirs("0.2", sections)
-        assert "recipes" in excluded  # 0.2 not in ["0.3"]
-        assert "migrations" not in excluded  # 0.2 in ["0.2", "0.3"]
-        assert "guide" not in excluded
+        versions = parse_versions_config(["0.3", "0.2"])
+        excluded = _compute_excluded_section_dirs("0.2", versions, sections, Layout.make(tmp_path))
+        assert Path("recipes") in excluded  # 0.2 not in ["0.3"]
+        assert Path("migrations") not in excluded  # 0.2 in ["0.2", "0.3"]
+        assert Path("guide") not in excluded
 
-    def test_no_sections_returns_empty(self):
-        assert _compute_excluded_section_dirs("0.1", None) == set()
-        assert _compute_excluded_section_dirs("0.1", []) == set()
+    def test_no_sections_returns_empty(self, tmp_path: Path):
+        layout = Layout.make(tmp_path)
+        versions = parse_versions_config(["0.1"])
+        assert _compute_excluded_section_dirs("0.1", versions, None, layout) == set()
+        assert _compute_excluded_section_dirs("0.1", versions, [], layout) == set()
+
+    def test_malformed_section_entries_are_ignored(self, tmp_path: Path):
+        # The section reader reports and skips non-mapping entries; the
+        # versioned build must survive the same configuration.
+        sections = ["examples", {"dir": "recipes", "versions": ["0.3"]}]
+        versions = parse_versions_config(["0.3", "0.2"])
+        excluded = _compute_excluded_section_dirs("0.2", versions, sections, Layout.make(tmp_path))
+        assert excluded == {Path("recipes")}
 
     def test_in_excluded_section(self):
-        excluded = {"recipes", "migrations"}
+        excluded = {Path("recipes"), Path("migrations")}
         assert _in_excluded_section(Path("recipes/01-example.qmd"), excluded)
         assert _in_excluded_section(Path("migrations/v2.qmd"), excluded)
         assert not _in_excluded_section(Path("guide/intro.qmd"), excluded)
@@ -689,6 +774,7 @@ class TestSectionVersionScoping:
         )
         versions = parse_versions_config(["0.3", "0.2"])
         sections = [{"dir": "recipes", "versions": ["0.3"]}]
+        layout = Layout.make(tmp_path)
 
         # Build 0.3 — recipes included
         dest1 = tmp_path / "build1"
@@ -698,6 +784,8 @@ class TestSectionVersionScoping:
             versions[0],
             versions,
             section_configs=sections,
+            layout=layout,
+            quarto_config={},
         )
         assert "recipes/01-basic.html" in pages1
 
@@ -709,9 +797,137 @@ class TestSectionVersionScoping:
             versions[1],
             versions,
             section_configs=sections,
+            layout=layout,
+            quarto_config={},
         )
         assert "recipes/01-basic.html" not in pages2
         assert "guide/intro.html" in pages2
+
+    def test_preprocess_reads_section_versions_as_expressions(self, tmp_path: Path):
+        # Section version scoping must match page front matter whether an
+        # expression is supplied as a string or in a list.
+        source = tmp_path / "source"
+        _make_source_tree(
+            source,
+            {
+                "recipes/basic.qmd": "---\ntitle: Basic\n---\n\nRecipe",
+                "legacy/old.qmd": "---\ntitle: Old\n---\n\nLegacy",
+            },
+        )
+        versions = parse_versions_config(["0.4", "0.3", "0.2"])
+        sections = [
+            {"dir": "recipes", "versions": ">=0.3"},
+            {"dir": "legacy", "versions": ["<0.4"]},
+        ]
+
+        pages = {
+            entry.tag: preprocess_version(
+                source,
+                tmp_path / f"build-{entry.tag}",
+                entry,
+                versions,
+                section_configs=sections,
+                layout=Layout.make(tmp_path),
+                quarto_config={},
+            )
+            for entry in versions
+        }
+
+        assert pages == {
+            "0.4": ["recipes/basic.html"],
+            "0.3": ["legacy/old.html", "recipes/basic.html"],
+            "0.2": ["legacy/old.html"],
+        }
+
+    def test_preprocess_excludes_sections_by_published_directory(self, tmp_path: Path):
+        # Exclusions follow full published paths, including nested and slugged
+        # directories. A matching name elsewhere must remain included.
+        layout = Layout.make(tmp_path)
+        source = layout.build_dir
+        _make_source_tree(
+            source,
+            {
+                "migration-guides/v2.qmd": "---\ntitle: V2\n---\n\nMigrate",
+                "guides/migrations/v1.qmd": "---\ntitle: V1\n---\n\nMigrate",
+                "guides/intro.qmd": "---\ntitle: Intro\n---\n\nGuide",
+                "user-guide/recipes/basic.qmd": "---\ntitle: Basic\n---\n\nRecipe",
+            },
+        )
+        versions = parse_versions_config(["0.3", "0.2"])
+        sections = [
+            {"dir": "Migration_Guides", "versions": ["0.3"]},
+            {"dir": "guides/migrations", "versions": ["0.3"]},
+            {"dir": "recipes", "versions": ["0.3"]},
+        ]
+
+        pages = preprocess_version(
+            source,
+            tmp_path / "build-0.2",
+            versions[1],
+            versions,
+            section_configs=sections,
+            layout=layout,
+            quarto_config={},
+        )
+
+        assert sorted(pages) == ["guides/intro.html", "user-guide/recipes/basic.html"]
+
+    def test_preprocess_removes_navbar_links_into_excluded_sections(self, tmp_path: Path):
+        # Navbar links to excluded sections lead to missing pages. Menu links
+        # must also be removed, along with menus emptied by those removals.
+        source = tmp_path / "source"
+        _make_source_tree(
+            source,
+            {
+                "_quarto.yml": (
+                    "project:\n  type: website\n"
+                    "website:\n"
+                    "  navbar:\n"
+                    "    left:\n"
+                    "      - text: Guide\n        href: guide/intro.qmd\n"
+                    "      - text: Recipes\n        href: recipes/index.qmd\n"
+                    "      - text: More\n"
+                    "        menu:\n"
+                    "          - text: Migrations\n            href: migrations/index.qmd\n"
+                    "          - guide/faq.qmd\n"
+                    "      - text: Legacy\n"
+                    "        menu:\n"
+                    "          - migrations/v1.qmd\n"
+                    "    right:\n"
+                    "      - recipes/basic.qmd\n"
+                    "      - icon: github\n        href: https://github.com/org/recipes\n"
+                ),
+                "guide/intro.qmd": "---\ntitle: Intro\n---\n\nGuide",
+                "guide/faq.qmd": "---\ntitle: FAQ\n---\n\nGuide",
+                "recipes/basic.qmd": "---\ntitle: Basic\n---\n\nRecipe",
+                "migrations/v1.qmd": "---\ntitle: V1\n---\n\nMigrate",
+            },
+        )
+        versions = parse_versions_config(["0.3", "0.2"])
+        sections = [
+            {"dir": "recipes", "versions": ["0.3"]},
+            {"dir": "migrations", "versions": ["0.3"]},
+        ]
+        dest = tmp_path / "build-0.2"
+        quarto_config = quarto_yml.read(source)
+
+        preprocess_version(
+            source,
+            dest,
+            versions[1],
+            versions,
+            section_configs=sections,
+            layout=Layout.make(tmp_path),
+            quarto_config=quarto_config,
+        )
+
+        assert quarto_config["website"]["navbar"] == {
+            "left": [
+                {"text": "Guide", "href": "guide/intro.qmd"},
+                {"text": "More", "menu": ["guide/faq.qmd"]},
+            ],
+            "right": [{"icon": "github", "href": "https://github.com/org/recipes"}],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -757,7 +973,7 @@ class TestExpandVersionBadges:
         assert "New in 0.3.0" in result
 
     def test_new_badge_expired_suppressed(self):
-        from great_docs._versioning import BadgeExpiry, parse_versions_config
+        from great_docs._versions.model import BadgeExpiry, parse_versions_config
 
         versions = parse_versions_config(["0.7", "0.6", "0.5", "0.4", "0.3"])
         entry = versions[0]  # 0.7
@@ -768,7 +984,7 @@ class TestExpandVersionBadges:
         assert "Feature  here." in result
 
     def test_new_badge_within_window_kept(self):
-        from great_docs._versioning import BadgeExpiry, parse_versions_config
+        from great_docs._versions.model import BadgeExpiry, parse_versions_config
 
         versions = parse_versions_config(["0.7", "0.6", "0.5", "0.4", "0.3"])
         entry = versions[2]  # 0.5
@@ -778,7 +994,7 @@ class TestExpandVersionBadges:
         assert "New in 0.3" in result
 
     def test_changed_badge_never_expired(self):
-        from great_docs._versioning import BadgeExpiry, parse_versions_config
+        from great_docs._versions.model import BadgeExpiry, parse_versions_config
 
         versions = parse_versions_config(["0.7", "0.6", "0.5", "0.4", "0.3"])
         entry = versions[0]  # 0.7
@@ -788,7 +1004,7 @@ class TestExpandVersionBadges:
         assert "Changed in 0.3" in result
 
     def test_deprecated_badge_never_expired(self):
-        from great_docs._versioning import BadgeExpiry, parse_versions_config
+        from great_docs._versions.model import BadgeExpiry, parse_versions_config
 
         versions = parse_versions_config(["0.7", "0.6", "0.5", "0.4", "0.3"])
         entry = versions[0]  # 0.7
@@ -806,7 +1022,7 @@ class TestExpandVersionBadges:
 
     def test_new_badge_prerelease_own_build_renders_new(self):
         """Building the prerelease itself renders as 'New', not 'Upcoming'."""
-        from great_docs._versioning import parse_versions_config
+        from great_docs._versions.model import parse_versions_config
 
         versions = parse_versions_config(
             [
@@ -823,7 +1039,7 @@ class TestExpandVersionBadges:
 
     def test_new_badge_prerelease_stable_build_renders_upcoming(self):
         """Building a stable version shows prerelease badges as 'Upcoming'."""
-        from great_docs._versioning import parse_versions_config
+        from great_docs._versions.model import parse_versions_config
 
         versions = parse_versions_config(
             [
@@ -840,7 +1056,7 @@ class TestExpandVersionBadges:
 
     def test_new_badge_prerelease_dev_tag_stable_build(self):
         """Dev tag badge on a stable build renders as 'Upcoming'."""
-        from great_docs._versioning import parse_versions_config
+        from great_docs._versions.model import parse_versions_config
 
         versions = parse_versions_config(
             [
@@ -856,7 +1072,7 @@ class TestExpandVersionBadges:
 
     def test_new_badge_prerelease_dev_tag_own_build_renders_new(self):
         """Building the dev version itself renders as 'New'."""
-        from great_docs._versioning import parse_versions_config
+        from great_docs._versions.model import parse_versions_config
 
         versions = parse_versions_config(
             [
@@ -873,7 +1089,7 @@ class TestExpandVersionBadges:
 
     def test_new_badge_released_version_not_upcoming(self):
         """A new badge referencing a released version stays 'New'."""
-        from great_docs._versioning import parse_versions_config
+        from great_docs._versions.model import parse_versions_config
 
         versions = parse_versions_config(
             [
@@ -891,7 +1107,7 @@ class TestExpandVersionBadges:
 
     def test_bare_new_badge_on_prerelease_build(self):
         """Bare [version-badge new] on a prerelease build renders as 'New' (own build)."""
-        from great_docs._versioning import parse_versions_config
+        from great_docs._versions.model import parse_versions_config
 
         versions = parse_versions_config(
             [
@@ -907,7 +1123,7 @@ class TestExpandVersionBadges:
 
     def test_changed_badge_not_affected_by_prerelease(self):
         """Changed badges stay 'Changed' even when version is prerelease."""
-        from great_docs._versioning import parse_versions_config
+        from great_docs._versions.model import parse_versions_config
 
         versions = parse_versions_config(
             [
@@ -951,7 +1167,7 @@ class TestUpdatePageStatusJson:
     def test_adds_upcoming_pages(self, tmp_path):
         import json
 
-        from great_docs._versioned_build import _update_page_status_json
+        from great_docs._versions.build import _update_page_status_json
 
         status_path = tmp_path / "_page_status.json"
         status_path.write_text(
@@ -971,7 +1187,7 @@ class TestUpdatePageStatusJson:
     def test_preserves_existing_status(self, tmp_path):
         import json
 
-        from great_docs._versioned_build import _update_page_status_json
+        from great_docs._versions.build import _update_page_status_json
 
         status_path = tmp_path / "_page_status.json"
         status_path.write_text(
@@ -991,7 +1207,7 @@ class TestUpdatePageStatusJson:
     def test_no_version_uses_true(self, tmp_path):
         import json
 
-        from great_docs._versioned_build import _update_page_status_json
+        from great_docs._versions.build import _update_page_status_json
 
         status_path = tmp_path / "_page_status.json"
         status_path.write_text(
@@ -1007,17 +1223,20 @@ class TestUpdatePageStatusJson:
         assert data["upcoming_pages"]["user-guide/feature.qmd"] is True
 
     def test_missing_file_does_nothing(self, tmp_path):
-        from great_docs._versioned_build import _update_page_status_json
+        from great_docs._versions.build import _update_page_status_json
 
         # Should not raise
         _update_page_status_json(tmp_path, [("feature.html", "0.8")])
 
 
 class TestSyncStatusInlineScript:
-    """Tests for _sync_status_inline_script which injects __GD_UPCOMING_DATA__."""
+    """
+    Upcoming page data in versioned Quarto configuration
+    """
 
-    def _make_quarto_yml(self, tmp_path, include_js_inline=True):
-        """Create a _quarto.yml with __GD_STATUS_DATA__ inline script."""
+    @staticmethod
+    def _quarto_config(include_js_inline=True) -> dict:
+        """Return a Quarto configuration with the `__GD_STATUS_DATA__` inline script"""
         import json
 
         status_data = {
@@ -1032,21 +1251,21 @@ class TestSyncStatusInlineScript:
             "format:",
             "  html:",
             "    include-after-body:",
-            f'      - text: "{script}"',
+            f"      - text: '{script}'",
         ]
         if include_js_inline:
             # Simulate inlined page-status-badges.js that references __GD_UPCOMING_DATA__
             lines.append(
-                '      - text: "<script>// var upcoming = window.__GD_UPCOMING_DATA__;</script>"'
+                "      - text: '<script>// var upcoming = window.__GD_UPCOMING_DATA__;</script>'"
             )
-        (tmp_path / "_quarto.yml").write_text("\n".join(lines))
+        return parse_yaml("\n".join(lines))
 
     def test_injects_upcoming_data(self, tmp_path):
         import json
 
-        from great_docs._versioned_build import _sync_status_inline_script
+        from great_docs._versions.build import _add_upcoming_status_data
 
-        self._make_quarto_yml(tmp_path)
+        quarto_config = self._quarto_config()
         status_path = tmp_path / "_page_status.json"
         status_path.write_text(
             json.dumps(
@@ -1057,17 +1276,17 @@ class TestSyncStatusInlineScript:
                 }
             )
         )
-        _sync_status_inline_script(tmp_path)
-        yml = (tmp_path / "_quarto.yml").read_text()
+        _add_upcoming_status_data(quarto_config, tmp_path)
+        yml = format_yaml(quarto_config)
         assert "<script>window.__GD_UPCOMING_DATA__=" in yml
-        assert '"user-guide/feature.qmd": "0.8"' in yml
+        assert '"user-guide/feature.qmd": "0.8"' in str(quarto_config)
 
     def test_does_not_double_inject(self, tmp_path):
         import json
 
-        from great_docs._versioned_build import _sync_status_inline_script
+        from great_docs._versions.build import _add_upcoming_status_data
 
-        self._make_quarto_yml(tmp_path)
+        quarto_config = self._quarto_config()
         status_path = tmp_path / "_page_status.json"
         status_path.write_text(
             json.dumps(
@@ -1078,39 +1297,38 @@ class TestSyncStatusInlineScript:
                 }
             )
         )
-        _sync_status_inline_script(tmp_path)
-        _sync_status_inline_script(tmp_path)  # second call
-        yml = (tmp_path / "_quarto.yml").read_text()
+        _add_upcoming_status_data(quarto_config, tmp_path)
+        _add_upcoming_status_data(quarto_config, tmp_path)
+        yml = format_yaml(quarto_config)
         assert yml.count("<script>window.__GD_UPCOMING_DATA__=") == 1
 
     def test_no_upcoming_pages_skips(self, tmp_path):
         import json
 
-        from great_docs._versioned_build import _sync_status_inline_script
+        from great_docs._versions.build import _add_upcoming_status_data
 
-        self._make_quarto_yml(tmp_path)
+        quarto_config = self._quarto_config()
         status_path = tmp_path / "_page_status.json"
         status_path.write_text(json.dumps({"page_statuses": {}, "definitions": {}}))
-        _sync_status_inline_script(tmp_path)
-        yml = (tmp_path / "_quarto.yml").read_text()
+        _add_upcoming_status_data(quarto_config, tmp_path)
+        yml = format_yaml(quarto_config)
         assert "__GD_UPCOMING_DATA__=" not in yml
 
     def test_missing_status_json_skips(self, tmp_path):
-        from great_docs._versioned_build import _sync_status_inline_script
+        from great_docs._versions.build import _add_upcoming_status_data
 
-        self._make_quarto_yml(tmp_path)
+        quarto_config = self._quarto_config()
         # No _page_status.json
-        _sync_status_inline_script(tmp_path)
-        yml = (tmp_path / "_quarto.yml").read_text()
+        _add_upcoming_status_data(quarto_config, tmp_path)
+        yml = format_yaml(quarto_config)
         assert "__GD_UPCOMING_DATA__=" not in yml
 
     def test_no_status_data_script_skips(self, tmp_path):
         import json
 
-        from great_docs._versioned_build import _sync_status_inline_script
+        from great_docs._versions.build import _add_upcoming_status_data
 
-        # _quarto.yml without __GD_STATUS_DATA__ script tag
-        (tmp_path / "_quarto.yml").write_text(
+        quarto_config = parse_yaml(
             "format:\n  html:\n    include-after-body:\n      - somefile.js\n"
         )
         (tmp_path / "_page_status.json").write_text(
@@ -1122,17 +1340,17 @@ class TestSyncStatusInlineScript:
                 }
             )
         )
-        _sync_status_inline_script(tmp_path)
-        yml = (tmp_path / "_quarto.yml").read_text()
+        _add_upcoming_status_data(quarto_config, tmp_path)
+        yml = format_yaml(quarto_config)
         assert "__GD_UPCOMING_DATA__=" not in yml
 
     def test_not_confused_by_js_reference(self, tmp_path):
         """The guard should not be tricked by __GD_UPCOMING_DATA__ in JS comments."""
         import json
 
-        from great_docs._versioned_build import _sync_status_inline_script
+        from great_docs._versions.build import _add_upcoming_status_data
 
-        self._make_quarto_yml(tmp_path, include_js_inline=True)
+        quarto_config = self._quarto_config(include_js_inline=True)
         status_path = tmp_path / "_page_status.json"
         status_path.write_text(
             json.dumps(
@@ -1143,8 +1361,8 @@ class TestSyncStatusInlineScript:
                 }
             )
         )
-        _sync_status_inline_script(tmp_path)
-        yml = (tmp_path / "_quarto.yml").read_text()
+        _add_upcoming_status_data(quarto_config, tmp_path)
+        yml = format_yaml(quarto_config)
         # Should still inject despite the JS reference existing
         assert "<script>window.__GD_UPCOMING_DATA__=" in yml
 
@@ -1241,7 +1459,7 @@ class TestGenerateRedirectFiles:
 
 
 # ---------------------------------------------------------------------------
-# Canonical URL injection (via _rewrite_quarto_yml_for_version)
+# Canonical URL configuration
 # ---------------------------------------------------------------------------
 
 
@@ -1251,36 +1469,25 @@ class TestCanonicalUrlInjection:
     """
 
     @staticmethod
-    def _rewritten(tmp_path: Path, entry, latest_tag: str) -> dict:
-        from yaml12 import read_yaml, write_yaml
-
-        from great_docs._versioned_build import _rewrite_quarto_yml_for_version
-
-        dest = tmp_path / entry.tag
-        dest.mkdir()
-        with open(dest / "_quarto.yml", "w") as f:
-            write_yaml(
-                {
-                    "project": {"type": "website"},
-                    "filters": ["interlinks", "page-url"],
-                    "gd-base-url": "https://example.com/pkg/",
-                    "website": {"title": "Test", "site-url": "https://example.com/pkg/"},
-                },
-                f,
-            )
-        _rewrite_quarto_yml_for_version(dest, entry, latest_tag)
-        with open(dest / "_quarto.yml") as f:
-            return read_yaml(f)
+    def _rewritten(entry, latest_tag: str) -> dict:
+        quarto_config = {
+            "project": {"type": "website"},
+            "filters": ["interlinks", "page-url"],
+            "gd-base-url": "https://example.com/pkg/",
+            "website": {"title": "Test", "site-url": "https://example.com/pkg/"},
+        }
+        _adjust_quarto_config_for_version(quarto_config, entry, latest_tag)
+        return quarto_config
 
     def test_older_version_keeps_the_latest_base_address(self, tmp_path: Path):
-        old = self._rewritten(tmp_path, _make_entry("0.1"), "0.2")
+        old = self._rewritten(_make_entry("0.1"), "0.2")
         assert old["filters"] == ["interlinks", "page-url"]
         assert old["gd-base-url"] == "https://example.com/pkg/"
         assert old["website"]["site-url"] == "https://example.com/pkg/v/0.1/"
         assert "include-in-header" not in old.get("format", {}).get("html", {})
 
     def test_latest_version_keeps_the_filter(self, tmp_path: Path):
-        latest = self._rewritten(tmp_path, _make_entry("0.2", latest=True), "0.2")
+        latest = self._rewritten(_make_entry("0.2", latest=True), "0.2")
         assert latest["filters"] == ["interlinks", "page-url"]
         assert latest["gd-base-url"] == "https://example.com/pkg/"
 
@@ -1293,66 +1500,36 @@ class TestCanonicalUrlInjection:
 class TestSiteUrlVersionAdjustment:
     def test_non_latest_adjusts_site_url(self, tmp_path: Path):
         """Non-latest versions get site-url with /v/<tag>/ appended."""
-        from great_docs._versioned_build import _rewrite_quarto_yml_for_version
-
-        dest = tmp_path / "v02"
-        dest.mkdir()
-        (dest / "_quarto.yml").write_text(
+        result = parse_yaml(
             "project:\n  type: website\n  output-dir: _site\n"
             "format:\n  html: {}\nwebsite:\n  title: Test\n"
             "  site-url: 'http://myserver:3838/data-team/mypkg/'\n",
-            encoding="utf-8",
         )
         entry = _make_entry("0.2")
-        _rewrite_quarto_yml_for_version(dest, entry, "0.3")
-
-        from yaml12 import read_yaml
-
-        with open(dest / "_quarto.yml") as f:
-            result = read_yaml(f)
+        _adjust_quarto_config_for_version(result, entry, "0.3")
 
         assert result["website"]["site-url"] == "http://myserver:3838/data-team/mypkg/v/0.2/"
 
     def test_latest_keeps_site_url_unchanged(self, tmp_path: Path):
         """Latest version keeps the original site-url as-is."""
-        from great_docs._versioned_build import _rewrite_quarto_yml_for_version
-
-        dest = tmp_path / "root"
-        dest.mkdir()
-        (dest / "_quarto.yml").write_text(
+        result = parse_yaml(
             "project:\n  type: website\n  output-dir: _site\n"
             "format:\n  html: {}\nwebsite:\n  title: Test\n"
             "  site-url: 'http://myserver:3838/data-team/mypkg/'\n",
-            encoding="utf-8",
         )
         entry = _make_entry("0.3", latest=True)
-        _rewrite_quarto_yml_for_version(dest, entry, "0.3")
-
-        from yaml12 import read_yaml
-
-        with open(dest / "_quarto.yml") as f:
-            result = read_yaml(f)
+        _adjust_quarto_config_for_version(result, entry, "0.3")
 
         assert result["website"]["site-url"] == "http://myserver:3838/data-team/mypkg/"
 
     def test_no_site_url_in_config_no_adjustment(self, tmp_path: Path):
         """When site-url is not in _quarto.yml, nothing is injected."""
-        from great_docs._versioned_build import _rewrite_quarto_yml_for_version
-
-        dest = tmp_path / "v02"
-        dest.mkdir()
-        (dest / "_quarto.yml").write_text(
+        result = parse_yaml(
             "project:\n  type: website\n  output-dir: _site\n"
             "format:\n  html: {}\nwebsite:\n  title: Test\n",
-            encoding="utf-8",
         )
         entry = _make_entry("0.2")
-        _rewrite_quarto_yml_for_version(dest, entry, "0.3")
-
-        from yaml12 import read_yaml
-
-        with open(dest / "_quarto.yml") as f:
-            result = read_yaml(f)
+        _adjust_quarto_config_for_version(result, entry, "0.3")
 
         assert "site-url" not in result.get("website", {})
 
@@ -1372,7 +1549,7 @@ class TestRebuildApiFromGitRefCustomCacheDir:
     def test_uses_config_cache_dir_over_project_root(self, tmp_path: Path) -> None:
         from unittest.mock import patch
 
-        from great_docs._versioned_build import _rebuild_api_from_git_ref
+        from great_docs._versions.build import _rebuild_api_from_git_ref
         from great_docs.config import Config
 
         entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref="v0.2.0")
@@ -1392,10 +1569,10 @@ class TestRebuildApiFromGitRefCustomCacheDir:
         dest.mkdir()
 
         with patch(
-            "great_docs._versioned_build._validate_git_ref_is_tag",
+            "great_docs._versions.build._validate_git_ref_is_tag",
             return_value=True,
         ):
-            pages = _rebuild_api_from_git_ref(dest, tmp_path, entry, config)
+            pages = _rebuild_api_from_git_ref(dest, tmp_path, entry, config, quarto_config={})
 
         assert "reference/my_func.html" in pages
         assert not (tmp_path / ".great-docs-cache").exists()
@@ -1403,8 +1580,8 @@ class TestRebuildApiFromGitRefCustomCacheDir:
 
 class TestPruneCliPagesForVersionCustomCacheDir:
     def test_uses_config_cache_dir_over_project_root(self, tmp_path: Path) -> None:
-        from great_docs._api_diff import ApiSnapshot, CliCommandInfo
-        from great_docs._versioned_build import _prune_cli_pages_for_version
+        from great_docs._api_evolution.model import ApiSnapshot, CliCommandInfo
+        from great_docs._versions.build import _prune_cli_pages_for_version
         from great_docs.config import Config
 
         entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref="v0.2.0")
@@ -1436,7 +1613,7 @@ class TestPruneCliPagesForVersionCustomCacheDir:
         (cli_dir / "build.qmd").write_text("Build command")
         (cli_dir / "old_command.qmd").write_text("Old command")
 
-        _prune_cli_pages_for_version(tmp_path, tmp_path, entry, config)
+        _prune_cli_pages_for_version(tmp_path, tmp_path, entry, config, quarto_config={})
 
         assert (cli_dir / "build.qmd").exists()
         assert (cli_dir / "index.qmd").exists()
@@ -1451,7 +1628,7 @@ class TestPruneCliPagesForVersionCustomCacheDir:
 
 class TestCollectQmdFiles:
     def test_finds_qmd_and_md(self, tmp_path: Path):
-        from great_docs._versioned_build import _collect_qmd_files
+        from great_docs._versions.build import _collect_qmd_files
 
         (tmp_path / "index.qmd").write_text("hello")
         (tmp_path / "guide.md").write_text("world")
@@ -1475,25 +1652,25 @@ class TestCollectQmdFiles:
 
 class TestExtractFrontmatterValue:
     def test_extracts_value(self):
-        from great_docs._versioned_build import _extract_frontmatter_value
+        from great_docs._versions.build import _extract_frontmatter_value
 
         content = '---\ntitle: "My Page"\nstatus: experimental\n---\n\nBody'
         assert _extract_frontmatter_value(content, "status") == "experimental"
 
     def test_returns_none_when_missing(self):
-        from great_docs._versioned_build import _extract_frontmatter_value
+        from great_docs._versions.build import _extract_frontmatter_value
 
         content = "---\ntitle: Hello\n---\n\nBody"
         assert _extract_frontmatter_value(content, "status") is None
 
     def test_returns_none_without_frontmatter(self):
-        from great_docs._versioned_build import _extract_frontmatter_value
+        from great_docs._versions.build import _extract_frontmatter_value
 
         content = "No frontmatter here"
         assert _extract_frontmatter_value(content, "status") is None
 
     def test_strips_quotes(self):
-        from great_docs._versioned_build import _extract_frontmatter_value
+        from great_docs._versions.build import _extract_frontmatter_value
 
         content = '---\nupcoming: "0.8"\n---\n\nBody'
         assert _extract_frontmatter_value(content, "upcoming") == "0.8"
@@ -1506,7 +1683,7 @@ class TestExtractFrontmatterValue:
 
 class TestInjectUpcomingStatus:
     def test_injects_when_no_status(self):
-        from great_docs._versioned_build import _inject_upcoming_status
+        from great_docs._versions.build import _inject_upcoming_status
 
         content = "---\ntitle: Hello\n---\n\nBody"
         result = _inject_upcoming_status(content)
@@ -1514,7 +1691,7 @@ class TestInjectUpcomingStatus:
         assert "title: Hello" in result
 
     def test_preserves_existing_status(self):
-        from great_docs._versioned_build import _inject_upcoming_status
+        from great_docs._versions.build import _inject_upcoming_status
 
         content = "---\ntitle: Hello\nstatus: experimental\n---\n\nBody"
         result = _inject_upcoming_status(content)
@@ -1522,7 +1699,7 @@ class TestInjectUpcomingStatus:
         assert "status: experimental" in result
 
     def test_no_frontmatter_returns_unchanged(self):
-        from great_docs._versioned_build import _inject_upcoming_status
+        from great_docs._versions.build import _inject_upcoming_status
 
         content = "No frontmatter at all"
         result = _inject_upcoming_status(content)
@@ -1536,7 +1713,7 @@ class TestInjectUpcomingStatus:
 
 class TestPruneCliPages:
     def test_removes_unknown_cli_pages(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_cli_pages
+        from great_docs._versions.build import _prune_cli_pages
 
         cli_dir = tmp_path / "reference" / "cli"
         cli_dir.mkdir(parents=True)
@@ -1551,22 +1728,22 @@ class TestPruneCliPages:
         class MockSnap:
             cli_commands = type("CLI", (), {"subcommands": [MockCmd()]})()
 
-        _prune_cli_pages(tmp_path, MockSnap())
+        _prune_cli_pages(tmp_path, MockSnap(), quarto_config={})
 
         assert (cli_dir / "index.qmd").exists()
         assert (cli_dir / "build.qmd").exists()
         assert not (cli_dir / "old_cmd.qmd").exists()
 
     def test_no_cli_dir_does_nothing(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_cli_pages
+        from great_docs._versions.build import _prune_cli_pages
 
         class MockSnap:
             cli_commands = None
 
-        _prune_cli_pages(tmp_path, MockSnap())  # Should not raise
+        _prune_cli_pages(tmp_path, MockSnap(), quarto_config={})  # Should not raise
 
     def test_no_cli_commands_does_nothing(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_cli_pages
+        from great_docs._versions.build import _prune_cli_pages
 
         cli_dir = tmp_path / "reference" / "cli"
         cli_dir.mkdir(parents=True)
@@ -1575,13 +1752,13 @@ class TestPruneCliPages:
         class MockSnap:
             cli_commands = None
 
-        _prune_cli_pages(tmp_path, MockSnap())
+        _prune_cli_pages(tmp_path, MockSnap(), quarto_config={})
         assert (cli_dir / "build.qmd").exists()
 
 
 class TestRewriteCliIndex:
     def test_removes_invalid_commands(self, tmp_path: Path):
-        from great_docs._versioned_build import _rewrite_cli_index
+        from great_docs._versions.build import _rewrite_cli_index
 
         index = tmp_path / "index.qmd"
         index.write_text(
@@ -1612,11 +1789,8 @@ class TestRewriteCliIndex:
 
 class TestPruneQuartoCliSidebar:
     def test_removes_invalid_sidebar_entries(self, tmp_path: Path):
-        from yaml12 import format_yaml, parse_yaml
+        from great_docs._versions.build import _prune_quarto_cli_sidebar
 
-        from great_docs._versioned_build import _prune_quarto_cli_sidebar
-
-        quarto = tmp_path / "_quarto.yml"
         config = {
             "website": {
                 "sidebar": [
@@ -1631,11 +1805,10 @@ class TestPruneQuartoCliSidebar:
                 ]
             }
         }
-        quarto.write_text(format_yaml(config), encoding="utf-8")
 
-        _prune_quarto_cli_sidebar(tmp_path, {"index", "build"})
+        _prune_quarto_cli_sidebar(config, {"index", "build"})
 
-        result = parse_yaml(quarto.read_text())
+        result = config
         contents = result["website"]["sidebar"][0]["contents"]
         stems = [Path(c).stem for c in contents]
         assert "build" in stems
@@ -1650,7 +1823,7 @@ class TestPruneQuartoCliSidebar:
 
 class TestPruneMissingSidebarPages:
     def test_removes_missing_pages_from_sidebar(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_sidebar_contents
+        from great_docs._versions.build import _prune_sidebar_contents
 
         # Only "index.qmd" and "guide.qmd" exist on disk
         (tmp_path / "index.qmd").write_text("---\ntitle: Home\n---\n")
@@ -1664,7 +1837,7 @@ class TestPruneMissingSidebarPages:
         assert "deleted.qmd" not in result
 
     def test_prunes_nested_sections(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_sidebar_contents
+        from great_docs._versions.build import _prune_sidebar_contents
 
         (tmp_path / "a.qmd").write_text("hi")
         contents = [
@@ -1676,7 +1849,7 @@ class TestPruneMissingSidebarPages:
         assert result[0]["contents"] == ["a.qmd"]
 
     def test_removes_empty_sections(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_sidebar_contents
+        from great_docs._versions.build import _prune_sidebar_contents
 
         contents = [
             {"section": "Empty", "contents": ["missing.qmd"]},
@@ -1685,7 +1858,7 @@ class TestPruneMissingSidebarPages:
         assert result == []
 
     def test_keeps_dict_with_href(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_sidebar_contents
+        from great_docs._versions.build import _prune_sidebar_contents
 
         (tmp_path / "page.qmd").write_text("hi")
         contents = [{"href": "page.qmd", "text": "Page"}]
@@ -1693,7 +1866,7 @@ class TestPruneMissingSidebarPages:
         assert len(result) == 1
 
     def test_removes_dict_with_missing_href(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_sidebar_contents
+        from great_docs._versions.build import _prune_sidebar_contents
 
         contents = [{"href": "gone.qmd", "text": "Gone"}]
         result = _prune_sidebar_contents(contents, tmp_path)
@@ -1707,7 +1880,7 @@ class TestPruneMissingSidebarPages:
 
 class TestFormatSignature:
     def test_class_with_params(self):
-        from great_docs._versioned_build import _format_signature
+        from great_docs._versions.build import _format_signature
 
         sym = type(
             "Sym",
@@ -1726,7 +1899,7 @@ class TestFormatSignature:
         assert result == "class MyClass(x: int, y: str = 'hi')"
 
     def test_class_without_params(self):
-        from great_docs._versioned_build import _format_signature
+        from great_docs._versions.build import _format_signature
 
         sym = type(
             "Sym",
@@ -1737,7 +1910,7 @@ class TestFormatSignature:
         assert result == "class Empty"
 
     def test_function(self):
-        from great_docs._versioned_build import _format_signature
+        from great_docs._versions.build import _format_signature
 
         sym = type(
             "Sym",
@@ -1755,7 +1928,7 @@ class TestFormatSignature:
         assert result == "def myfunc(a) -> str"
 
     def test_async_function(self):
-        from great_docs._versioned_build import _format_signature
+        from great_docs._versions.build import _format_signature
 
         sym = type(
             "Sym",
@@ -1766,7 +1939,7 @@ class TestFormatSignature:
         assert result == "async def afunc()"
 
     def test_other_kind(self):
-        from great_docs._versioned_build import _format_signature
+        from great_docs._versions.build import _format_signature
 
         sym = type(
             "Sym",
@@ -1784,24 +1957,24 @@ class TestFormatSignature:
 
 class TestIsValidRefNameLegacy:
     def test_index_always_valid(self):
-        from great_docs._versioned_build import _is_valid_ref_name
+        from great_docs._versions.build import _is_valid_ref_name
 
         assert _is_valid_ref_name("index", set()) is True
 
     def test_symbol_in_set(self):
-        from great_docs._versioned_build import _is_valid_ref_name
+        from great_docs._versions.build import _is_valid_ref_name
 
         assert _is_valid_ref_name("MyClass", {"MyClass", "func"}) is True
 
     def test_method_stem_valid_when_in_snapshot(self):
-        from great_docs._versioned_build import _is_valid_ref_name
+        from great_docs._versions.build import _is_valid_ref_name
 
         assert _is_valid_ref_name("MyClass.method", {"MyClass", "MyClass.method"}) is True
 
     def test_method_stem_invalid_when_absent_from_deep_snapshot(self):
         # A deep snapshot carries dotted keys, so a method stem that is not
         # itself present is authoritatively invalid (the method was dropped).
-        from great_docs._versioned_build import _is_valid_ref_name
+        from great_docs._versions.build import _is_valid_ref_name
 
         assert _is_valid_ref_name("MyClass.gone", {"MyClass", "MyClass.kept"}) is False
 
@@ -1809,17 +1982,17 @@ class TestIsValidRefNameLegacy:
         # A shallow snapshot has no dotted keys; pruning a `Class.method` page
         # under exact membership would reintroduce the #190 regression, so the
         # class-prefix safety net keeps it.
-        from great_docs._versioned_build import _is_valid_ref_name
+        from great_docs._versions.build import _is_valid_ref_name
 
         assert _is_valid_ref_name("MyClass.method", {"MyClass", "func"}) is True
 
     def test_method_stem_dropped_when_class_absent_under_shallow_snapshot(self):
-        from great_docs._versioned_build import _is_valid_ref_name
+        from great_docs._versions.build import _is_valid_ref_name
 
         assert _is_valid_ref_name("Gone.method", {"MyClass"}) is False
 
     def test_unknown_symbol(self):
-        from great_docs._versioned_build import _is_valid_ref_name
+        from great_docs._versions.build import _is_valid_ref_name
 
         assert _is_valid_ref_name("Unknown", {"Known"}) is False
 
@@ -1831,7 +2004,7 @@ class TestIsValidRefNameLegacy:
 
 class TestPruneReferenceIndex:
     def test_removes_invalid_links(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_reference_index
+        from great_docs._versions.build import _prune_reference_index
 
         index = tmp_path / "index.qmd"
         index.write_text(
@@ -1853,7 +2026,7 @@ class TestPruneReferenceIndex:
         assert "OldFunc" not in content
 
     def test_removes_empty_sections(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_reference_index
+        from great_docs._versions.build import _prune_reference_index
 
         index = tmp_path / "index.qmd"
         index.write_text(
@@ -1881,11 +2054,8 @@ class TestPruneReferenceIndex:
 
 class TestPruneQuartoSidebar:
     def test_removes_invalid_reference_entries(self, tmp_path: Path):
-        from yaml12 import format_yaml, parse_yaml
+        from great_docs._versions.build import _prune_quarto_sidebar
 
-        from great_docs._versioned_build import _prune_quarto_sidebar
-
-        quarto = tmp_path / "_quarto.yml"
         config = {
             "website": {
                 "sidebar": [
@@ -1900,11 +2070,10 @@ class TestPruneQuartoSidebar:
                 ]
             }
         }
-        quarto.write_text(format_yaml(config), encoding="utf-8")
 
-        _prune_quarto_sidebar(tmp_path, "reference", {"MyFunc", "MyClass"})
+        _prune_quarto_sidebar(config, "reference", {"MyFunc", "MyClass"})
 
-        result = parse_yaml(quarto.read_text())
+        result = config
         contents = result["website"]["sidebar"][0]["contents"]
         stems = [Path(c).stem for c in contents]
         assert "MyFunc" in stems
@@ -1912,11 +2081,8 @@ class TestPruneQuartoSidebar:
         assert "OldFunc" not in stems
 
     def test_removes_empty_section_groups(self, tmp_path: Path):
-        from yaml12 import format_yaml, parse_yaml
+        from great_docs._versions.build import _prune_quarto_sidebar
 
-        from great_docs._versioned_build import _prune_quarto_sidebar
-
-        quarto = tmp_path / "_quarto.yml"
         config = {
             "website": {
                 "sidebar": [
@@ -1933,47 +2099,14 @@ class TestPruneQuartoSidebar:
                 ]
             }
         }
-        quarto.write_text(format_yaml(config), encoding="utf-8")
 
-        _prune_quarto_sidebar(tmp_path, "reference", {"Kept"})
+        _prune_quarto_sidebar(config, "reference", {"Kept"})
 
-        result = parse_yaml(quarto.read_text())
+        result = config
         contents = result["website"]["sidebar"][0]["contents"]
         # The section group with "OldFunc" should be removed
         assert len(contents) == 1
         assert contents[0] == "reference/Kept.qmd"
-
-
-@pytest.mark.parametrize(
-    "prune",
-    [
-        lambda dest: _prune_quarto_cli_sidebar(dest, {"index"}),
-        _prune_missing_sidebar_pages,
-        lambda dest: _prune_quarto_sidebar(dest, "reference", {"Kept"}),
-    ],
-    ids=["cli", "missing-pages", "reference"],
-)
-def test_sidebar_pruning_keeps_generated_header(tmp_path: Path, prune):
-    # Each pruner drops a different stale entry from this one sidebar
-    (tmp_path / "reference").mkdir()
-    (tmp_path / "reference" / "Kept.qmd").write_text("", encoding="utf-8")
-    quarto_yml = tmp_path / "_quarto.yml"
-    seeded = (
-        QUARTO_YML_HEADER
-        + "website:\n"
-        + "  sidebar:\n"
-        + "    - id: cli-reference\n"
-        + "      contents:\n"
-        + "        - reference/cli/old.qmd\n"
-        + "        - reference/Old.qmd\n"
-        + "        - reference/Kept.qmd\n"
-    )
-    quarto_yml.write_text(seeded, encoding="utf-8")
-
-    prune(tmp_path)
-
-    assert quarto_yml.read_text(encoding="utf-8") != seeded
-    assert is_great_docs_build_dir(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -2019,23 +2152,23 @@ class TestValidateGitRefIsTag:
 
 class TestRebuildApiFromGitRef:
     def test_no_git_ref_returns_empty(self, tmp_path: Path):
-        from great_docs._versioned_build import _rebuild_api_from_git_ref
+        from great_docs._versions.build import _rebuild_api_from_git_ref
 
         entry = _make_entry("0.2")
         entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref=None)
-        result = _rebuild_api_from_git_ref(tmp_path, tmp_path, entry)
+        result = _rebuild_api_from_git_ref(tmp_path, tmp_path, entry, quarto_config={})
         assert result == []
 
     def test_invalid_tag_warns_and_returns_empty(self, tmp_path: Path):
         from unittest.mock import patch
 
-        from great_docs._versioned_build import _rebuild_api_from_git_ref
+        from great_docs._versions.build import _rebuild_api_from_git_ref
 
         entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref="v0.2.0")
 
-        with patch("great_docs._versioned_build._validate_git_ref_is_tag", return_value=False):
+        with patch("great_docs._versions.build._validate_git_ref_is_tag", return_value=False):
             with pytest.warns(UserWarning, match="not a valid tag"):
-                result = _rebuild_api_from_git_ref(tmp_path, tmp_path, entry)
+                result = _rebuild_api_from_git_ref(tmp_path, tmp_path, entry, quarto_config={})
         assert result == []
 
 
@@ -2116,61 +2249,22 @@ class TestMergeTree:
 
 
 # ---------------------------------------------------------------------------
-# _render_single_version (mocked subprocess)
-# ---------------------------------------------------------------------------
-
-
-class TestRenderSingleVersion:
-    def test_success(self, tmp_path: Path):
-        from unittest.mock import patch
-
-        from great_docs._versioned_build import _render_single_version
-
-        mock_result = type("R", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
-        with patch("subprocess.run", return_value=mock_result):
-            build_dir, rc, stdout, stderr = _render_single_version(str(tmp_path), None)
-        assert rc == 0
-        assert build_dir == str(tmp_path)
-
-    def test_timeout(self, tmp_path: Path):
-        import subprocess
-        from unittest.mock import patch
-
-        from great_docs._versioned_build import _render_single_version
-
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("quarto", 600)):
-            build_dir, rc, stdout, stderr = _render_single_version(str(tmp_path), None)
-        assert rc == -1
-        assert "timed out" in stderr
-
-    def test_exception(self, tmp_path: Path):
-        from unittest.mock import patch
-
-        from great_docs._versioned_build import _render_single_version
-
-        with patch("subprocess.run", side_effect=OSError("No quarto")):
-            build_dir, rc, stdout, stderr = _render_single_version(str(tmp_path), None)
-        assert rc == -1
-        assert "No quarto" in stderr
-
-
-# ---------------------------------------------------------------------------
-# render_versions_parallel (streaming mode)
+# Version renders with a progress callback
 # ---------------------------------------------------------------------------
 
 
 class TestRenderVersionsParallel:
-    def test_streaming_mode_with_callback(self, tmp_path: Path):
+    def test_with_callback(self, tmp_path: Path):
         from unittest.mock import MagicMock, patch
 
-        from great_docs._versioned_build import render_versions_parallel
+        from great_docs._versions.build import render_versions_parallel
 
         d1 = tmp_path / "v1"
         d1.mkdir()
 
         mock_result = (str(d1), 0, "", "")
         with patch(
-            "great_docs._versioned_build._render_single_version_streaming",
+            "great_docs._versions.build._render_version",
             return_value=mock_result,
         ):
             callback = MagicMock()
@@ -2187,7 +2281,7 @@ class TestRenderVersionsParallel:
 
 class TestUpdatePageStatusJsonEdge:
     def test_json_decode_error_does_nothing(self, tmp_path: Path):
-        from great_docs._versioned_build import _update_page_status_json
+        from great_docs._versions.build import _update_page_status_json
 
         status_path = tmp_path / "_page_status.json"
         status_path.write_text("not valid json {{{", encoding="utf-8")
@@ -2197,7 +2291,7 @@ class TestUpdatePageStatusJsonEdge:
         assert "not valid json" in status_path.read_text()
 
     def test_os_error_does_nothing(self, tmp_path: Path):
-        from great_docs._versioned_build import _update_page_status_json
+        from great_docs._versions.build import _update_page_status_json
 
         # _page_status.json doesn't exist
         _update_page_status_json(tmp_path, [("page.html", "0.4")])
@@ -2205,19 +2299,18 @@ class TestUpdatePageStatusJsonEdge:
 
 
 # ---------------------------------------------------------------------------
-# _sync_status_inline_script — detailed injection test
+# _add_upcoming_status_data — detailed injection test
 # ---------------------------------------------------------------------------
 
 
 class TestSyncStatusInlineScriptIndentation:
     def test_matches_indentation_of_status_data_line(self, tmp_path: Path):
-        from great_docs._versioned_build import _sync_status_inline_script
+        from great_docs._versions.build import _add_upcoming_status_data
 
         status_data = {"upcoming_pages": {"guide.qmd": "0.4"}}
         (tmp_path / "_page_status.json").write_text(json.dumps(status_data), encoding="utf-8")
 
-        # _quarto.yml with indented status data line
-        yml_content = (
+        quarto_config = parse_yaml(
             "project:\n"
             "  type: website\n"
             "format:\n"
@@ -2226,25 +2319,24 @@ class TestSyncStatusInlineScriptIndentation:
             "      - text: '<script>window.__GD_STATUS_DATA__={};'\n"
             "      - text: 'other'\n"
         )
-        (tmp_path / "_quarto.yml").write_text(yml_content, encoding="utf-8")
 
-        _sync_status_inline_script(tmp_path)
+        _add_upcoming_status_data(quarto_config, tmp_path)
 
-        result = (tmp_path / "_quarto.yml").read_text()
+        result = format_yaml(quarto_config)
         assert "__GD_UPCOMING_DATA__" in result
         # Verify indentation matches — the injected line should start with same indent
         lines = result.split("\n")
-        upcoming_line = [l for l in lines if "__GD_UPCOMING_DATA__" in l]
+        upcoming_line = [line for line in lines if "__GD_UPCOMING_DATA__" in line]
         assert len(upcoming_line) == 1
         assert upcoming_line[0].startswith("      ")
 
     def test_json_decode_error_skips(self, tmp_path: Path):
-        from great_docs._versioned_build import _sync_status_inline_script
+        from great_docs._versions.build import _add_upcoming_status_data
 
         (tmp_path / "_page_status.json").write_text("bad json!", encoding="utf-8")
-        (tmp_path / "_quarto.yml").write_text("project:\n  type: website\n")
-        # Should not raise
-        _sync_status_inline_script(tmp_path)
+        quarto_config = {"project": {"type": "website"}}
+        _add_upcoming_status_data(quarto_config, tmp_path)
+        assert quarto_config == {"project": {"type": "website"}}
 
 
 # ---------------------------------------------------------------------------
@@ -2254,10 +2346,9 @@ class TestSyncStatusInlineScriptIndentation:
 
 class TestPruneMissingSidebarPagesFull:
     def test_prunes_via_yaml12(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_missing_sidebar_pages
+        from great_docs._versions.build import _prune_missing_sidebar_pages
 
-        # Create a _quarto.yml with sidebar referencing pages
-        yml_content = {
+        quarto_config = {
             "project": {"type": "website"},
             "website": {
                 "sidebar": [
@@ -2271,38 +2362,24 @@ class TestPruneMissingSidebarPagesFull:
                 ]
             },
         }
-        from yaml12 import write_yaml
-
-        with open(tmp_path / "_quarto.yml", "w", encoding="utf-8") as f:
-            write_yaml(yml_content, f)
-
         # Only guide.qmd exists, removed.qmd and ref.qmd don't
         (tmp_path / "guide.qmd").write_text("---\ntitle: Guide\n---\n")
 
-        _prune_missing_sidebar_pages(tmp_path)
+        _prune_missing_sidebar_pages(quarto_config, tmp_path)
 
-        from yaml12 import read_yaml
-
-        with open(tmp_path / "_quarto.yml", "r", encoding="utf-8") as f:
-            result = read_yaml(f)
-
-        contents = result["website"]["sidebar"][0]["contents"]
+        contents = quarto_config["website"]["sidebar"][0]["contents"]
         assert "guide.qmd" in contents
         assert "removed.qmd" not in contents
         # The "API" section with ref.qmd should be removed entirely
         section_items = [c for c in contents if isinstance(c, dict) and "section" in c]
         assert len(section_items) == 0
 
-    def test_no_quarto_yml_does_nothing(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_missing_sidebar_pages
+    def test_empty_configuration_does_nothing(self, tmp_path: Path):
+        from great_docs._versions.build import _prune_missing_sidebar_pages
 
-        _prune_missing_sidebar_pages(tmp_path)  # Should not raise
-
-    def test_empty_yaml_does_nothing(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_missing_sidebar_pages
-
-        (tmp_path / "_quarto.yml").write_text("", encoding="utf-8")
-        _prune_missing_sidebar_pages(tmp_path)  # Should not raise
+        quarto_config = {}
+        _prune_missing_sidebar_pages(quarto_config, tmp_path)
+        assert quarto_config == {}
 
 
 # ---------------------------------------------------------------------------
@@ -2312,21 +2389,21 @@ class TestPruneMissingSidebarPagesFull:
 
 class TestPruneCliPagesForVersion:
     def test_no_git_ref_does_nothing(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_cli_pages_for_version
+        from great_docs._versions.build import _prune_cli_pages_for_version
 
         entry = VersionEntry(tag="0.3", label="0.3", latest=True, git_ref=None)
-        _prune_cli_pages_for_version(tmp_path, tmp_path, entry)
+        _prune_cli_pages_for_version(tmp_path, tmp_path, entry, quarto_config={})
 
     def test_no_cache_file_does_nothing(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_cli_pages_for_version
+        from great_docs._versions.build import _prune_cli_pages_for_version
 
         entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref="v0.2.0")
-        _prune_cli_pages_for_version(tmp_path, tmp_path, entry)
+        _prune_cli_pages_for_version(tmp_path, tmp_path, entry, quarto_config={})
 
     def test_loads_snapshot_and_prunes(self, tmp_path: Path):
         from unittest.mock import MagicMock, patch
 
-        from great_docs._versioned_build import _prune_cli_pages_for_version
+        from great_docs._versions.build import _prune_cli_pages_for_version
 
         entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref="v0.2.0")
 
@@ -2350,8 +2427,37 @@ class TestPruneCliPagesForVersion:
         (cli_dir / "build.qmd").write_text("build cmd")
 
         # The snapshot doesn't have cli_commands, so no pruning occurs (early return)
-        _prune_cli_pages_for_version(tmp_path, tmp_path, entry)
+        _prune_cli_pages_for_version(tmp_path, tmp_path, entry, quarto_config={})
         assert (cli_dir / "build.qmd").exists()
+
+    @pytest.mark.parametrize(
+        "cache", ["not json", '{"symbols": {}}'], ids=["invalid-json", "missing-keys"]
+    )
+    def test_unusable_cache_skips_pruning(self, tmp_path: Path, cache: str):
+        from great_docs._versions.build import _prune_cli_pages_for_version
+
+        entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref="v0.2.0")
+        cache_file = tmp_path / ".great-docs-cache" / "snapshots" / "v0.2.0.json"
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text(cache)
+        cli_dir = tmp_path / "reference" / "cli"
+        cli_dir.mkdir(parents=True)
+        (cli_dir / "old_command.qmd").write_text("Old command")
+
+        _prune_cli_pages_for_version(tmp_path, tmp_path, entry, quarto_config={})
+
+        assert (cli_dir / "old_command.qmd").exists()
+
+    def test_cache_that_is_not_a_mapping_stops_the_build(self, tmp_path: Path):
+        from great_docs._versions.build import _prune_cli_pages_for_version
+
+        entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref="v0.2.0")
+        cache_file = tmp_path / ".great-docs-cache" / "snapshots" / "v0.2.0.json"
+        cache_file.parent.mkdir(parents=True)
+        cache_file.write_text("[]")
+
+        with pytest.raises(TypeError):
+            _prune_cli_pages_for_version(tmp_path, tmp_path, entry, quarto_config={})
 
 
 # ---------------------------------------------------------------------------
@@ -2383,7 +2489,9 @@ class TestPreprocessVersionUpcoming:
         versions = self._setup_versions()
         # Build for 0.4 (the prerelease)
         dest = tmp_path / "build"
-        pages = preprocess_version(source, dest, versions[0], versions)
+        pages = preprocess_version(
+            source, dest, versions[0], versions, layout=Layout.make(tmp_path), quarto_config={}
+        )
 
         assert "new-feature.html" in pages
 
@@ -2402,7 +2510,9 @@ class TestPreprocessVersionUpcoming:
 
         # Build for 0.3: future.qmd should be included but flagged as upcoming
         dest = tmp_path / "build"
-        pages = preprocess_version(source, dest, versions[1], versions)
+        pages = preprocess_version(
+            source, dest, versions[1], versions, layout=Layout.make(tmp_path), quarto_config={}
+        )
 
         assert "future.html" in pages
 
@@ -2420,7 +2530,9 @@ class TestPreprocessVersionUpcoming:
 
         versions = self._setup_versions()
         dest = tmp_path / "build"
-        preprocess_version(source, dest, versions[1], versions)
+        preprocess_version(
+            source, dest, versions[1], versions, layout=Layout.make(tmp_path), quarto_config={}
+        )
         content = (dest / "page.qmd").read_text()
 
         # With expiry="1 releases", badge for 0.2 should be expired when building 0.3
@@ -2443,7 +2555,13 @@ class TestPreprocessVersionUpcoming:
         section_configs = [{"dir": "recipes", "versions": ["0.3", "0.4"]}]
         dest = tmp_path / "build"
         pages = preprocess_version(
-            source, dest, versions[2], versions, section_configs=section_configs
+            source,
+            dest,
+            versions[2],
+            versions,
+            section_configs=section_configs,
+            layout=Layout.make(tmp_path),
+            quarto_config={},
         )
         assert "recipes/foo.html" not in pages
         assert not (dest / "recipes" / "foo.qmd").exists()
@@ -2478,7 +2596,7 @@ class TestRebuildApiFromSnapshotEdge:
         # No reference/ dir exists yet
 
         entry = _make_entry("0.2")
-        pages = _rebuild_api_from_snapshot(dest_dir, snap_path, entry)
+        pages = _rebuild_api_from_snapshot(dest_dir, snap_path, entry, quarto_config={})
 
         assert "reference/MyFunc.html" in pages
         assert (dest_dir / "reference" / "MyFunc.qmd").exists()
@@ -2495,7 +2613,7 @@ class TestRebuildApiFromSnapshotEdge:
         dest_dir = tmp_path / "build"
         dest_dir.mkdir()
 
-        _rebuild_api_from_snapshot(dest_dir, snap_path, _make_entry("0.2"))
+        _rebuild_api_from_snapshot(dest_dir, snap_path, _make_entry("0.2"), quarto_config={})
 
         ref_dir = dest_dir / "reference"
         page = (ref_dir / "MyFunc.qmd").read_text()
@@ -2520,7 +2638,7 @@ class TestRebuildApiFromSnapshotEdge:
         (ref_dir / "GT.qmd").write_text("---\ntitle: GT\n---\n# GT {.doc-heading}\nRich content\n")
 
         entry = _make_entry("0.2")
-        pages = _rebuild_api_from_snapshot(dest_dir, snap_path, entry)
+        pages = _rebuild_api_from_snapshot(dest_dir, snap_path, entry, quarto_config={})
         assert "reference/GT.html" in pages
         # Content should be preserved
         assert "Rich content" in (ref_dir / "GT.qmd").read_text()
@@ -2542,7 +2660,7 @@ class TestRebuildApiFromSnapshotEdge:
         dest_dir.mkdir()
 
         entry = _make_entry("0.2")
-        _rebuild_api_from_snapshot(dest_dir, snap_path, entry)
+        _rebuild_api_from_snapshot(dest_dir, snap_path, entry, quarto_config={})
 
         index_content = (dest_dir / "reference" / "index.qmd").read_text()
         assert "## Classes" in index_content
@@ -2568,11 +2686,30 @@ class TestRebuildApiFromSnapshotEdge:
         (ref_dir / "index.qmd").write_text("---\ntitle: API\n---\n")
 
         entry = _make_entry("0.2")
-        _rebuild_api_from_snapshot(dest_dir, snap_path, entry)
+        _rebuild_api_from_snapshot(dest_dir, snap_path, entry, quarto_config={})
 
         assert (ref_dir / "kept.qmd").exists()
         assert not (ref_dir / "removed.qmd").exists()
         assert (ref_dir / "index.qmd").exists()
+
+    def test_prune_keeps_subdirectories_and_other_files(self, tmp_path: Path):
+        snap_path = tmp_path / "snap.json"
+        ApiSnapshot(
+            version="0.2",
+            package_name="pkg",
+            symbols={"kept": SymbolInfo(name="kept", kind="function")},
+        ).save(snap_path)
+        ref_dir = tmp_path / "build" / "reference"
+        (ref_dir / "cli").mkdir(parents=True)
+        (ref_dir / "cli" / "index.qmd").write_text("---\ntitle: CLI\n---\n")
+        (ref_dir / "objects.json").write_text("{}")
+
+        _rebuild_api_from_snapshot(
+            tmp_path / "build", snap_path, _make_entry("0.2"), quarto_config={}
+        )
+
+        assert (ref_dir / "cli" / "index.qmd").exists()
+        assert (ref_dir / "objects.json").exists()
 
     def test_shallow_snapshot_keeps_method_pages(self, tmp_path: Path):
         # Regression guard for #190: when the documented set can't be resolved,
@@ -2597,7 +2734,7 @@ class TestRebuildApiFromSnapshotEdge:
         (ref_dir / "index.qmd").write_text("---\ntitle: API\n---\n")
 
         entry = _make_entry("0.2")
-        _rebuild_api_from_snapshot(dest_dir, snap_path, entry)
+        _rebuild_api_from_snapshot(dest_dir, snap_path, entry, quarto_config={})
 
         # Methods of a documented class survive under the shallow fallback.
         assert (ref_dir / "Big.qmd").exists()
@@ -2610,7 +2747,7 @@ class TestRebuildApiFromSnapshotEdge:
     def test_deep_snapshot_prunes_dropped_method_pages(self, tmp_path: Path):
         # With a deep snapshot (dotted keys present), exact membership governs:
         # a method page absent from the snapshot is correctly pruned.
-        from great_docs._versioned_build import _rebuild_api_from_snapshot
+        from great_docs._versions.build import _rebuild_api_from_snapshot
 
         snap_path = tmp_path / "snap.json"
         snap = ApiSnapshot(
@@ -2632,7 +2769,7 @@ class TestRebuildApiFromSnapshotEdge:
         (ref_dir / "index.qmd").write_text("---\ntitle: API\n---\n")
 
         entry = _make_entry("0.2")
-        _rebuild_api_from_snapshot(dest_dir, snap_path, entry)
+        _rebuild_api_from_snapshot(dest_dir, snap_path, entry, quarto_config={})
 
         assert (ref_dir / "Big.qmd").exists()
         assert (ref_dir / "Big.m0.qmd").exists()
@@ -2640,7 +2777,7 @@ class TestRebuildApiFromSnapshotEdge:
         assert not (ref_dir / "Big.m1.qmd").exists()
 
     def test_rich_index_pruned_not_regenerated(self, tmp_path: Path):
-        from great_docs._versioned_build import _rebuild_api_from_snapshot
+        from great_docs._versions.build import _rebuild_api_from_snapshot
 
         snap_path = tmp_path / "snap.json"
         snap = ApiSnapshot(
@@ -2663,7 +2800,7 @@ class TestRebuildApiFromSnapshotEdge:
         )
 
         entry = _make_entry("0.2")
-        _rebuild_api_from_snapshot(dest_dir, snap_path, entry)
+        _rebuild_api_from_snapshot(dest_dir, snap_path, entry, quarto_config={})
 
         index_content = (ref_dir / "index.qmd").read_text()
         assert "kept" in index_content
@@ -2701,7 +2838,7 @@ class TestRebuildApiFromSnapshotInventory:
 
         config = Config(tmp_path)
         entry = _make_entry("0.2")
-        _rebuild_api_from_snapshot(dest_dir, snap_path, entry, config)
+        _rebuild_api_from_snapshot(dest_dir, snap_path, entry, config, quarto_config={})
 
         inv = decode((dest_dir / "objects.inv").read_bytes())
         by_name = {e.name: e for e in inv.entries}
@@ -2726,7 +2863,7 @@ class TestRebuildApiFromSnapshotInventory:
         (dest_dir / "objects.inv").write_bytes(b"stale bytes from the live build")
 
         entry = _make_entry("0.2")
-        _rebuild_api_from_snapshot(dest_dir, snap_path, entry)
+        _rebuild_api_from_snapshot(dest_dir, snap_path, entry, quarto_config={})
 
         assert (dest_dir / "objects.inv").read_bytes() == b"stale bytes from the live build"
         assert not (dest_dir / "_inv").exists()
@@ -2870,7 +3007,9 @@ class TestRebuildApiFromSnapshotInventory:
         )
         (dest_dir / INVENTORY_FILENAME).write_bytes(encode(live))
 
-        _rebuild_api_from_snapshot(dest_dir, snap_path, _make_entry("0.2"), Config(tmp_path))
+        _rebuild_api_from_snapshot(
+            dest_dir, snap_path, _make_entry("0.2"), Config(tmp_path), quarto_config={}
+        )
 
         inv = decode((dest_dir / INVENTORY_FILENAME).read_bytes())
         by_name = {e.name: e for e in inv.entries}
@@ -2941,7 +3080,9 @@ class TestRebuildApiFromSnapshotInventory:
         )
         (dest_dir / INVENTORY_FILENAME).write_bytes(encode(live))
 
-        _rebuild_api_from_snapshot(dest_dir, snap_path, _make_entry("0.2"), Config(tmp_path))
+        _rebuild_api_from_snapshot(
+            dest_dir, snap_path, _make_entry("0.2"), Config(tmp_path), quarto_config={}
+        )
 
         inv = decode((dest_dir / INVENTORY_FILENAME).read_bytes())
         by_name = {e.name: e for e in inv.entries}
@@ -3051,7 +3192,7 @@ class TestRebuildApiFromSnapshotInventory:
 
 class TestPruneReferenceIndexDefinitionList:
     def test_removes_definition_list_descriptions(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_reference_index
+        from great_docs._versions.build import _prune_reference_index
 
         index = tmp_path / "index.qmd"
         index.write_text(
@@ -3073,7 +3214,7 @@ class TestPruneReferenceIndexDefinitionList:
         assert "removed function description" not in content
 
     def test_removes_bare_ref_links(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_reference_index
+        from great_docs._versions.build import _prune_reference_index
 
         index = tmp_path / "index.qmd"
         index.write_text("---\ntitle: API\n---\n\n- OldFunc.qmd\n- KeptFunc.qmd\n")
@@ -3093,11 +3234,8 @@ class TestPruneReferenceIndexDefinitionList:
 class TestPruneQuartoSidebarSubPath:
     def test_keeps_sub_paths(self, tmp_path: Path):
         """Sub-paths like reference/cli/build.qmd are kept (not pruned)."""
-        from yaml12 import format_yaml, parse_yaml
+        from great_docs._versions.build import _prune_quarto_sidebar
 
-        from great_docs._versioned_build import _prune_quarto_sidebar
-
-        quarto = tmp_path / "_quarto.yml"
         config = {
             "website": {
                 "sidebar": [
@@ -3112,41 +3250,30 @@ class TestPruneQuartoSidebarSubPath:
                 ]
             }
         }
-        quarto.write_text(format_yaml(config), encoding="utf-8")
 
-        _prune_quarto_sidebar(tmp_path, "reference", {"MyFunc"})
+        _prune_quarto_sidebar(config, "reference", {"MyFunc"})
 
-        result = parse_yaml(quarto.read_text())
+        result = config
         contents = result["website"]["sidebar"][0]["contents"]
         assert "reference/MyFunc.qmd" in contents
         assert "reference/cli/build.qmd" in contents  # sub-path kept
         assert "reference/Removed.qmd" not in contents
 
     def test_no_matching_sidebar_does_nothing(self, tmp_path: Path):
-        from yaml12 import format_yaml, parse_yaml
+        from great_docs._versions.build import _prune_quarto_sidebar
 
-        from great_docs._versioned_build import _prune_quarto_sidebar
-
-        quarto = tmp_path / "_quarto.yml"
         config = {"website": {"sidebar": [{"id": "other", "contents": ["guide.qmd"]}]}}
-        quarto.write_text(format_yaml(config), encoding="utf-8")
 
-        _prune_quarto_sidebar(tmp_path, "reference", {"func"})
+        _prune_quarto_sidebar(config, "reference", {"func"})
 
-        # File should be unchanged since no sidebar matches
-        result = parse_yaml(quarto.read_text())
-        assert result["website"]["sidebar"][0]["contents"] == ["guide.qmd"]
+        assert config["website"]["sidebar"][0]["contents"] == ["guide.qmd"]
 
-    def test_no_quarto_yml_does_nothing(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_quarto_sidebar
+    def test_empty_configuration_does_nothing(self):
+        from great_docs._versions.build import _prune_quarto_sidebar
 
-        _prune_quarto_sidebar(tmp_path, "reference", {"func"})
-
-    def test_empty_yaml_does_nothing(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_quarto_sidebar
-
-        (tmp_path / "_quarto.yml").write_text("", encoding="utf-8")
-        _prune_quarto_sidebar(tmp_path, "reference", {"func"})
+        config = {}
+        _prune_quarto_sidebar(config, "reference", {"func"})
+        assert config == {}
 
 
 # ---------------------------------------------------------------------------
@@ -3158,7 +3285,7 @@ class TestRebuildApiFromGitRefCache:
     def test_cache_hit_uses_cached_snapshot(self, tmp_path: Path):
         from unittest.mock import patch
 
-        from great_docs._versioned_build import _rebuild_api_from_git_ref
+        from great_docs._versions.build import _rebuild_api_from_git_ref
 
         entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref="v0.2.0")
 
@@ -3177,15 +3304,15 @@ class TestRebuildApiFromGitRefCache:
         dest = tmp_path / "build"
         dest.mkdir()
 
-        with patch("great_docs._versioned_build._validate_git_ref_is_tag", return_value=True):
-            pages = _rebuild_api_from_git_ref(dest, tmp_path, entry)
+        with patch("great_docs._versions.build._validate_git_ref_is_tag", return_value=True):
+            pages = _rebuild_api_from_git_ref(dest, tmp_path, entry, quarto_config={})
 
         assert "reference/my_func.html" in pages
 
     def test_cache_miss_calls_snapshot_at_tag(self, tmp_path: Path):
         from unittest.mock import MagicMock, patch
 
-        from great_docs._versioned_build import _rebuild_api_from_git_ref
+        from great_docs._versions.build import _rebuild_api_from_git_ref
 
         entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref="v0.2.0")
 
@@ -3200,15 +3327,20 @@ class TestRebuildApiFromGitRefCache:
 
         with (
             patch(
-                "great_docs._versioned_build._validate_git_ref_is_tag",
+                "great_docs._versions.build._validate_git_ref_is_tag",
                 return_value=True,
             ),
-            patch("great_docs._api_diff._detect_package_name", return_value="pkg"),
-            patch("great_docs._api_diff.snapshot_at_tag", return_value=mock_snap),
+            patch("great_docs._api_evolution.snapshot._detect_package_name", return_value="pkg"),
+            patch(
+                "great_docs._api_evolution.snapshot.snapshot_at_tag", return_value=mock_snap
+            ) as snapshot,
         ):
-            pages = _rebuild_api_from_git_ref(dest, tmp_path, entry)
+            pages = _rebuild_api_from_git_ref(
+                dest, tmp_path, entry, documented_symbols=lambda name: ["func2"], quarto_config={}
+            )
 
         assert "reference/func2.html" in pages
+        assert snapshot.call_args.kwargs["documented_names"] == ["func2"]
         # Cache should have been written
         cache_path = tmp_path / ".great-docs-cache" / "snapshots" / "v0.2.0.json"
         assert cache_path.exists()
@@ -3216,7 +3348,7 @@ class TestRebuildApiFromGitRefCache:
     def test_cache_miss_no_package_returns_empty(self, tmp_path: Path):
         from unittest.mock import patch
 
-        from great_docs._versioned_build import _rebuild_api_from_git_ref
+        from great_docs._versions.build import _rebuild_api_from_git_ref
 
         entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref="v0.2.0")
         dest = tmp_path / "build"
@@ -3224,19 +3356,19 @@ class TestRebuildApiFromGitRefCache:
 
         with (
             patch(
-                "great_docs._versioned_build._validate_git_ref_is_tag",
+                "great_docs._versions.build._validate_git_ref_is_tag",
                 return_value=True,
             ),
-            patch("great_docs._api_diff._detect_package_name", return_value=None),
+            patch("great_docs._api_evolution.snapshot._detect_package_name", return_value=None),
         ):
-            pages = _rebuild_api_from_git_ref(dest, tmp_path, entry)
+            pages = _rebuild_api_from_git_ref(dest, tmp_path, entry, quarto_config={})
 
         assert pages == []
 
     def test_cache_miss_snapshot_fails_returns_empty(self, tmp_path: Path):
         from unittest.mock import patch
 
-        from great_docs._versioned_build import _rebuild_api_from_git_ref
+        from great_docs._versions.build import _rebuild_api_from_git_ref
 
         entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref="v0.2.0")
         dest = tmp_path / "build"
@@ -3244,13 +3376,13 @@ class TestRebuildApiFromGitRefCache:
 
         with (
             patch(
-                "great_docs._versioned_build._validate_git_ref_is_tag",
+                "great_docs._versions.build._validate_git_ref_is_tag",
                 return_value=True,
             ),
-            patch("great_docs._api_diff._detect_package_name", return_value="pkg"),
-            patch("great_docs._api_diff.snapshot_at_tag", return_value=None),
+            patch("great_docs._api_evolution.snapshot._detect_package_name", return_value="pkg"),
+            patch("great_docs._api_evolution.snapshot.snapshot_at_tag", return_value=None),
         ):
-            pages = _rebuild_api_from_git_ref(dest, tmp_path, entry)
+            pages = _rebuild_api_from_git_ref(dest, tmp_path, entry, quarto_config={})
 
         assert pages == []
 
@@ -3304,39 +3436,21 @@ class TestExpandVersionBadgesFenceEdge:
 
 
 # ---------------------------------------------------------------------------
-# _rewrite_quarto_yml_for_version — edge cases
+# Version-specific titles
 # ---------------------------------------------------------------------------
 
 
-class TestRewriteQuartoYmlEdge:
-    def test_no_quarto_yml_does_nothing(self, tmp_path: Path):
-        from great_docs._versioned_build import _rewrite_quarto_yml_for_version
-
-        entry = _make_entry("0.2")
-        _rewrite_quarto_yml_for_version(tmp_path, entry, "0.3")  # no crash
-
-    def test_non_latest_title_gets_version_suffix(self, tmp_path: Path):
-        from yaml12 import read_yaml, write_yaml
-
-        from great_docs._versioned_build import _rewrite_quarto_yml_for_version
-
-        dest = tmp_path / "vdir"
-        dest.mkdir()
-        config = {
+class TestAdjustQuartoConfigEdge:
+    def test_non_latest_title_gets_version_suffix(self):
+        quarto_config = {
             "project": {"type": "website", "output-dir": "_site"},
             "format": {"html": {}},
             "website": {"title": "My Docs"},
         }
-        with open(dest / "_quarto.yml", "w") as f:
-            write_yaml(config, f)
 
-        entry = _make_entry("0.2")
-        _rewrite_quarto_yml_for_version(dest, entry, "0.3")
+        _adjust_quarto_config_for_version(quarto_config, _make_entry("0.2"), "0.3")
 
-        with open(dest / "_quarto.yml", "r") as f:
-            result = read_yaml(f)
-
-        assert "(0.2)" in result["website"]["title"]
+        assert "(0.2)" in quarto_config["website"]["title"]
 
     @pytest.mark.parametrize(
         ("navbar_title", "expected"),
@@ -3345,31 +3459,18 @@ class TestRewriteQuartoYmlEdge:
             (False, False),
         ],
     )
-    def test_non_latest_navbar_title_gets_version_suffix(
-        self, tmp_path: Path, navbar_title, expected
-    ):
+    def test_non_latest_navbar_title_gets_version_suffix(self, navbar_title, expected):
         # An explicit navbar title overrides the site title. Both need
         # the version suffix.
-        from yaml12 import read_yaml, write_yaml
-
-        from great_docs._versioned_build import _rewrite_quarto_yml_for_version
-
-        dest = tmp_path / "vdir"
-        dest.mkdir()
-        config = {
+        quarto_config = {
             "project": {"type": "website", "output-dir": "_site"},
             "format": {"html": {}},
             "website": {"title": "My Docs", "navbar": {"title": navbar_title}},
         }
-        with open(dest / "_quarto.yml", "w") as f:
-            write_yaml(config, f)
 
-        _rewrite_quarto_yml_for_version(dest, _make_entry("0.2"), "0.3")
+        _adjust_quarto_config_for_version(quarto_config, _make_entry("0.2"), "0.3")
 
-        with open(dest / "_quarto.yml", "r") as f:
-            result = read_yaml(f)
-
-        assert result["website"]["navbar"]["title"] == expected
+        assert quarto_config["website"]["navbar"]["title"] == expected
 
 
 # ---------------------------------------------------------------------------
@@ -3382,17 +3483,14 @@ class TestRunVersionedBuild:
         from unittest.mock import MagicMock, patch
 
         # Set up source tree
-        source = tmp_path / "source"
-        _make_source_tree(
-            source,
+        layout = _make_project(
+            tmp_path,
             {
                 "index.qmd": "---\ntitle: Home\n---\nHi",
                 "guide.qmd": "---\ntitle: Guide\n---\nContent",
             },
         )
-
-        project_root = tmp_path / "project"
-        project_root.mkdir()
+        source, project_root = layout.build_dir, layout.package_root
 
         # Mock render to return success
         def mock_render(build_dirs, env_vars=None, max_workers=None, progress_callback=None):
@@ -3406,12 +3504,14 @@ class TestRunVersionedBuild:
             return results
 
         with patch(
-            "great_docs._versioned_build.render_versions_parallel",
+            "great_docs._versions.build.render_versions_parallel",
             side_effect=mock_render,
         ):
             result = run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3", "0.2"],
             )
 
@@ -3424,11 +3524,8 @@ class TestRunVersionedBuild:
     def test_latest_only_builds_single_version(self, tmp_path: Path):
         from unittest.mock import patch
 
-        source = tmp_path / "source"
-        _make_source_tree(source, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
-
-        project_root = tmp_path / "project"
-        project_root.mkdir()
+        layout = _make_project(tmp_path, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
+        source, project_root = layout.build_dir, layout.package_root
 
         def mock_render(build_dirs, **kwargs):
             results = []
@@ -3440,12 +3537,14 @@ class TestRunVersionedBuild:
             return results
 
         with patch(
-            "great_docs._versioned_build.render_versions_parallel",
+            "great_docs._versions.build.render_versions_parallel",
             side_effect=mock_render,
         ):
             result = run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3", "0.2"],
                 latest_only=True,
             )
@@ -3456,11 +3555,8 @@ class TestRunVersionedBuild:
     def test_version_tags_filter(self, tmp_path: Path):
         from unittest.mock import patch
 
-        source = tmp_path / "source"
-        _make_source_tree(source, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
-
-        project_root = tmp_path / "project"
-        project_root.mkdir()
+        layout = _make_project(tmp_path, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
+        source, project_root = layout.build_dir, layout.package_root
 
         def mock_render(build_dirs, **kwargs):
             results = []
@@ -3472,12 +3568,14 @@ class TestRunVersionedBuild:
             return results
 
         with patch(
-            "great_docs._versioned_build.render_versions_parallel",
+            "great_docs._versions.build.render_versions_parallel",
             side_effect=mock_render,
         ):
             result = run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3", "0.2", "0.1"],
                 version_tags=["0.2"],
             )
@@ -3488,23 +3586,22 @@ class TestRunVersionedBuild:
     def test_render_failure_reported(self, tmp_path: Path):
         from unittest.mock import patch
 
-        source = tmp_path / "source"
-        _make_source_tree(source, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
-
-        project_root = tmp_path / "project"
-        project_root.mkdir()
+        layout = _make_project(tmp_path, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
+        source, project_root = layout.build_dir, layout.package_root
 
         def mock_render(build_dirs, **kwargs):
             # All versions fail
             return [(str(d), 1, "", "ERROR: something broke", []) for d in build_dirs]
 
         with patch(
-            "great_docs._versioned_build.render_versions_parallel",
+            "great_docs._versions.build.render_versions_parallel",
             side_effect=mock_render,
         ):
             result = run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3"],
             )
 
@@ -3516,11 +3613,8 @@ class TestRunVersionedBuild:
     def test_on_renders_done_callback(self, tmp_path: Path):
         from unittest.mock import MagicMock, patch
 
-        source = tmp_path / "source"
-        _make_source_tree(source, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
-
-        project_root = tmp_path / "project"
-        project_root.mkdir()
+        layout = _make_project(tmp_path, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
+        source, project_root = layout.build_dir, layout.package_root
 
         callback = MagicMock()
 
@@ -3534,12 +3628,14 @@ class TestRunVersionedBuild:
             return results
 
         with patch(
-            "great_docs._versioned_build.render_versions_parallel",
+            "great_docs._versions.build.render_versions_parallel",
             side_effect=mock_render,
         ):
             run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3"],
                 on_renders_done=callback,
             )
@@ -3555,11 +3651,8 @@ class TestRunVersionedBuild:
         """
         from unittest.mock import patch
 
-        source = tmp_path / "source"
-        _make_source_tree(source, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
-
-        project_root = tmp_path / "project"
-        project_root.mkdir()
+        layout = _make_project(tmp_path, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
+        source, project_root = layout.build_dir, layout.package_root
 
         captured_build_dirs: list[Path] = []
 
@@ -3574,17 +3667,19 @@ class TestRunVersionedBuild:
             return results
 
         with patch(
-            "great_docs._versioned_build.render_versions_parallel",
+            "great_docs._versions.build.render_versions_parallel",
             side_effect=mock_render,
         ):
             run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3", "0.2"],
             )
 
         assert captured_build_dirs[0] == source
-        assert captured_build_dirs[1] == tmp_path / "source-0.2"
+        assert captured_build_dirs[1] == layout.build_dir_for("0.2", "0.3")
 
     def test_raises_when_target_dir_exists_and_unmarked(self, tmp_path: Path):
         """
@@ -3593,42 +3688,40 @@ class TestRunVersionedBuild:
         An unmarked directory may contain user files, so the build must stop
         before preprocessing can replace it.
         """
-        source = tmp_path / "source"
-        _make_source_tree(source, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
+        layout = _make_project(tmp_path, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
+        source, project_root = layout.build_dir, layout.package_root
 
-        project_root = tmp_path / "project"
-        project_root.mkdir()
-
-        stray = tmp_path / "source-0.2"
+        stray = layout.build_dir_for("0.2", "0.3")
         stray.mkdir()
         (stray / "notes.txt").write_text("mine", encoding="utf-8")
 
-        with pytest.raises(ValueError, match="source-0.2"):
+        with pytest.raises(ValueError, match="great-docs-0.2"):
             run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3", "0.2"],
             )
 
         assert (stray / "notes.txt").read_text() == "mine"
 
     def test_rejects_symlinked_version_build_directory(self, tmp_path: Path):
-        source = tmp_path / "source"
-        _make_source_tree(source, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
-
-        project_root = tmp_path / "project"
-        project_root.mkdir()
+        layout = _make_project(tmp_path, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
+        source, project_root = layout.build_dir, layout.package_root
 
         target = tmp_path / "marked-target"
         target.mkdir()
         (target / "_quarto.yml").write_text(QUARTO_YML_HEADER, encoding="utf-8")
-        version_dir = tmp_path / "source-0.2"
+        version_dir = layout.build_dir_for("0.2", "0.3")
         version_dir.symlink_to(target, target_is_directory=True)
 
-        with pytest.raises(ValueError, match="source-0.2.*symlink"):
+        with pytest.raises(ValueError, match="symlink.*great-docs-0.2"):
             run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3", "0.2"],
             )
 
@@ -3642,27 +3735,26 @@ class TestRunVersionedBuild:
         Collision validation must stop the build before cleanup removes marked
         sibling directories.
         """
-        source = tmp_path / "source"
-        _make_source_tree(source, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
+        layout = _make_project(tmp_path, {"index.qmd": "---\ntitle: Hi\n---\nHi"})
+        source, project_root = layout.build_dir, layout.package_root
 
-        project_root = tmp_path / "project"
-        project_root.mkdir()
-
-        marked = tmp_path / "source-0.1"
+        marked = layout.build_dir_for("0.1", "0.3")
         marked.mkdir()
         (marked / "_quarto.yml").write_text(
             QUARTO_YML_HEADER + "project:\n  type: website\n", encoding="utf-8"
         )
         (marked / "notes.txt").write_text("kept", encoding="utf-8")
 
-        stray = tmp_path / "source-0.2"
+        stray = layout.build_dir_for("0.2", "0.3")
         stray.mkdir()
         (stray / "notes.txt").write_text("mine", encoding="utf-8")
 
-        with pytest.raises(ValueError, match="source-0.2"):
+        with pytest.raises(ValueError, match="great-docs-0.2"):
             run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3", "0.2", "0.1"],
             )
 
@@ -3678,17 +3770,14 @@ class TestRunVersionedBuild:
         """
         from unittest.mock import patch
 
-        source = tmp_path / "source"
-        _make_source_tree(
-            source,
+        layout = _make_project(
+            tmp_path,
             {
                 "index.qmd": "---\ntitle: Home\n---\nHi",
                 "old-only.qmd": '---\ntitle: Old\nversions: ["0.2"]\n---\nOnly in 0.2.',
             },
         )
-
-        project_root = tmp_path / "project"
-        project_root.mkdir()
+        source, project_root = layout.build_dir, layout.package_root
 
         def mock_render(build_dirs, **kwargs):
             results = []
@@ -3700,30 +3789,39 @@ class TestRunVersionedBuild:
             return results
 
         with patch(
-            "great_docs._versioned_build.render_versions_parallel",
+            "great_docs._versions.build.render_versions_parallel",
             side_effect=mock_render,
         ):
             result = run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3", "0.2"],
             )
 
         assert result["success"] is True
-        assert (tmp_path / "source-0.2" / "old-only.qmd").exists()
+        assert (layout.build_dir_for("0.2", "0.3") / "old-only.qmd").exists()
         assert not (source / "old-only.qmd").exists()
 
-    def test_badge_expiry_raw_passed_through(self, tmp_path: Path):
+    def test_section_versions_exclude_section_from_other_versions(self, tmp_path: Path):
+        """Omit a section from every version its `versions` list leaves out"""
         from unittest.mock import patch
 
-        source = tmp_path / "source"
-        _make_source_tree(
-            source,
-            {"index.qmd": "---\ntitle: Hi\n---\n\n[version-badge new 0.1]\n"},
-        )
+        from great_docs.config import Config
 
-        project_root = tmp_path / "project"
-        project_root.mkdir()
+        layout = _make_project(
+            tmp_path,
+            {
+                "index.qmd": "---\ntitle: Home\n---\nHi",
+                "migrations/v2.qmd": "---\ntitle: Migrate\n---\nMove to 0.2.",
+            },
+        )
+        source, project_root = layout.build_dir, layout.package_root
+        (project_root / "great-docs.yml").write_text(
+            'sections:\n  - title: Migration Guides\n    dir: migrations\n    versions: ["0.2"]\n',
+            encoding="utf-8",
+        )
 
         def mock_render(build_dirs, **kwargs):
             results = []
@@ -3735,12 +3833,49 @@ class TestRunVersionedBuild:
             return results
 
         with patch(
-            "great_docs._versioned_build.render_versions_parallel",
+            "great_docs._versions.build.render_versions_parallel",
             side_effect=mock_render,
         ):
             result = run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
+                versions_config=["0.2", "0.1"],
+                config=Config(project_root),
+            )
+
+        assert result["success"] is True
+        assert "migrations/v2.html" in result["pages_by_version"]["0.2"]
+        assert "migrations/v2.html" not in result["pages_by_version"]["0.1"]
+        assert not (layout.build_dir_for("0.1", "0.2") / "migrations" / "v2.qmd").exists()
+
+    def test_badge_expiry_raw_passed_through(self, tmp_path: Path):
+        from unittest.mock import patch
+
+        layout = _make_project(
+            tmp_path, {"index.qmd": "---\ntitle: Hi\n---\n\n[version-badge new 0.1]\n"}
+        )
+        source, project_root = layout.build_dir, layout.package_root
+
+        def mock_render(build_dirs, **kwargs):
+            results = []
+            for d in build_dirs:
+                site_dir = d / "_site"
+                site_dir.mkdir(parents=True, exist_ok=True)
+                (site_dir / "index.html").write_text("<html/>")
+                results.append((str(d), 0, "", "", []))
+            return results
+
+        with patch(
+            "great_docs._versions.build.render_versions_parallel",
+            side_effect=mock_render,
+        ):
+            result = run_versioned_build(
+                source_dir=source,
+                project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3", "0.2", "0.1"],
                 badge_expiry_raw="1",
             )
@@ -3749,15 +3884,15 @@ class TestRunVersionedBuild:
 
 
 # ---------------------------------------------------------------------------
-# _render_single_version_streaming — subprocess mocking
+# Version renders with mocked subprocesses
 # ---------------------------------------------------------------------------
 
 
-class TestRenderSingleVersionStreaming:
+class TestRenderVersion:
     def test_successful_render_with_progress(self, tmp_path: Path):
         from unittest.mock import MagicMock, patch
 
-        from great_docs._versioned_build import _render_single_version_streaming
+        from great_docs._versions.build import _render_version
 
         # Mock subprocess.Popen
         mock_proc = MagicMock()
@@ -3772,20 +3907,19 @@ class TestRenderSingleVersionStreaming:
         progress = MagicMock()
 
         with patch("subprocess.Popen", return_value=mock_proc):
-            result = _render_single_version_streaming(str(tmp_path), None, on_progress=progress)
+            result = _render_version(str(tmp_path), None, on_progress=progress)
 
         assert result[0] == str(tmp_path)
         assert result[1] == 0
-        assert result[2] == "output"
         assert progress.call_count == 3
 
     def test_popen_failure_returns_error(self, tmp_path: Path):
         from unittest.mock import patch
 
-        from great_docs._versioned_build import _render_single_version_streaming
+        from great_docs._versions.build import _render_version
 
         with patch("subprocess.Popen", side_effect=OSError("not found")):
-            result = _render_single_version_streaming(str(tmp_path), None)
+            result = _render_version(str(tmp_path), None)
 
         assert result[0] == str(tmp_path)
         assert result[1] == -1
@@ -3794,7 +3928,7 @@ class TestRenderSingleVersionStreaming:
     def test_with_env_vars(self, tmp_path: Path):
         from unittest.mock import MagicMock, patch
 
-        from great_docs._versioned_build import _render_single_version_streaming
+        from great_docs._versions.build import _render_version
 
         mock_proc = MagicMock()
         mock_proc.returncode = 0
@@ -3803,7 +3937,7 @@ class TestRenderSingleVersionStreaming:
         mock_proc.wait.return_value = 0
 
         with patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
-            _render_single_version_streaming(str(tmp_path), {"QUARTO_PYTHON": "/usr/bin/python3"})
+            _render_version(str(tmp_path), {"QUARTO_PYTHON": "/usr/bin/python3"})
 
         # Check that env vars were passed
         call_kwargs = mock_popen.call_args[1]
@@ -3811,29 +3945,29 @@ class TestRenderSingleVersionStreaming:
 
 
 # ---------------------------------------------------------------------------
-# render_versions_parallel — streaming mode with multiple dirs
+# Version render results in input order
 # ---------------------------------------------------------------------------
 
 
-class TestRenderVersionsParallelStreaming:
-    def test_streaming_mode_ordered_results(self, tmp_path: Path):
+class TestRenderVersionsParallelOrder:
+    def test_ordered_results(self, tmp_path: Path):
         from unittest.mock import MagicMock, patch
 
-        from great_docs._versioned_build import render_versions_parallel
+        from great_docs._versions.build import render_versions_parallel
 
         d1 = tmp_path / "v1"
         d2 = tmp_path / "v2"
         d1.mkdir()
         d2.mkdir()
 
-        def mock_streaming(build_dir, env_vars, on_progress=None):
+        def mock_render(build_dir, env_vars, on_progress=None):
             if on_progress:
                 on_progress(1, 2)
             return (build_dir, 0, "", "")
 
         with patch(
-            "great_docs._versioned_build._render_single_version_streaming",
-            side_effect=mock_streaming,
+            "great_docs._versions.build._render_version",
+            side_effect=mock_render,
         ):
             callback = MagicMock()
             results = render_versions_parallel([d1, d2], progress_callback=callback)
@@ -3853,7 +3987,7 @@ class TestRenderVersionsParallelStreaming:
 
 class TestPruneSidebarContentsHref:
     def test_removes_missing_href_dict_entry(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_sidebar_contents
+        from great_docs._versions.build import _prune_sidebar_contents
 
         contents = [
             {"href": "guide.qmd", "text": "Guide"},
@@ -3871,7 +4005,7 @@ class TestPruneSidebarContentsHref:
         assert {"href": "removed.qmd", "text": "Removed"} not in result
 
     def test_keeps_non_qmd_href(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_sidebar_contents
+        from great_docs._versions.build import _prune_sidebar_contents
 
         contents = [
             {"href": "https://example.com", "text": "External"},
@@ -3890,8 +4024,8 @@ class TestPruneSidebarContentsHref:
 
 class TestPruneCliPagesForVersionFull:
     def test_prunes_cli_pages_via_snapshot(self, tmp_path: Path):
-        from great_docs._api_diff import ApiSnapshot, CliCommandInfo
-        from great_docs._versioned_build import _prune_cli_pages_for_version
+        from great_docs._api_evolution.model import ApiSnapshot, CliCommandInfo
+        from great_docs._versions.build import _prune_cli_pages_for_version
 
         entry = VersionEntry(tag="0.2", label="0.2", latest=False, git_ref="v0.2.0")
 
@@ -3921,13 +4055,23 @@ class TestPruneCliPagesForVersionFull:
         (cli_dir / "index.qmd").write_text("CLI index")
         (cli_dir / "build.qmd").write_text("Build command")
         (cli_dir / "old_command.qmd").write_text("Old command")
+        sidebar = {
+            "id": "cli-reference",
+            "contents": [
+                "reference/cli/index.qmd",
+                "reference/cli/build.qmd",
+                "reference/cli/old_command.qmd",
+            ],
+        }
+        quarto_config = {"website": {"sidebar": [sidebar]}}
 
-        _prune_cli_pages_for_version(tmp_path, tmp_path, entry)
+        _prune_cli_pages_for_version(tmp_path, tmp_path, entry, quarto_config=quarto_config)
 
         # build.qmd should be kept, old_command.qmd should be removed
         assert (cli_dir / "build.qmd").exists()
         assert (cli_dir / "index.qmd").exists()
         assert not (cli_dir / "old_command.qmd").exists()
+        assert sidebar["contents"] == ["reference/cli/index.qmd", "reference/cli/build.qmd"]
 
 
 # ---------------------------------------------------------------------------
@@ -3937,6 +4081,8 @@ class TestPruneCliPagesForVersionFull:
 
 class TestPreprocessVersionApiSnapshot:
     def test_api_snapshot_strategy(self, tmp_path: Path):
+        from unittest.mock import patch
+
         source = tmp_path / "source"
         _make_source_tree(source, {"index.qmd": "---\ntitle: Home\n---\nHi"})
 
@@ -3958,13 +4104,28 @@ class TestPreprocessVersionApiSnapshot:
             label="0.2",
             latest=False,
             api_snapshot="api-snapshot.json",
+            git_ref="v0.2.0",
         )
 
         dest = tmp_path / "build"
-        pages = preprocess_version(source, dest, entry, versions, project_root=project_root)
+        sidebar = {"id": "reference", "contents": ["reference/my_func.qmd", "reference/gone.qmd"]}
+        with patch(
+            "great_docs._versions.build._rebuild_api_from_git_ref",
+            side_effect=AssertionError("tag introspection bypassed the prewritten snapshot"),
+        ):
+            pages = preprocess_version(
+                source,
+                dest,
+                entry,
+                versions,
+                project_root=project_root,
+                layout=Layout.make(tmp_path),
+                quarto_config={"website": {"sidebar": [sidebar]}},
+            )
 
         assert "reference/my_func.html" in pages
         assert (dest / "reference" / "my_func.qmd").exists()
+        assert sidebar["contents"] == ["reference/my_func.qmd"]
 
     def test_api_snapshot_file_missing_skips(self, tmp_path: Path):
         source = tmp_path / "source"
@@ -3982,7 +4143,15 @@ class TestPreprocessVersionApiSnapshot:
         )
 
         dest = tmp_path / "build"
-        pages = preprocess_version(source, dest, entry, versions, project_root=project_root)
+        pages = preprocess_version(
+            source,
+            dest,
+            entry,
+            versions,
+            project_root=project_root,
+            layout=Layout.make(tmp_path),
+            quarto_config={},
+        )
 
         # Should succeed without generating API pages
         assert "index.html" in pages
@@ -3990,94 +4159,51 @@ class TestPreprocessVersionApiSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# _sync_status_inline_script — no upcoming map scenario
+# _add_upcoming_status_data — no upcoming map scenario
 # ---------------------------------------------------------------------------
 
 
 class TestSyncStatusNoUpcoming:
     def test_no_upcoming_map_returns_early(self, tmp_path: Path):
-        from great_docs._versioned_build import _sync_status_inline_script
+        from great_docs._versions.build import _add_upcoming_status_data
 
         # _page_status.json with empty upcoming_pages
         data = {"page_statuses": {"x.qmd": "new"}, "upcoming_pages": {}}
         (tmp_path / "_page_status.json").write_text(json.dumps(data))
-        (tmp_path / "_quarto.yml").write_text("project:\n  type: website\n")
+        quarto_config = {"project": {"type": "website"}}
 
-        _sync_status_inline_script(tmp_path)
+        _add_upcoming_status_data(quarto_config, tmp_path)
 
-        # _quarto.yml should be unchanged
-        assert "__GD_UPCOMING_DATA__" not in (tmp_path / "_quarto.yml").read_text()
+        assert quarto_config == {"project": {"type": "website"}}
 
     def test_already_injected_skips(self, tmp_path: Path):
-        from great_docs._versioned_build import _sync_status_inline_script
+        from great_docs._versions.build import _add_upcoming_status_data
 
         data = {"upcoming_pages": {"x.qmd": "0.4"}}
         (tmp_path / "_page_status.json").write_text(json.dumps(data))
-        yml_content = (
+        quarto_config = parse_yaml(
             "format:\n"
             "  html:\n"
             "    include-in-header:\n"
             "      - text: '<script>window.__GD_STATUS_DATA__={};'\n"
             '      - text: \'<script>window.__GD_UPCOMING_DATA__={"x.qmd":"0.4"};\'\n'
         )
-        (tmp_path / "_quarto.yml").write_text(yml_content)
 
-        _sync_status_inline_script(tmp_path)
+        _add_upcoming_status_data(quarto_config, tmp_path)
 
         # Should not double-inject
-        content = (tmp_path / "_quarto.yml").read_text()
+        content = format_yaml(quarto_config)
         assert content.count("__GD_UPCOMING_DATA__") == 1
 
     def test_no_status_data_line_returns_early(self, tmp_path: Path):
-        from great_docs._versioned_build import _sync_status_inline_script
+        from great_docs._versions.build import _add_upcoming_status_data
 
         data = {"upcoming_pages": {"x.qmd": "0.4"}}
         (tmp_path / "_page_status.json").write_text(json.dumps(data))
-        # _quarto.yml without __GD_STATUS_DATA__
-        (tmp_path / "_quarto.yml").write_text("project:\n  type: website\n")
+        quarto_config = {"project": {"type": "website"}}
 
-        _sync_status_inline_script(tmp_path)
-        assert "__GD_UPCOMING_DATA__" not in (tmp_path / "_quarto.yml").read_text()
-
-
-# ---------------------------------------------------------------------------
-# render_versions_parallel — non-streaming multi-dir path
-# ---------------------------------------------------------------------------
-
-
-class TestRenderVersionsParallelNonStreaming:
-    def test_multi_dir_uses_process_pool(self, tmp_path: Path):
-        from concurrent.futures import Future
-        from unittest.mock import MagicMock, patch
-
-        from great_docs._versioned_build import render_versions_parallel
-
-        d1 = tmp_path / "v1"
-        d2 = tmp_path / "v2"
-        d1.mkdir()
-        d2.mkdir()
-
-        # Mock ProcessPoolExecutor to avoid pickling issues
-        mock_pool = MagicMock()
-        mock_pool.__enter__ = MagicMock(return_value=mock_pool)
-        mock_pool.__exit__ = MagicMock(return_value=False)
-
-        # Create futures that return results
-        f1 = Future()
-        f1.set_result((str(d1), 0, "out1", ""))
-        f2 = Future()
-        f2.set_result((str(d2), 0, "out2", ""))
-
-        mock_pool.submit.side_effect = [f1, f2]
-
-        with patch(
-            "great_docs._versioned_build.ProcessPoolExecutor",
-            return_value=mock_pool,
-        ):
-            results = render_versions_parallel([d1, d2])  # No progress_callback
-
-        assert len(results) == 2
-        assert all(r[1] == 0 for r in results)
+        _add_upcoming_status_data(quarto_config, tmp_path)
+        assert quarto_config == {"project": {"type": "website"}}
 
 
 # ---------------------------------------------------------------------------
@@ -4112,10 +4238,18 @@ class TestPreprocessVersionGitRef:
         dest = tmp_path / "build"
 
         with patch(
-            "great_docs._versioned_build._validate_git_ref_is_tag",
+            "great_docs._versions.build._validate_git_ref_is_tag",
             return_value=True,
         ):
-            pages = preprocess_version(source, dest, entry, versions, project_root=project_root)
+            pages = preprocess_version(
+                source,
+                dest,
+                entry,
+                versions,
+                project_root=project_root,
+                layout=Layout.make(tmp_path),
+                quarto_config={},
+            )
 
         assert "reference/my_func.html" in pages
 
@@ -4127,11 +4261,8 @@ class TestPreprocessVersionGitRef:
 
 class TestPruneQuartoSidebarNestedSectionGroup:
     def test_removes_empty_section_group(self, tmp_path: Path):
-        from yaml12 import format_yaml, parse_yaml
+        from great_docs._versions.build import _prune_quarto_sidebar
 
-        from great_docs._versioned_build import _prune_quarto_sidebar
-
-        quarto = tmp_path / "_quarto.yml"
         config = {
             "website": {
                 "sidebar": [
@@ -4151,22 +4282,18 @@ class TestPruneQuartoSidebarNestedSectionGroup:
                 ]
             }
         }
-        quarto.write_text(format_yaml(config), encoding="utf-8")
 
-        _prune_quarto_sidebar(tmp_path, "reference", {"kept"})
+        _prune_quarto_sidebar(config, "reference", {"kept"})
 
-        result = parse_yaml(quarto.read_text())
+        result = config
         contents = result["website"]["sidebar"][0]["contents"]
         # The section group should be entirely removed since all its entries are invalid
         assert len(contents) == 1
         assert contents[0] == "reference/kept.qmd"
 
     def test_partially_prunes_section_group(self, tmp_path: Path):
-        from yaml12 import format_yaml, parse_yaml
+        from great_docs._versions.build import _prune_quarto_sidebar
 
-        from great_docs._versioned_build import _prune_quarto_sidebar
-
-        quarto = tmp_path / "_quarto.yml"
         config = {
             "website": {
                 "sidebar": [
@@ -4185,11 +4312,10 @@ class TestPruneQuartoSidebarNestedSectionGroup:
                 ]
             }
         }
-        quarto.write_text(format_yaml(config), encoding="utf-8")
 
-        _prune_quarto_sidebar(tmp_path, "reference", {"kept"})
+        _prune_quarto_sidebar(config, "reference", {"kept"})
 
-        result = parse_yaml(quarto.read_text())
+        result = config
         contents = result["website"]["sidebar"][0]["contents"]
         assert len(contents) == 1
         section = contents[0]
@@ -4198,27 +4324,24 @@ class TestPruneQuartoSidebarNestedSectionGroup:
 
 
 # ---------------------------------------------------------------------------
-# render_versions_parallel — single dir non-streaming path
+# Version renders without a progress callback
 # ---------------------------------------------------------------------------
 
 
-class TestRenderVersionsParallelSingleNonStreaming:
+class TestRenderVersionsParallelWithoutCallback:
     def test_single_dir_no_callback(self, tmp_path: Path):
         from unittest.mock import patch
 
-        from great_docs._versioned_build import render_versions_parallel
+        from great_docs._versions.build import render_versions_parallel
 
         d1 = tmp_path / "v1"
         d1.mkdir()
 
-        with patch(
-            "great_docs._versioned_build._render_single_version",
-            return_value=(str(d1), 0, "output", ""),
-        ):
+        result = (str(d1), 0, "", "", [{"page": "index.html", "seconds": 1.0}])
+        with patch("great_docs._versions.build._render_version", return_value=result):
             results = render_versions_parallel([d1])  # No callback, single dir
 
-        assert len(results) == 1
-        assert results[0] == (str(d1), 0, "output", "", [])
+        assert results == [result]
 
 
 # ---------------------------------------------------------------------------
@@ -4230,7 +4353,7 @@ class TestPruneCliPagesFull:
     def test_prunes_and_rewrites_index(self, tmp_path: Path):
         from unittest.mock import MagicMock
 
-        from great_docs._versioned_build import _prune_cli_pages
+        from great_docs._versions.build import _prune_cli_pages
 
         # Create a mock snapshot with cli_commands
         snap = MagicMock()
@@ -4257,7 +4380,7 @@ class TestPruneCliPagesFull:
         (cli_dir / "serve.qmd").write_text("Serve cmd")
         (cli_dir / "old_cmd.qmd").write_text("Old cmd")
 
-        _prune_cli_pages(tmp_path, snap)
+        _prune_cli_pages(tmp_path, snap, quarto_config={})
 
         # old_cmd.qmd should be removed (not in valid_stems)
         assert not (cli_dir / "old_cmd.qmd").exists()
@@ -4272,16 +4395,16 @@ class TestPruneCliPagesFull:
     def test_no_cli_dir_returns_early(self, tmp_path: Path):
         from unittest.mock import MagicMock
 
-        from great_docs._versioned_build import _prune_cli_pages
+        from great_docs._versions.build import _prune_cli_pages
 
         snap = MagicMock()
         snap.cli_commands = None
-        _prune_cli_pages(tmp_path, snap)  # No crash
+        _prune_cli_pages(tmp_path, snap, quarto_config={})  # No crash
 
     def test_no_cli_commands_returns_early(self, tmp_path: Path):
         from unittest.mock import MagicMock
 
-        from great_docs._versioned_build import _prune_cli_pages
+        from great_docs._versions.build import _prune_cli_pages
 
         cli_dir = tmp_path / "reference" / "cli"
         cli_dir.mkdir(parents=True)
@@ -4289,23 +4412,9 @@ class TestPruneCliPagesFull:
 
         snap = MagicMock()
         snap.cli_commands = None
-        _prune_cli_pages(tmp_path, snap)
+        _prune_cli_pages(tmp_path, snap, quarto_config={})
         # All files still there
         assert (cli_dir / "build.qmd").exists()
-
-
-# ---------------------------------------------------------------------------
-# _prune_missing_sidebar_pages — exception path
-# ---------------------------------------------------------------------------
-
-
-class TestPruneMissingSidebarPagesException:
-    def test_corrupt_yaml_handled_gracefully(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_missing_sidebar_pages
-
-        (tmp_path / "_quarto.yml").write_text("invalid: yaml: content: [\n  unmatched bracket")
-        # Should not raise
-        _prune_missing_sidebar_pages(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -4315,7 +4424,7 @@ class TestPruneMissingSidebarPagesException:
 
 class TestPruneSidebarContentsHrefMissing:
     def test_removes_href_dict_with_missing_md_file(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_sidebar_contents
+        from great_docs._versions.build import _prune_sidebar_contents
 
         contents = [
             {"href": "intro.md", "text": "Intro"},
@@ -4340,23 +4449,22 @@ class TestRunVersionedBuildEmptyRender:
         """When Quarto succeeds (exit 0) but creates no HTML, report failure."""
         from unittest.mock import patch
 
-        source = tmp_path / "source"
-        _make_source_tree(source, {"index.qmd": "---\ntitle: Hi\n---\nContent"})
-
-        project_root = tmp_path / "project"
-        project_root.mkdir()
+        layout = _make_project(tmp_path, {"index.qmd": "---\ntitle: Hi\n---\nContent"})
+        source, project_root = layout.build_dir, layout.package_root
 
         def mock_render_no_output(build_dirs, **kwargs):
             # Quarto exits 0 but creates NO _site directory (empty render)
             return [(str(d), 0, "", "", []) for d in build_dirs]
 
         with patch(
-            "great_docs._versioned_build.render_versions_parallel",
+            "great_docs._versions.build.render_versions_parallel",
             side_effect=mock_render_no_output,
         ):
             result = run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3"],
             )
 
@@ -4369,11 +4477,8 @@ class TestRunVersionedBuildEmptyRender:
         """When Quarto creates _site but it's empty, report failure."""
         from unittest.mock import patch
 
-        source = tmp_path / "source"
-        _make_source_tree(source, {"index.qmd": "---\ntitle: Hi\n---\nContent"})
-
-        project_root = tmp_path / "project"
-        project_root.mkdir()
+        layout = _make_project(tmp_path, {"index.qmd": "---\ntitle: Hi\n---\nContent"})
+        source, project_root = layout.build_dir, layout.package_root
 
         def mock_render_empty_site(build_dirs, **kwargs):
             results = []
@@ -4386,12 +4491,14 @@ class TestRunVersionedBuildEmptyRender:
             return results
 
         with patch(
-            "great_docs._versioned_build.render_versions_parallel",
+            "great_docs._versions.build.render_versions_parallel",
             side_effect=mock_render_empty_site,
         ):
             result = run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3", "0.2"],
             )
 
@@ -4406,15 +4513,9 @@ class TestRunVersionedBuildEmptyRender:
         """When preprocessing removes all .qmd files, abort before render."""
         from unittest.mock import patch
 
-        source = tmp_path / "source"
-        source.mkdir(parents=True)
         # Only _quarto.yml, no .qmd files
-        (source / "_quarto.yml").write_text(
-            "project:\n  type: website\n  output-dir: _site\nwebsite:\n  title: Test\n"
-        )
-
-        project_root = tmp_path / "project"
-        project_root.mkdir()
+        layout = _make_project(tmp_path, {})
+        source, project_root = layout.build_dir, layout.package_root
 
         render_called = []
 
@@ -4423,51 +4524,19 @@ class TestRunVersionedBuildEmptyRender:
             return [(str(d), 0, "", "", []) for d in build_dirs]
 
         with patch(
-            "great_docs._versioned_build.render_versions_parallel",
+            "great_docs._versions.build.render_versions_parallel",
             side_effect=mock_render,
         ):
             result = run_versioned_build(
                 source_dir=source,
                 project_root=project_root,
+                layout=layout,
+                quarto_config=_QUARTO_CONFIG,
                 versions_config=["0.3"],
             )
 
         assert result["success"] is False
         assert "No .qmd files" in result["errors"][0]
-
-        # Render should NOT have been called
-        assert render_called == []
-
-    def test_pre_render_check_missing_quarto_yml(self, tmp_path: Path):
-        """When _quarto.yml is missing from build dir, abort before render."""
-        from unittest.mock import patch
-
-        source = tmp_path / "source"
-        source.mkdir(parents=True)
-        # Create a .qmd file but no _quarto.yml
-        (source / "index.qmd").write_text("---\ntitle: Hi\n---\nContent")
-
-        project_root = tmp_path / "project"
-        project_root.mkdir()
-
-        render_called = []
-
-        def mock_render(build_dirs, **kwargs):
-            render_called.append(True)
-            return [(str(d), 0, "", "", []) for d in build_dirs]
-
-        with patch(
-            "great_docs._versioned_build.render_versions_parallel",
-            side_effect=mock_render,
-        ):
-            result = run_versioned_build(
-                source_dir=source,
-                project_root=project_root,
-                versions_config=["0.3"],
-            )
-
-        assert result["success"] is False
-        assert "_quarto.yml missing" in result["errors"][0]
 
         # Render should NOT have been called
         assert render_called == []
@@ -4546,9 +4615,27 @@ class TestGitRefRebuildKeepsSubmodulePages:
         (ref / "index.qmd").write_text("---\ntitle: API\n---\n")
 
         entry = VersionEntry(label="0.1.0", tag="0.1.0", git_ref="v0.1.0")
-        from great_docs._versioned_build import _rebuild_api_from_git_ref
+        from great_docs._reference import documented
+        from great_docs._reference.exports import Exports
+        from great_docs._versions.build import _rebuild_api_from_git_ref
 
-        pages = _rebuild_api_from_git_ref(tmp_path / "build", tmp_path, entry)
+        exports = Exports.make(Layout.make(tmp_path))
+
+        def documented_symbols(package_name: str) -> list[str]:
+            return documented.symbol_names(
+                exports.config,
+                importable_name=exports.project.module or package_name.replace("-", "_"),
+                search_paths=exports.project.search_paths(),
+                create_sections=exports.sections,
+            )
+
+        pages = _rebuild_api_from_git_ref(
+            tmp_path / "build",
+            tmp_path,
+            entry,
+            documented_symbols=documented_symbols,
+            quarto_config={},
+        )
 
         assert (ref / "sub.Widget.qmd").exists()
         assert (ref / "sub.Widget.fit.qmd").exists()
@@ -4588,18 +4675,83 @@ class TestIsGreatDocsBuildDir:
         assert is_great_docs_build_dir(tmp_path) is False
 
 
-class TestRewriteQuartoYmlKeepsHeader:
-    def test_header_survives_version_rewrite(self, tmp_path: Path):
-        (tmp_path / "_quarto.yml").write_text(
-            QUARTO_YML_HEADER + "website:\n  title: Test\n  site-url: https://example.com\n",
-            encoding="utf-8",
-        )
-        entry = _make_entry("0.2")
-        _rewrite_quarto_yml_for_version(tmp_path, entry, "0.3")
+class TestVersionConfigurationWrite:
+    """Version-specific Quarto configuration written by the build"""
 
-        content = (tmp_path / "_quarto.yml").read_text(encoding="utf-8")
-        assert content.startswith("# Generated by Great Docs")
-        assert is_great_docs_build_dir(tmp_path) is True
+    @pytest.fixture()
+    def built(self, tmp_path: Path) -> tuple[Layout, list[VersionEntry]]:
+        from unittest.mock import patch
+
+        layout = _make_project(
+            tmp_path,
+            {
+                "index.qmd": "---\ntitle: Home\n---\nHi",
+                "recipes/basic.qmd": "---\ntitle: Basic\n---\nRecipe",
+                "legacy/old.qmd": "---\ntitle: Old\n---\nOld",
+            },
+        )
+        navbar = {
+            "left": [
+                {"text": "Recipes", "href": "recipes/basic.qmd"},
+                {"text": "Legacy", "href": "legacy/old.qmd"},
+            ]
+        }
+        quarto_config = {
+            **_QUARTO_CONFIG,
+            "website": {**_QUARTO_CONFIG["website"], "navbar": navbar},
+        }
+        config = cast(
+            "Config",
+            SimpleNamespace(
+                sections=[
+                    {"dir": "recipes", "versions": ["0.3"]},
+                    {"dir": "legacy", "versions": ["0.2"]},
+                ],
+                seo_enabled=False,
+                social_cards_enabled=False,
+                bibliography=[],
+            ),
+        )
+
+        def render(build_dirs, **kwargs):
+            for build_dir in build_dirs:
+                (build_dir / "_site").mkdir(exist_ok=True)
+                (build_dir / "_site" / "index.html").write_text("<html></html>")
+            return [(str(build_dir), 0, "", "", []) for build_dir in build_dirs]
+
+        with patch("great_docs._versions.build.render_versions_parallel", side_effect=render):
+            result = run_versioned_build(
+                source_dir=layout.build_dir,
+                project_root=layout.package_root,
+                layout=layout,
+                quarto_config=quarto_config,
+                versions_config=["0.3", "0.2"],
+                config=config,
+            )
+        assert result["success"], result["errors"]
+        return layout, parse_versions_config(["0.3", "0.2"])
+
+    def test_every_version_keeps_the_generated_header(self, built):
+        layout, versions = built
+        for entry in versions:
+            directory = _version_build_dir(layout.build_dir, entry, "0.3", layout)
+            assert is_great_docs_build_dir(directory)
+
+    def test_versions_start_from_the_same_configuration(self, built):
+        # The latest version prunes the source directory after the historical copy.
+        # Each version must retain its own navbar links and title.
+        layout, versions = built
+        navbars = {}
+        titles = {}
+        for entry in versions:
+            directory = _version_build_dir(layout.build_dir, entry, "0.3", layout)
+            quarto_config = quarto_yml.read(directory)
+            navbars[entry.tag] = [
+                item["href"] for item in quarto_config["website"]["navbar"]["left"]
+            ]
+            titles[entry.tag] = quarto_config["website"]["title"]
+        assert navbars == {"0.3": ["recipes/basic.qmd"], "0.2": ["legacy/old.qmd"]}
+        assert titles == {"0.3": "Test", "0.2": "Test (0.2)"}
 
 
 # ---------------------------------------------------------------------------
@@ -4640,7 +4792,7 @@ class TestEscapingRelativePaths:
 
 class TestPruneCliPagesNonQmd:
     def test_non_qmd_file_not_deleted(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_cli_pages
+        from great_docs._versions.build import _prune_cli_pages
 
         cli_dir = tmp_path / "reference" / "cli"
         cli_dir.mkdir(parents=True)
@@ -4654,7 +4806,7 @@ class TestPruneCliPagesNonQmd:
         class MockSnap:
             cli_commands = type("CLI", (), {"subcommands": [MockCmd()]})()
 
-        _prune_cli_pages(tmp_path, MockSnap())
+        _prune_cli_pages(tmp_path, MockSnap(), quarto_config={})
         assert txt.exists()
 
 
@@ -4665,7 +4817,7 @@ class TestPruneCliPagesNonQmd:
 
 class TestRewriteCliIndexMdHref:
     def test_md_extension_stripped(self, tmp_path: Path):
-        from great_docs._versioned_build import _rewrite_cli_index
+        from great_docs._versions.build import _rewrite_cli_index
 
         index = tmp_path / "index.qmd"
         index.write_text(
@@ -4681,19 +4833,16 @@ class TestRewriteCliIndexMdHref:
 
 
 class TestPruneQuartoCliSidebarEdges:
-    def test_empty_yaml_returns_early(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_quarto_cli_sidebar
+    def test_empty_configuration_does_nothing(self):
+        from great_docs._versions.build import _prune_quarto_cli_sidebar
 
-        quarto = tmp_path / "_quarto.yml"
-        quarto.write_text("", encoding="utf-8")
-        _prune_quarto_cli_sidebar(tmp_path, {"index"})
+        config = {}
+        _prune_quarto_cli_sidebar(config, {"index"})
+        assert config == {}
 
     def test_non_cli_sidebar_skipped(self, tmp_path: Path):
-        from yaml12 import format_yaml, parse_yaml
+        from great_docs._versions.build import _prune_quarto_cli_sidebar
 
-        from great_docs._versioned_build import _prune_quarto_cli_sidebar
-
-        quarto = tmp_path / "_quarto.yml"
         config = {
             "website": {
                 "sidebar": [
@@ -4701,17 +4850,13 @@ class TestPruneQuartoCliSidebarEdges:
                 ]
             }
         }
-        quarto.write_text(format_yaml(config), encoding="utf-8")
-        _prune_quarto_cli_sidebar(tmp_path, {"index"})
-        result = parse_yaml(quarto.read_text())
+        _prune_quarto_cli_sidebar(config, {"index"})
+        result = config
         assert len(result["website"]["sidebar"][0]["contents"]) == 2
 
     def test_dict_item_in_contents_kept(self, tmp_path: Path):
-        from yaml12 import format_yaml, parse_yaml
+        from great_docs._versions.build import _prune_quarto_cli_sidebar
 
-        from great_docs._versioned_build import _prune_quarto_cli_sidebar
-
-        quarto = tmp_path / "_quarto.yml"
         config = {
             "website": {
                 "sidebar": [
@@ -4726,9 +4871,8 @@ class TestPruneQuartoCliSidebarEdges:
                 ]
             }
         }
-        quarto.write_text(format_yaml(config), encoding="utf-8")
-        _prune_quarto_cli_sidebar(tmp_path, {"index"})
-        result = parse_yaml(quarto.read_text())
+        _prune_quarto_cli_sidebar(config, {"index"})
+        result = config
         contents = result["website"]["sidebar"][0]["contents"]
         has_dict = any(isinstance(c, dict) for c in contents)
         assert has_dict
@@ -4741,7 +4885,7 @@ class TestPruneQuartoCliSidebarEdges:
 
 class TestPruneSidebarContentsEdges:
     def test_dict_without_href_or_section_kept(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_sidebar_contents
+        from great_docs._versions.build import _prune_sidebar_contents
 
         contents = [{"text": "About", "url": "https://example.com"}]
         result = _prune_sidebar_contents(contents, tmp_path)
@@ -4749,7 +4893,7 @@ class TestPruneSidebarContentsEdges:
         assert result[0]["text"] == "About"
 
     def test_non_string_non_dict_item_kept(self, tmp_path: Path):
-        from great_docs._versioned_build import _prune_sidebar_contents
+        from great_docs._versions.build import _prune_sidebar_contents
 
         contents = [42, True]
         result = _prune_sidebar_contents(contents, tmp_path)

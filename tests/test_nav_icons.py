@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import json
+import re
+from importlib import resources
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from great_docs._icons import LUCIDE_ICONS, get_icon_svg, list_icons
+from great_docs._website.navigation import icons
 from great_docs.config import Config
-
-
-def _make_config(tmp_path: Path, yaml_text: str) -> Config:
-    (tmp_path / "great-docs.yml").write_text(yaml_text, encoding="utf-8")
-    return Config(tmp_path)
+from tests.support import write_config
 
 
 class TestLucideIcons:
@@ -93,11 +94,11 @@ class TestNavIconsConfig:
         assert cfg.nav_icons is None
 
     def test_false_is_none(self, tmp_path: Path):
-        cfg = _make_config(tmp_path, "nav_icons: false\n")
+        cfg = write_config(tmp_path, "nav_icons: false\n")
         assert cfg.nav_icons is None
 
     def test_navbar_only(self, tmp_path: Path):
-        cfg = _make_config(
+        cfg = write_config(
             tmp_path,
             "nav_icons:\n  navbar:\n    User Guide: book-open\n    Reference: code-2\n",
         )
@@ -108,7 +109,7 @@ class TestNavIconsConfig:
         assert icons["navbar"]["Reference"] == "code-2"
 
     def test_sidebar_only(self, tmp_path: Path):
-        cfg = _make_config(
+        cfg = write_config(
             tmp_path,
             "nav_icons:\n  sidebar:\n    Getting Started: rocket\n",
         )
@@ -118,7 +119,7 @@ class TestNavIconsConfig:
         assert icons["sidebar"]["Getting Started"] == "rocket"
 
     def test_both_navbar_and_sidebar(self, tmp_path: Path):
-        cfg = _make_config(
+        cfg = write_config(
             tmp_path,
             "nav_icons:\n  navbar:\n    Recipes: chef-hat\n  sidebar:\n    Quick Start: rocket\n",
         )
@@ -128,19 +129,19 @@ class TestNavIconsConfig:
         assert icons["sidebar"]["Quick Start"] == "rocket"
 
     def test_empty_dict_returns_none(self, tmp_path: Path):
-        cfg = _make_config(tmp_path, "nav_icons:\n  foo: bar\n")
+        cfg = write_config(tmp_path, "nav_icons:\n  foo: bar\n")
         # No 'navbar' or 'sidebar' keys -> None
         assert cfg.nav_icons is None
 
     def test_nav_icons_navbar_property(self, tmp_path: Path):
-        cfg = _make_config(
+        cfg = write_config(
             tmp_path,
             "nav_icons:\n  navbar:\n    Changelog: history\n",
         )
         assert cfg.nav_icons_navbar == {"Changelog": "history"}
 
     def test_nav_icons_sidebar_property(self, tmp_path: Path):
-        cfg = _make_config(
+        cfg = write_config(
             tmp_path,
             "nav_icons:\n  sidebar:\n    Config: settings\n",
         )
@@ -156,7 +157,7 @@ class TestNavIconsConfig:
 
     def test_values_coerced_to_strings(self, tmp_path: Path):
         # Ensure non-string YAML values get coerced
-        cfg = _make_config(
+        cfg = write_config(
             tmp_path,
             "nav_icons:\n  navbar:\n    123: home\n",
         )
@@ -164,3 +165,39 @@ class TestNavIconsConfig:
         assert icons is not None
         # Key "123" should be a string
         assert "123" in icons["navbar"]
+
+
+def _icon_data(quarto_config: dict[str, Any]) -> list[dict[str, dict[str, str]]]:
+    after_body = quarto_config["format"]["html"]["include-after-body"]
+    pattern = r'<script id="gd-nav-icons-data" type="application/json">(.*?)</script>'
+    return [json.loads(m) for e in after_body for m in re.findall(pattern, e["text"])]
+
+
+def test_register_embeds_icons_and_script(tmp_path: Path):
+    config = write_config(
+        tmp_path, "nav_icons:\n  navbar:\n    Reference: book\n  sidebar:\n    Intro: rocket\n"
+    )
+    quarto_config: dict[str, Any] = {"format": {"html": {}}}
+
+    icons.register(quarto_config, config, report=print)
+
+    assert _icon_data(quarto_config) == [
+        {
+            "navbar": {"Reference": get_icon_svg("book")},
+            "sidebar": {"Intro": get_icon_svg("rocket")},
+        }
+    ]
+    (entry,) = quarto_config["format"]["html"]["include-after-body"]
+    script = (resources.files("great_docs") / "assets" / "nav-icons.js").read_text(encoding="utf-8")
+    assert entry["text"].endswith(f"<script>{script}</script>")
+
+
+def test_register_reports_and_skips_unknown_icons(tmp_path: Path):
+    config = write_config(tmp_path, "nav_icons:\n  navbar:\n    Reference: no-such-icon\n")
+    quarto_config: dict[str, Any] = {"format": {"html": {}}}
+    reports: list[str] = []
+
+    icons.register(quarto_config, config, report=reports.append)
+
+    assert reports == ["Warning: Unknown nav icon 'no-such-icon' for 'Reference'"]
+    assert "include-after-body" not in quarto_config["format"]["html"]

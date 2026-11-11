@@ -5,18 +5,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-from yaml12 import read_yaml
-
+from great_docs._build import generated
+from great_docs._contribution import Contribution, InlineData
+from great_docs._website import page_status
 from great_docs.config import Config
 from great_docs.core import GreatDocs
+from tests.support import make_run, write_config
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-
-
-def _make_config(tmp_path: Path, yaml_text: str) -> Config:
-    (tmp_path / "great-docs.yml").write_text(yaml_text, encoding="utf-8")
-    return Config(tmp_path)
 
 
 def _make_qmd(
@@ -59,31 +55,31 @@ class TestPageStatusConfig:
         assert cfg.page_status_enabled is False
 
     def test_enabled_dict(self, tmp_path: Path):
-        cfg = _make_config(tmp_path, "page_status:\n  enabled: true\n")
+        cfg = write_config(tmp_path, "page_status:\n  enabled: true\n")
         assert cfg.page_status_enabled is True
 
     def test_enabled_shorthand(self, tmp_path: Path):
-        cfg = _make_config(tmp_path, "page_status: true\n")
+        cfg = write_config(tmp_path, "page_status: true\n")
         assert cfg.page_status_enabled is True
 
     def test_disabled_shorthand(self, tmp_path: Path):
-        cfg = _make_config(tmp_path, "page_status: false\n")
+        cfg = write_config(tmp_path, "page_status: false\n")
         assert cfg.page_status_enabled is False
 
     def test_show_in_sidebar_default(self, tmp_path: Path):
-        cfg = _make_config(tmp_path, "page_status:\n  enabled: true\n")
+        cfg = write_config(tmp_path, "page_status:\n  enabled: true\n")
         assert cfg.page_status_show_in_sidebar is True
 
     def test_show_in_sidebar_disabled(self, tmp_path: Path):
-        cfg = _make_config(tmp_path, "page_status:\n  enabled: true\n  show_in_sidebar: false\n")
+        cfg = write_config(tmp_path, "page_status:\n  enabled: true\n  show_in_sidebar: false\n")
         assert cfg.page_status_show_in_sidebar is False
 
     def test_show_on_pages_default(self, tmp_path: Path):
-        cfg = _make_config(tmp_path, "page_status:\n  enabled: true\n")
+        cfg = write_config(tmp_path, "page_status:\n  enabled: true\n")
         assert cfg.page_status_show_on_pages is True
 
     def test_show_on_pages_disabled(self, tmp_path: Path):
-        cfg = _make_config(tmp_path, "page_status:\n  enabled: true\n  show_on_pages: false\n")
+        cfg = write_config(tmp_path, "page_status:\n  enabled: true\n  show_on_pages: false\n")
         assert cfg.page_status_show_on_pages is False
 
     def test_not_enabled_disables_subordinates(self, tmp_path: Path):
@@ -92,7 +88,7 @@ class TestPageStatusConfig:
         assert cfg.page_status_show_on_pages is False
 
     def test_default_definitions(self, tmp_path: Path):
-        cfg = _make_config(tmp_path, "page_status:\n  enabled: true\n")
+        cfg = write_config(tmp_path, "page_status:\n  enabled: true\n")
         defs = cfg.page_status_definitions
         assert "new" in defs
         assert "deprecated" in defs
@@ -104,7 +100,7 @@ class TestPageStatusConfig:
 
     def test_shorthand_true_preserves_default_definitions(self, tmp_path: Path):
         """Regression: `page_status: true` must not replace definitions with bool."""
-        cfg = _make_config(tmp_path, "page_status: true\n")
+        cfg = write_config(tmp_path, "page_status: true\n")
         defs = cfg.page_status_definitions
         assert isinstance(defs, dict)
         assert len(defs) >= 5
@@ -113,7 +109,7 @@ class TestPageStatusConfig:
         assert defs["new"]["label"] == "New"
 
     def test_custom_definitions_merge(self, tmp_path: Path):
-        cfg = _make_config(
+        cfg = write_config(
             tmp_path,
             "page_status:\n  enabled: true\n  statuses:\n"
             "    draft:\n      label: Draft\n      icon: pencil\n"
@@ -131,32 +127,40 @@ class TestPageStatusConfig:
 
 
 class TestCollectPageStatuses:
+    def test_skips_reference_and_index_pages(self, tmp_path: Path):
+        gd = _bootstrap_project(tmp_path)
+        _make_qmd(gd.layout.build_dir / "reference" / "item.qmd", "Item", status="new")
+        _make_qmd(gd.layout.build_dir / "user-guide" / "index.qmd", "Guide", status="new")
+        _make_qmd(gd.layout.build_dir / "user-guide" / "topic.qmd", "Topic", status="new")
+
+        assert page_status.collect(gd._config, gd.layout) == {"user-guide/topic.qmd": "new"}
+
     def test_collect_from_user_guide(self, tmp_path: Path):
         gd = _bootstrap_project(tmp_path)
-        ug_dir = gd.build_dir / "user-guide"
+        ug_dir = gd.layout.build_dir / "user-guide"
         _make_qmd(ug_dir / "intro.qmd", "Introduction", status="new")
         _make_qmd(ug_dir / "advanced.qmd", "Advanced Usage", status="deprecated")
 
-        result = gd._collect_page_statuses()
+        result = page_status.collect(gd._config, gd.layout)
 
         assert result["user-guide/intro.qmd"] == "new"
         assert result["user-guide/advanced.qmd"] == "deprecated"
 
     def test_collect_from_recipes(self, tmp_path: Path):
         gd = _bootstrap_project(tmp_path)
-        recipes_dir = gd.build_dir / "recipes"
+        recipes_dir = gd.layout.build_dir / "recipes"
         _make_qmd(recipes_dir / "recipe1.qmd", "Easy Recipe", status="beta")
 
-        result = gd._collect_page_statuses()
+        result = page_status.collect(gd._config, gd.layout)
 
         assert result["recipes/recipe1.qmd"] == "beta"
 
     def test_unknown_status_warns(self, tmp_path: Path, capsys):
         gd = _bootstrap_project(tmp_path)
-        ug_dir = gd.build_dir / "user-guide"
+        ug_dir = gd.layout.build_dir / "user-guide"
         _make_qmd(ug_dir / "page.qmd", "A Page", status="nonexistent")
 
-        result = gd._collect_page_statuses()
+        result = page_status.collect(gd._config, gd.layout)
 
         assert len(result) == 0
         captured = capsys.readouterr()
@@ -164,23 +168,23 @@ class TestCollectPageStatuses:
 
     def test_no_status_pages(self, tmp_path: Path):
         gd = _bootstrap_project(tmp_path)
-        ug_dir = gd.build_dir / "user-guide"
+        ug_dir = gd.layout.build_dir / "user-guide"
         _make_qmd(ug_dir / "page.qmd", "No Status")
 
-        result = gd._collect_page_statuses()
+        result = page_status.collect(gd._config, gd.layout)
         assert len(result) == 0
 
     def test_no_qmd_files(self, tmp_path: Path):
         gd = _bootstrap_project(tmp_path)
-        result = gd._collect_page_statuses()
+        result = page_status.collect(gd._config, gd.layout)
         assert len(result) == 0
 
     def test_case_insensitive_status(self, tmp_path: Path):
         gd = _bootstrap_project(tmp_path)
-        ug_dir = gd.build_dir / "user-guide"
+        ug_dir = gd.layout.build_dir / "user-guide"
         _make_qmd(ug_dir / "page.qmd", "A Page", status="New")
 
-        result = gd._collect_page_statuses()
+        result = page_status.collect(gd._config, gd.layout)
 
         assert result["user-guide/page.qmd"] == "new"
 
@@ -189,10 +193,10 @@ class TestCollectPageStatuses:
             tmp_path,
             "page_status:\n  enabled: true\nsections:\n  - title: Tutorials\n    dir: tutorials\n",
         )
-        tut_dir = gd.build_dir / "tutorials"
+        tut_dir = gd.layout.build_dir / "tutorials"
         _make_qmd(tut_dir / "first.qmd", "First Tutorial", status="new")
 
-        result = gd._collect_page_statuses()
+        result = page_status.collect(gd._config, gd.layout)
 
         assert result["tutorials/first.qmd"] == "new"
 
@@ -202,10 +206,10 @@ class TestCollectPageStatuses:
             tmp_path,
             "page_status:\n  enabled: true\nsections:\n  - title: Examples\n    dir: docs/examples\n",
         )
-        section_dir = gd.build_dir / "docs" / "examples"
+        section_dir = gd.layout.build_dir / "docs" / "examples"
         _make_qmd(section_dir / "ex.qmd", "Example", status="new")
 
-        result = gd._collect_page_statuses()
+        result = page_status.collect(gd._config, gd.layout)
 
         assert result["docs/examples/ex.qmd"] == "new"
 
@@ -214,13 +218,29 @@ class TestCollectPageStatuses:
 
 
 class TestGenerateStatusJson:
+    def test_builtin_overrides_and_unknown_icon(self, tmp_path: Path, capsys):
+        gd = _bootstrap_project(
+            tmp_path,
+            "page_status:\n  enabled: true\n  statuses:\n    new:\n"
+            "      label: Fresh\n      description: Newly published\n      icon: no-such-icon\n",
+        )
+        page_status.write(gd._config, gd.layout, {})
+
+        definition = json.loads((gd.layout.build_dir / "_page_status.json").read_text())[
+            "definitions"
+        ]["new"]
+        assert definition["label"] == "Fresh"
+        assert definition["description"] == "Newly published"
+        assert definition["icon"] == ""
+        assert "no-such-icon" in capsys.readouterr().out
+
     def test_generates_json_file(self, tmp_path: Path):
         gd = _bootstrap_project(tmp_path)
         status_map = {"user-guide/intro.qmd": "new"}
 
-        gd._generate_status_json(status_map)
+        page_status.write(gd._config, gd.layout, status_map)
 
-        json_path = gd.build_dir / "_page_status.json"
+        json_path = gd.layout.build_dir / "_page_status.json"
         assert json_path.exists()
         data = json.loads(json_path.read_text(encoding="utf-8"))
         assert data["page_statuses"] == {"user-guide/intro.qmd": "new"}
@@ -233,9 +253,9 @@ class TestGenerateStatusJson:
         gd = _bootstrap_project(tmp_path)
         status_map = {"user-guide/intro.qmd": "new"}
 
-        gd._generate_status_json(status_map)
+        page_status.write(gd._config, gd.layout, status_map)
 
-        json_path = gd.build_dir / "_page_status.json"
+        json_path = gd.layout.build_dir / "_page_status.json"
         data = json.loads(json_path.read_text(encoding="utf-8"))
         # All built-in statuses should be in definitions
         for key in ("new", "updated", "beta", "deprecated", "experimental"):
@@ -248,40 +268,35 @@ class TestGenerateStatusJson:
 class TestProcessPageStatuses:
     def test_no_pages_returns_false(self, tmp_path: Path):
         gd = _bootstrap_project(tmp_path)
-        result = gd._process_page_statuses()
-        assert result is False
+        result = page_status.process(gd._config, gd.layout)
+        assert result is None
 
-    def test_with_pages_returns_true(self, tmp_path: Path):
+    def test_with_pages_returns_the_written_data(self, tmp_path: Path):
         gd = _bootstrap_project(tmp_path)
-        ug_dir = gd.build_dir / "user-guide"
+        ug_dir = gd.layout.build_dir / "user-guide"
         _make_qmd(ug_dir / "intro.qmd", "Intro", status="new")
 
-        result = gd._process_page_statuses()
-        assert result is True
+        result = page_status.process(gd._config, gd.layout)
 
-        # Verify JSON file was created
-        json_path = gd.build_dir / "_page_status.json"
-        assert json_path.exists()
+        written = json.loads(
+            (gd.layout.build_dir / "_page_status.json").read_text(encoding="utf-8")
+        )
+        assert written["page_statuses"] == {"user-guide/intro.qmd": "new"}
+        assert result == Contribution(
+            inline_data=(InlineData("__GD_STATUS_DATA__", written, before="page-status-badges.js"),)
+        )
 
 
-# ── Configuration Pass Tests ────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("inlined", [True, False], ids=["inlined", "reference"])
-def test_repeated_config_passes_keep_one_status_script(tmp_path: Path, inlined: bool):
-    """Verify that repeated passes keep one status script in either include form"""
+def test_the_page_status_step_records_the_badge_data(tmp_path: Path):
     gd = _bootstrap_project(tmp_path)
-    gd.build_dir.mkdir(exist_ok=True)
-    if inlined:
-        (gd.build_dir / "page-status-badges.js").write_text("function renderPageBadge() {}\n")
-    quarto_yml = gd.build_dir / "_quarto.yml"
-    quarto_yml.write_text("project:\n  type: website\nformat:\n  html: {}\n")
+    _make_qmd(gd.layout.build_dir / "user-guide" / "intro.qmd", "Intro", status="new")
+    run = make_run(gd)
 
-    gd._update_quarto_config()
-    gd._update_quarto_config()
+    assert generated.page_statuses(run, gd._config, gd.layout) == "Status badges processed"
 
-    entries = read_yaml(quarto_yml)["format"]["html"]["include-after-body"]
-    assert sum("renderPageBadge" in str(e) or "page-status-badges" in str(e) for e in entries) == 1
+    [contribution] = run.contributions
+    assert [data.name for data in contribution.inline_data] == ["__GD_STATUS_DATA__"]
+    assert not (gd.layout.build_dir / "_quarto.yml").exists()
 
 
 # ── Asset Correctness Tests ─────────────────────────────────────────────────

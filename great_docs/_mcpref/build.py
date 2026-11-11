@@ -1,0 +1,128 @@
+"""
+Select an MCP server and publish its reference pages and discovery manifest
+"""
+
+from __future__ import annotations
+
+import importlib
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
+
+from .._contribution import Contribution, Sidebar, SidebarItem
+from .._translations import translate
+from ..config import Config
+from . import reference
+
+if TYPE_CHECKING:
+    from .._project.layout import Layout
+
+
+def discover_server(config: Config, package: str | None) -> dict[str, Any] | None:
+    """
+    Find the configured MCP server or the first conventional module in a package
+
+    Probing a conventional module imports the documented package.
+
+    Parameters
+    ----------
+    config
+        The documentation configuration.
+    package
+        The importable package name, when one is available.
+
+    Returns
+    -------
+    :
+        The server metadata, or `None` if no candidate is available.
+    """
+    module_path = config.mcp_module
+    if not module_path and package:
+        for candidate in (f"{package}.mcp", f"{package}.mcp_server", f"{package}.server"):
+            try:
+                _ = importlib.import_module(candidate)
+            except ImportError:
+                continue
+            module_path = candidate
+            break
+
+    if not module_path:
+        print("No MCP module configured or found")
+        return None
+
+    return reference.discover_mcp_server(
+        module_path=module_path,
+        server_var=config.mcp_server_var,
+    )
+
+
+def build_mcp_reference(
+    config: Config,
+    server_info: dict[str, Any],
+    layout: Layout,
+    package_name: str | None,
+    repo_url: str | None,
+) -> list[SidebarItem]:
+    """
+    Write MCP reference pages and publish a manifest when pages exist
+
+    Parameters
+    ----------
+    config
+        The documentation configuration.
+    server_info
+        Metadata returned by MCP server discovery.
+    layout
+        Project directories, including the build directory for the MCP reference
+        pages and discovery manifest.
+    package_name
+        The installable package name, when known.
+    repo_url
+        The repository URL, when known.
+
+    Returns
+    -------
+    :
+        Sidebar items for the generated reference pages.
+    """
+    files = reference.generate_mcp_reference_pages(
+        server_info=server_info,
+        output_dir=layout.build_dir / "reference" / "mcp",
+        categories=config.mcp_categories or None,
+        display_name=config.mcp_name,
+        language=config.lang,
+    )
+    if files:
+        _ = reference.generate_mcp_manifest(
+            server_info=server_info,
+            output_dir=layout.build_dir,
+            package_name=package_name,
+            repo_url=repo_url,
+            site_url=config.site_url,
+        )
+    return files
+
+
+def contribution(config: Config, items: Sequence[SidebarItem]) -> Contribution:
+    """
+    Build the navigation contribution for the MCP reference pages
+
+    Parameters
+    ----------
+    config
+        The documentation configuration, for `lang`.
+    items
+        The sidebar entries for the generated pages.
+
+    Returns
+    -------
+    :
+        The `mcp-reference` sidebar, titled "MCP Reference" in the site's language.
+        Its first entry links to the index page. The link is labelled "MCP Index" on
+        an English site and uses the sidebar's title otherwise.
+    """
+    title = translate("mcp_reference", config.lang)
+    index_label = "MCP Index" if config.lang == "en" else title
+    index: SidebarItem = {"text": index_label, "href": "reference/mcp/index.qmd"}
+    return Contribution(
+        sidebars=(Sidebar(id="mcp-reference", title=title, contents=(index, *items)),)
+    )

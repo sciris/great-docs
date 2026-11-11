@@ -15,6 +15,7 @@ test: ## Run core tests (fast, no package builds)
 		-n auto \
 		-o faulthandler_timeout=60 \
 		--cov=great_docs \
+		--cov-config=pyproject.toml \
 		--cov-report=term-missing \
 		--ignore=tests/test_integration.py \
 		--ignore=tests/test_synthetic.py
@@ -27,13 +28,13 @@ test-synthetic: ## Run synthetic package tests
 test-integration: ## Run integration tests with external packages
 	@$(PYTHON) -m pytest tests/test_integration.py -n auto
 
-.PHONY: harness
-harness: ## Compare init, build, watch and freeze results against main for 40 cases with Quarto rendering stubbed
-	@$(PYTHON) -m tests.harness run $(HARNESS_ARGS)
+.PHONY: quarto-project-diff
+quarto-project-diff: ## Compare the Quarto projects that init, build, watch and freeze write with those of the commit where HEAD branched from main, for 40 cases
+	@$(PYTHON) -m tests.quarto_project_diff run $(QUARTO_PROJECT_DIFF_ARGS)
 
-.PHONY: harness-full
-harness-full: ## Compare init, build, watch and freeze results against main for all supported Gauntlet packages and variants
-	@$(PYTHON) -m tests.harness run --catalogue full $(HARNESS_ARGS)
+.PHONY: quarto-project-diff-full
+quarto-project-diff-full: ## Compare the Quarto projects that init, build, watch and freeze write with those of the commit where HEAD branched from main, for every supported Gauntlet package and variant
+	@$(PYTHON) -m tests.quarto_project_diff run --catalogue full $(QUARTO_PROJECT_DIFF_ARGS)
 
 .PHONY: test-all
 test-all: ## Run all tests (core + synthetic + integration)
@@ -43,6 +44,7 @@ test-all: ## Run all tests (core + synthetic + integration)
 test-coverage: ## Run tests with coverage report
 	@$(PYTHON) -m pytest \
 		--cov=great_docs \
+		--cov-config=pyproject.toml \
 		--cov-report=term-missing \
 		--cov-report=html \
 		tests/ -v
@@ -175,6 +177,14 @@ site-build: ## Build the great-docs site
 .PHONY: adopters
 adopters: ## Regenerate ADOPTERS.md from a GitHub code search (requires gh CLI)
 	@$(PYTHON) scripts/update_adopters.py
+
+.PHONY: landing-demo
+landing-demo: ## Regenerate the README's animated demo (docs/assets/landing-demo-{light,dark}.svg) from its recording
+	@great-docs termshow export docs/assets/landing-demo.termshow --svg \
+		--font-file great_docs/assets/_extensions/termshow/JetBrainsMono-Regular.subset.woff2 \
+		-o docs/assets/landing-demo.svg
+	@# READMEs of released versions on PyPI still show landing-demo.svg
+	@cp docs/assets/landing-demo-dark.svg docs/assets/landing-demo.svg
 
 .PHONY: signature-grammar
 signature-grammar: ## Regenerate the signature highlighting grammar from Pygments

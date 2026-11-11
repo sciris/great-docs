@@ -1,22 +1,24 @@
 """
 Rendering a website with several Quarto processes
 
-`_parallel_render.render()` splits a project's pages into groups that each
+`parallel_render.render()` splits a project's pages into groups that each
 render in a copy of the project, then merges the copies' output. The merged
 site must match the output of a plain `quarto render`.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
 import subprocess
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 import pytest
 
-from great_docs import _parallel_render as pr
+from great_docs._build import parallel_render as pr
 
 # ── Choosing the number of processes ─────────────────────────────────────────
 
@@ -225,6 +227,28 @@ def test_read_timings_uses_the_first_readable_file(tmp_path: Path):
     assert pr.read_timings(tmp_path / "missing.json") == {}
 
 
+def test_read_startup_from_the_last_parallel_build(tmp_path: Path):
+    parallel = tmp_path / "parallel.json"
+    parallel.write_text(
+        json.dumps({"pages": [], "render": {"processes": 6, "groups": 37, "startup_seconds": 4.9}})
+    )
+    ordinary = tmp_path / "ordinary.json"
+    ordinary.write_text(json.dumps({"pages": [{"page": "a.qmd", "seconds": 1.5}]}))
+
+    assert pr.read_startup(tmp_path / "missing.json", parallel) == 4.9
+    # The first file with page timings is the last build's, even if it wasn't parallel
+    assert pr.read_startup(ordinary, parallel) is None
+    assert pr.read_startup(tmp_path / "missing.json") is None
+
+
+@pytest.mark.parametrize("seconds", [0, -1, "5", True, None])
+def test_read_startup_ignores_odd_values(tmp_path: Path, seconds):
+    path = tmp_path / "timings.json"
+    path.write_text(json.dumps({"pages": [], "render": {"startup_seconds": seconds}}))
+
+    assert pr.read_startup(path) is None
+
+
 # ── Merging ──────────────────────────────────────────────────────────────────
 
 
@@ -414,28 +438,36 @@ def test_target_overhead_grows_with_the_project():
     assert pr.target_overhead(2000) > pr.target_overhead(1000) > pr.TARGET_OVERHEAD
 
 
+def test_plan_targets_makes_fewer_groups_when_quarto_starts_slowly():
+    inputs = _site(n_ref=300, n_guide=40)
+    costs = {item: 0.5 for item in inputs}
+
+    quick = pr.plan_targets(inputs, costs, 6, overhead=2.0)
+    slow = pr.plan_targets(inputs, costs, 6, overhead=5.0)
+    assert quick is not None and slow is not None
+    assert len(slow) < len(quick)
+
+
 # ── Falling back to a plain render ───────────────────────────────────────────
 
 
 def test_render_falls_back_with_one_process(tmp_path: Path):
-    result = pr.render(tmp_path, {}, 1)
+    result = pr.render(tmp_path, {}, {}, 1)
 
     assert result.fallback == "one render process requested"
 
 
 def test_render_falls_back_for_other_project_types(tmp_path: Path):
-    (tmp_path / "_quarto.yml").write_text("project:\n  type: book\n")
-
-    result = pr.render(tmp_path, {}, 4)
+    result = pr.render(tmp_path, {"project": {"type": "book"}}, {}, 4)
 
     assert result.fallback is not None
     assert "book" in result.fallback
 
 
 def test_render_falls_back_for_output_outside_the_project(tmp_path: Path):
-    (tmp_path / "_quarto.yml").write_text("project:\n  type: website\n  output-dir: ../out\n")
+    config = {"project": {"type": "website", "output-dir": "../out"}}
 
-    result = pr.render(tmp_path, {}, 4)
+    result = pr.render(tmp_path, config, {}, 4)
 
     assert result.fallback is not None
     assert "outside" in result.fallback
@@ -447,9 +479,62 @@ def test_render_removes_leftover_worker_directories(tmp_path: Path):
     leftover = pr.worker_dir(build, 0)
     leftover.mkdir()
 
-    pr.render(build, {}, 1)
+    pr.render(build, {}, {}, 1)
 
     assert not leftover.exists()
+
+
+def test_workers_get_the_configuration_a_pre_render_script_edits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    edit = "open('_quarto.yml', 'a').write('website:\\n  title: Edited\\n')\n"
+    build = _write(
+        tmp_path / "default",
+        {
+            "_quarto.yml": "project:\n  type: website\n",
+            "edit.py": edit,
+            "a/index.qmd": "A\n",
+            "b/index.qmd": "B\n",
+        },
+    )
+    project = pr._Project(
+        inputs=["a/index.qmd", "b/index.qmd"], executable={}, listing_dirs=set(), page_freeze=set()
+    )
+    monkeypatch.setattr(pr, "_inspect", lambda build_dir, env: project)
+    copied: list[dict[str, Any]] = []
+
+    def copy_project(build_dir: Path, dest: Path, quarto_config: dict[str, Any]) -> None:
+        copied.append(quarto_config)
+        raise OSError("stop before Quarto runs")
+
+    monkeypatch.setattr(pr, "_copy_project", copy_project)
+    config = {"project": {"type": "website", "pre-render": "edit.py"}}
+
+    result = pr.render(build, config, dict(os.environ), 2, min_pages=1)
+
+    assert result.fallback is not None and result.fallback.startswith("a worker failed")
+    assert copied
+    assert all(c["website"] == {"title": "Edited"} for c in copied)
+
+
+def test_worker_copy_writes_its_configuration_from_the_mapping(tmp_path: Path):
+    build = _write(
+        tmp_path / "default", {"_quarto.yml": "project:\n  type: book\n", "index.qmd": "Home\n"}
+    )
+    config = {
+        "project": {"type": "website", "pre-render": "a.py", "post-render": ["b.py"]},
+        "website": {"title": "T"},
+        "api-reference": {"sections": []},
+    }
+    original = copy.deepcopy(config)
+    worker = tmp_path / "worker"
+
+    pr._copy_project(build, worker, config)
+
+    written = (worker / "_quarto.yml").read_text(encoding="utf-8")
+    assert pr.parse_yaml(written) == {"project": {"type": "website"}, "website": {"title": "T"}}
+    assert (worker / "index.qmd").read_text(encoding="utf-8") == "Home\n"
+    assert config == original
 
 
 # ── Rendering with Quarto ────────────────────────────────────────────────────
@@ -521,7 +606,8 @@ def sites(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path, pr.Rend
     split = _write_project(tmp_path_factory.mktemp("split") / "proj")
     subprocess.run(["quarto", "render"], cwd=plain, check=True, capture_output=True)
     pages: list[str] = []
-    result = pr.render(split, dict(os.environ), 3, on_page=pages.append, min_pages=1)
+    config = pr.parse_yaml(_QUARTO_YML)
+    result = pr.render(split, config, dict(os.environ), 3, on_page=pages.append, min_pages=1)
     assert result.fallback is None, result.fallback
     assert result.returncode == 0, result.stderr
     assert result.workers > 1
@@ -569,3 +655,10 @@ def test_render_reports_every_page_and_cleans_up(sites):
     )
     assert pr.worker_dirs(project) == []
     assert not (project / "_freeze").exists()
+
+
+@_needs_quarto
+def test_render_measures_quarto_startup(sites):
+    _, _, result = sites
+
+    assert result.startup is not None and result.startup > 0

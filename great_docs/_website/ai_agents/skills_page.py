@@ -1,0 +1,542 @@
+"""
+Render installed agent skills as a browsable documentation page
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypedDict
+
+from ..._project.layout import Layout
+from ..._project.manifest import Manifest
+from ..._yaml import split_front_matter
+from ...config import Config
+from .. import page_dates
+from ..scripts import script_tag
+from ..seo import noindex
+from .well_known import companion_files
+
+if TYPE_CHECKING:
+    from .skills import SkillsWriter
+
+
+class SkillMeta(TypedDict):
+    name: str
+    description: str
+    path: Path
+    dir: Path | None
+
+
+@dataclass
+class SkillsPageWriter:
+    """
+    Writer for the site page that displays and links to agent skills
+
+    `layout` supplies the build directory where `skills.qmd` is written.
+    """
+
+    config: Config
+    layout: Layout
+    distribution_name: str | None
+    metadata: Manifest
+
+    @classmethod
+    def make(cls, writer: SkillsWriter) -> SkillsPageWriter:
+        """
+        Collect the site and package facts needed to write the skills page
+        """
+        return cls(
+            writer.config,
+            writer.layout,
+            writer.distribution_name,
+            writer.metadata,
+        )
+
+    def write(
+        self,
+        skill_path: "Path",
+        *,
+        skill_dir: "Path | None" = None,
+        extra_skills: "Sequence[tuple[Path, Path | None]] | None" = None,
+        companions: bool = True,
+    ) -> None:
+        """
+        Write a `skills.qmd` page with raw skill content and installation guidance
+
+        Display companion files from curated skill directories. Add a switcher when
+        `extra_skills` contains more skills for the page.
+
+        Parameters
+        ----------
+        skill_path
+            Path to the skill file to render.
+        skill_dir
+            Directory containing a curated skill and its companion files, when present.
+        extra_skills
+            Additional `(skill_path, skill_dir)` tuples to display as switchable panels.
+        companions
+            Whether to include companion files from `skill_dir` for the first skill.
+            Use `False` when the skill shares its directory with the project.
+        """
+        import html
+
+        from ..._translations import translate
+
+        lang = self.config.lang
+
+        def _t(key: str, fallback: str) -> str:
+            return translate(key, lang) if lang != "en" else fallback
+
+        if not skill_path.exists():
+            return
+
+        # ── Collect all skills for potential multi-skill rendering ──
+        all_skills: list[tuple["Path", "Path | None"]] = [
+            (skill_path, skill_dir if companions else None)
+        ]
+        if extra_skills:
+            all_skills.extend(extra_skills)
+        multi_skill = len(all_skills) > 1
+
+        # Parse metadata for each skill (name, description)
+        skill_meta: list[SkillMeta] = []
+        for sp, sd in all_skills:
+            if not sp.exists():
+                continue
+            content = sp.read_text(encoding="utf-8")
+            fm, _ = split_front_matter(content)
+            skill_meta.append(
+                {
+                    "name": fm.string("name") or sp.stem,
+                    "description": (fm.string("description") or "").strip(),
+                    "path": sp,
+                    "dir": sd,
+                }
+            )
+
+        # Build the skills.qmd page
+        lines: list[str] = []
+        lines.append("---")
+        lines.append(f"title: {_t('skills_title', 'Skills')}")
+        lines.append("toc: false")
+        lines.append("sidebar: false")
+        lines.append("page-layout: full")
+        lines.append('body-classes: "gd-skills-page"')
+        lines.append(f"{page_dates.AUTO_GENERATED}: true")
+        lines.append("---")
+        lines.append("")
+
+        # ── Intro: what is a skill? ──
+        if multi_skill:
+            lines.append(
+                _t(
+                    "skills_intro_multi",
+                    "A skill is a package of structured files that teaches an AI "
+                    "coding agent how to work with a specific tool or framework. "
+                    "This project ships multiple skills — use the switcher below "
+                    "to browse each one. Install a skill in your agent and it will "
+                    "be able to run commands, edit configuration, write content, "
+                    "and troubleshoot problems without step-by-step guidance from you.",
+                )
+            )
+        elif not skill_dir:
+            lines.append(
+                _t(
+                    "skills_intro_generated",
+                    "A skill is a package of structured files that teaches an AI "
+                    "coding agent how to work with a specific tool or framework. "
+                    "The skill below was generated by Great Docs from this "
+                    "project's documentation. Install it in your agent and it will "
+                    "be able to run commands, edit configuration, write content, "
+                    "and troubleshoot problems without step-by-step guidance from you.",
+                )
+            )
+        else:
+            lines.append(
+                _t(
+                    "skills_intro_curated",
+                    "A skill is a package of structured files that teaches an AI "
+                    "coding agent how to work with a specific tool or framework. "
+                    "Install it in your agent and it will be able to run commands, "
+                    "edit configuration, write content, and troubleshoot problems "
+                    "without step-by-step guidance from you.",
+                )
+            )
+        lines.append("")
+
+        # Install instructions
+        # Detect GitHub repo URL from metadata
+        metadata = self.metadata
+        urls = metadata.get("urls", {})
+        repo_url = urls.get("Repository", "") or urls.get("Source", "")
+        github_owner_repo = ""
+        if repo_url:
+            gh_match = re.match(r"https?://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$", repo_url)
+            if gh_match:
+                github_owner_repo = gh_match.group(1)
+
+        site_url = urls.get("Documentation", "") or self.config.site_url or ""
+        if site_url and not site_url.endswith("/"):
+            site_url += "/"
+
+        lines.append("```{=html}")
+        lines.append('<div class="gd-skills-install">')
+        lines.append(
+            '  <button class="gd-skills-install-toggle" '
+            'aria-expanded="false" aria-controls="gd-skills-install-body">'
+        )
+        _install_label = (
+            _t("install_these_skills", "Install these skills")
+            if multi_skill
+            else _t("install_this_skill", "Install this skill")
+        )
+        lines.append('    <span class="gd-skills-install-icon">&#9654;</span>    ' + _install_label)
+        lines.append("  </button>")
+        lines.append('  <div class="gd-skills-install-body" id="gd-skills-install-body">')
+        lines.append('    <div class="gd-skills-install-inner">')
+        lines.append('      <div class="gd-skills-install-pad">')
+        lines.append("```")
+        lines.append("")
+
+        # ── npx (universal installer) ──
+        if multi_skill:
+            lines.append(
+                f"**{_t('any_agent', 'Any agent')}** --- "
+                f"{_t('install_all_with_npx', 'install all with')} "
+                "[npx](https://github.com/vercel-labs/skills):"
+            )
+        else:
+            lines.append(
+                f"**{_t('any_agent', 'Any agent')}** --- "
+                f"{_t('install_with_npx', 'install with')} "
+                "[npx](https://github.com/vercel-labs/skills):"
+            )
+        lines.append("")
+        if site_url:
+            _npx_cmd = f"npx skills add {site_url}"
+        elif github_owner_repo:
+            _npx_cmd = f"npx skills add {github_owner_repo}"
+        else:
+            _npx_cmd = "npx skills add <site-url>"
+        lines.append("```{=html}")
+        lines.append(
+            f'<div class="sourceCode"><pre class="sourceCode bash code-with-copy" style="padding-bottom: 0;">'
+            f"<code>{_npx_cmd}</code></pre></div>"
+        )
+        lines.append("```")
+        lines.append("")
+
+        if multi_skill:
+            # ── CLI install (multi-skill only, requires detectable package name) ──
+            _package_name = self.distribution_name or ""
+            if _package_name:
+                _install_name = _package_name.replace("_", "-")
+                lines.append(
+                    f"**{_t('cli_install', 'CLI')}** --- "
+                    f"{_t('install_all_in_project', 'install all skills in a project')}:"
+                )
+                lines.append("")
+                _cli_cmd = f"great-docs skill install {_install_name}"
+                lines.append("```{=html}")
+                lines.append(
+                    f'<div class="sourceCode"><pre class="sourceCode bash code-with-copy" style="padding-bottom: 0;">'
+                    f"<code>{_cli_cmd}</code></pre></div>"
+                )
+                lines.append("```")
+                lines.append("")
+
+            # ── Codex / OpenCode (multi-skill: list all URLs) ──
+            lines.append("**Codex / OpenCode**")
+            lines.append("")
+            _tell_line = _t("tell_the_agent_to_fetch", "Tell the agent to fetch these skill files")
+            _skill_url_lines = [f"{_tell_line}:"]
+            for meta in skill_meta:
+                sname = meta["name"]
+                if site_url:
+                    _skill_url_lines.append(f"{site_url}.well-known/agent-skills/{sname}/SKILL.md")
+                else:
+                    _skill_url_lines.append(
+                        f"&lt;site-url&gt;/.well-known/agent-skills/{sname}/SKILL.md"
+                    )
+            _url_list_html = "<br>".join(_skill_url_lines)
+            lines.append("```{=html}")
+            lines.append(
+                f'<div class="sourceCode"><pre class="sourceCode text code-with-copy" style="padding-bottom: 0;">'
+                f"<code>{_url_list_html}</code></pre></div>"
+            )
+            lines.append("```")
+            lines.append("")
+            _browse_label = _t("browse_skill_files", "Or browse the skill files below")
+            lines.append("```{=html}")
+            lines.append(f"<p>{_browse_label}.</p>")
+            lines.append("```")
+            lines.append("")
+
+        else:
+            # ── Codex / OpenCode (single skill) ──
+            skill_file_url = f"{site_url}skill.md" if site_url else ""
+            lines.append("**Codex / OpenCode**")
+            lines.append("")
+            _tell_the_agent = _t("tell_the_agent", "Tell the agent")
+            _fetch_verb = _t("fetch_skill_file_at", "Fetch the skill file at")
+            _fetch_from_verb = _t("fetch_skill_file_from", "Fetch the skill file from")
+            if skill_file_url:
+                _follow = _t("and_follow_instructions", "and follow the instructions.")
+                _prompt_text = f"{_fetch_verb} {skill_file_url} {_follow}"
+            elif github_owner_repo:
+                _follow = _t("and_follow_instructions", "and follow the instructions.")
+                _prompt_text = (
+                    f"{_fetch_from_verb} https://github.com/{github_owner_repo} {_follow}"
+                )
+            else:
+                _follow = _t("and_follow_instructions", "and follow the instructions.")
+                _prompt_text = f"{_fetch_verb} &lt;site-url&gt;/skill.md {_follow}"
+            _code_content = f"{_tell_the_agent}:<br>{_prompt_text}"
+            lines.append("```{=html}")
+            lines.append(
+                f'<div class="sourceCode"><pre class="sourceCode text code-with-copy" style="padding-bottom: 0;">'
+                f"<code>{_code_content}</code></pre></div>"
+            )
+            lines.append("```")
+            lines.append("")
+
+            # ── Manual (curl + raw links, single skill only) ──
+            _download_label = _t("download_skill_file", "download the skill file")
+            lines.append(f"**{_t('manual_download', 'Manual')}** --- {_download_label}:")
+            lines.append("")
+            if skill_file_url:
+                _curl_cmd = f"curl -O {skill_file_url}"
+            else:
+                _curl_cmd = "curl -O &lt;site-url&gt;/skill.md"
+            lines.append("```{=html}")
+            lines.append(
+                f'<div class="sourceCode"><pre class="sourceCode bash code-with-copy" style="padding-bottom: 0;">'
+                f"<code>{_curl_cmd}</code></pre></div>"
+            )
+            lines.append("```")
+            lines.append("")
+            _browse_label = (
+                f"{_t('browse_skill_file', 'Or browse the')} "
+                '<a href="skill.md" class="gd-raw-link"><code>SKILL.md</code></a> '
+                f"{_t('file_word', 'file')}"
+            )
+            lines.append("```{=html}")
+            lines.append(f"<p>{_browse_label}.</p>")
+            lines.append("```")
+            lines.append("")
+
+        lines.append("```{=html}")
+        lines.append("      </div>")
+        lines.append("    </div>")
+        lines.append("  </div>")
+        lines.append("</div>")
+        lines.append("<script>")
+        lines.append("(function() {")
+        lines.append("  var btn = document.querySelector('.gd-skills-install-toggle');")
+        lines.append("  var body = document.getElementById('gd-skills-install-body');")
+        lines.append("  if (!btn || !body) return;")
+        lines.append("  btn.addEventListener('click', function() {")
+        lines.append("    var open = body.classList.toggle('gd-skills-install-open');")
+        lines.append("    btn.setAttribute('aria-expanded', open);")
+        lines.append("  });")
+        lines.append("})();")
+        lines.append("</script>")
+        lines.append("```")
+        lines.append("")
+
+        # ── Multi-skill switcher bar ──
+        if multi_skill:
+            lines.append("```{=html}")
+            lines.append(
+                '<div class="gd-skill-switcher" role="tablist" aria-label="Skill selector">'
+            )
+            for idx, meta in enumerate(skill_meta):
+                active_cls = " gd-skill-pill--active" if idx == 0 else ""
+                selected = "true" if idx == 0 else "false"
+                tabindex = "0" if idx == 0 else "-1"
+                name = html.escape(meta["name"])
+                desc = html.escape(meta["description"])
+                title_attr = f' title="{desc}"' if desc else ""
+                lines.append(
+                    f'  <button class="gd-skill-pill{active_cls}" role="tab" '
+                    f'aria-selected="{selected}" tabindex="{tabindex}"{title_attr}>'
+                    f"{name}</button>"
+                )
+            lines.append("</div>")
+            lines.append("```")
+            lines.append("")
+
+        # ── Render each skill as a panel ──
+        for panel_idx, meta in enumerate(skill_meta):
+            sp = meta["path"]
+            sd = meta["dir"]
+
+            if multi_skill:
+                hidden_attr = " hidden" if panel_idx > 0 else ""
+                lines.append("```{=html}")
+                lines.append(f'<div class="gd-skill-panel"{hidden_attr}>')
+                lines.append("```")
+                lines.append("")
+
+            self._append_panel(lines, sp, sd, _t, panel_prefix=meta["name"])
+
+            if multi_skill:
+                lines.append("```{=html}")
+                lines.append("</div>")
+                lines.append("```")
+                lines.append("")
+
+        # ── Script tag for the switcher (only for multi-skill pages) ──
+        if multi_skill:
+            lines.append("```{=html}")
+            lines.append(script_tag("skill-switcher.js"))
+            lines.append("```")
+            lines.append("")
+
+        skills_page = self.layout.build_dir / "skills.qmd"
+        with open(skills_page, "w", encoding="utf-8") as f:
+            _ = f.write(noindex.add_to_page(self.config, "\n".join(lines)))
+
+    def _append_panel(
+        self,
+        lines: "list[str]",
+        skill_path: "Path",
+        skill_dir: "Path | None",
+        _t: "Callable[[str, str], str]",
+        *,
+        panel_prefix: str = "",
+    ) -> None:
+        """
+        Append one skill and its companion files to the page content
+        """
+        if not skill_path.exists():
+            return
+
+        raw_content = skill_path.read_text(encoding="utf-8")
+
+        def _fence(text: str, min_ticks: int = 4) -> str:
+            """
+            Return a backtick fence longer than any fence in `text`
+            """
+            runs = re.findall(r"`{3,}", text)
+            max_run = max((len(r) for r in runs), default=0)
+            return "`" * max(min_ticks, max_run + 1)
+
+        def _neutralize_executable_cells(text: str) -> str:
+            """
+            Display Python Quarto cells without executing them
+
+            Quarto extracts `{python}` cells before parsing Markdown fences, so a
+            deeper fence cannot prevent execution. `{.python}` retains syntax
+            highlighting while preventing execution.
+            """
+            return re.sub(r"\{python\}", "{.python}", text)
+
+        raw_content = _neutralize_executable_cells(raw_content)
+
+        # List all companions in the tree; display contents only for supported text formats.
+        companions = companion_files(skill_dir) if skill_dir else []
+        _RENDERABLE_EXTS = {".md", ".sh", ".yaml", ".yml", ".py"}
+        companion_contents: list[tuple[str, str, str]] = []  # (relative path, extension, content)
+        for rel in companions:
+            if skill_dir and rel.suffix in _RENDERABLE_EXTS:
+                content = _neutralize_executable_cells(
+                    (skill_dir / rel).read_text(encoding="utf-8")
+                )
+                companion_contents.append((rel.as_posix(), rel.suffix, content))
+        shown = {rel for rel, _ext, _content in companion_contents}
+
+        # Prefix for unique anchor IDs when multiple skills share the page
+        anchor_pfx = f"{panel_prefix}-" if panel_prefix else ""
+
+        def _anchor(rel: str) -> str:
+            return f"{anchor_pfx}{rel}".replace("/", "-").replace(".", "-")
+
+        def _tree(node: dict[str, Any], indent: str, parent: str) -> list[str]:
+            """
+            Render a directory tree with links to file contents shown on the page
+
+            `node` maps directory names to nested mappings and file names to `None`.
+            """
+            rows: list[str] = []
+            names = sorted(node)
+            for i, name in enumerate(names):
+                is_last = i == len(names) - 1
+                branch = "\u2514\u2500\u2500" if is_last else "\u251c\u2500\u2500"
+                rel = f"{parent}{name}"
+                child = node[name]
+                if child is None:
+                    label = f'<a href="#{_anchor(rel)}">{name}</a>' if rel in shown else name
+                    rows.append(f"{indent}{branch} {label}")
+                else:
+                    rows.append(f"{indent}{branch} {name}/")
+                    child_indent = indent + ("    " if is_last else "\u2502   ")
+                    rows.extend(_tree(child, child_indent, f"{rel}/"))
+            return rows
+
+        # ── Directory tree (only when companion files exist) ──
+        if companions and skill_dir:
+            root: dict[str, Any] = {}
+            for rel in companions:
+                node = root
+                for part in rel.parts[:-1]:
+                    node = node.setdefault(part, {})
+                node[rel.name] = None
+            tree_lines = [f"{skill_dir.name}/", "\u251c\u2500\u2500 SKILL.md"]
+            tree_lines.extend(_tree(root, "", ""))
+
+            lines.append("```{=html}")
+            lines.append(
+                f'<h3 class="gd-skills-section-heading">{_t("skill_layout", "SKILL LAYOUT")}</h3>'
+            )
+            lines.append('<pre class="gd-skills-tree">')
+            lines.append("\n".join(tree_lines))
+            lines.append("</pre>")
+            lines.append("```")
+            lines.append("")
+
+        # ── Render the full skill.md as a raw pre block (terminal style) ──
+        lines.append("```{=html}")
+        lines.append('<h3 class="gd-skills-file-heading">SKILL.md</h3>')
+        lines.append('<pre class="gd-skills-raw">')
+        lines.append("```")
+        lines.append("")
+        skill_fence = _fence(raw_content)
+        lines.append(f"{skill_fence}markdown")
+        lines.append(raw_content.rstrip("\n"))
+        lines.append(skill_fence)
+        lines.append("")
+        lines.append("```{=html}")
+        lines.append("</pre>")
+        lines.append("```")
+        lines.append("")
+
+        # ── Render each companion file in its own pre block ──
+        for rel, ext, content in companion_contents:
+            anchor = _anchor(rel)
+            lang_map = {
+                ".md": "markdown",
+                ".sh": "bash",
+                ".yaml": "yaml",
+                ".yml": "yaml",
+                ".py": "python",
+            }
+            lang_hint = lang_map.get(ext, "")
+
+            lines.append("```{=html}")
+            lines.append(f'<h3 id="{anchor}" class="gd-skills-file-heading">{rel}</h3>')
+            lines.append('<pre class="gd-skills-raw">')
+            lines.append("```")
+            lines.append("")
+            comp_fence = _fence(content)
+            lines.append(f"{comp_fence}{lang_hint}")
+            lines.append(content.rstrip("\n"))
+            lines.append(comp_fence)
+            lines.append("")
+            lines.append("```{=html}")
+            lines.append("</pre>")
+            lines.append("```")
+            lines.append("")

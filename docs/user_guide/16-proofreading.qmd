@@ -39,7 +39,19 @@ harper-cli --version
 
 ## What Gets Checked
 
-The proofreader scans all `.qmd` and `.md` files in your documentation site directory. It automatically skips:
+The proofreader reads the same `.qmd` and `.md` pages as the [link checker](link-checker.qmd#what-gets-checked):
+
+- The homepage source
+- The pages in the user guide directory
+- The pages in each section directory
+- The pages in each custom page directory
+- The `README.md` file at the package root
+
+Within page directories, paths with any part starting with `_` or `.` are skipped. Generated pages, such as the API reference, are not checked. A `recipes/` directory is read only when a section lists it.
+
+With `--include-docstrings`, the proofreader also checks docstrings in the documented package's Python files.
+
+Within `.qmd` pages, the proofreader skips:
 
 - **Fenced code blocks** - Content between ` ``` ` markers
 - **YAML frontmatter** - Content between `---` markers at the start of files
@@ -64,9 +76,14 @@ Check specific files or patterns:
 # Check one file
 great-docs proofread user-guide/getting-started.qmd
 
-# Check all files in a directory
+# Check pages recursively in a directory
 great-docs proofread recipes/
+
+# Check .qmd pages directly in a directory
+great-docs proofread recipes/*.qmd
 ```
+
+A directory argument expands into its `.qmd` and `.md` pages, including pages in subdirectories. As with the default page search, paths with a component starting with `_` or `.` below the specified directory are skipped.
 
 ## Custom Dictionary
 
@@ -110,13 +127,13 @@ great-docs proofread --grammar-only
 
 ## English Dialect
 
-Harper supports different English dialects. The default is American English:
+Harper supports different English dialects. The default is American English. To use British English:
 
 ```bash
-great-docs proofread --dialect British
+great-docs proofread --dialect uk
 ```
 
-Available dialects: `American` (default), `British`, `Australian`, `Canadian`.
+Available values are `us` (American, the default), `uk` (British), `au` (Australian), `in` (Indian) and `ca` (Canadian).
 
 ## Output Formats
 
@@ -230,7 +247,7 @@ great-docs check-links && great-docs proofread
 
 ## Programmatic Usage
 
-You can also use the proofreader programmatically:
+Call `GreatDocs.proofread()` from Python to use the same dictionary and rule defaults as `great-docs proofread`. It returns a list of checked files, each with a `file` path, `issues` and an `error` message if checking failed:
 
 ```python
 from great_docs import GreatDocs
@@ -251,13 +268,20 @@ results = docs.proofread(
 # Strict mode (all rules enabled)
 results = docs.proofread(strict=True)
 
+# Check docstrings in the package's Python files
+results = docs.proofread(include_docstrings=True)
+
 # Process results
 for file_result in results:
+    if file_result.error:
+        print(f"{file_result.file}: not checked ({file_result.error})")
     for issue in file_result.issues:
         print(f"Line {issue.line}: {issue.message}")
         if issue.suggestions:
             print(f"  Suggestions: {issue.suggestions[:3]}")
 ```
+
+Use `dialect`, `only_rules` and `ignore_rules` as you would the CLI options `--dialect`, `--only` and `--ignore`. A missing `harper-cli` raises `RuntimeError` for the whole run, including runs that check only `.qmd` pages.
 
 ## Next Steps
 
@@ -265,4 +289,4 @@ Proofreading catches the small errors that accumulate over time: misspellings, r
 
 - [Link Checker](link-checker.qmd) validates that all links in your documentation resolve correctly
 - [Docs Linting](linting.qmd) checks docstring directives, cross-references, and structural issues
-- [Configuration](configuration.qmd) covers custom dictionaries and proofreading settings in `great-docs.yml`
+- [Configuration](configuration.qmd) describes the project settings available in `great-docs.yml`

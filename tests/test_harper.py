@@ -7,7 +7,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from great_docs._harper import (
+from great_docs._checks import proofread as proofreading
+from great_docs._checks.harper import (
     HarperError,
     HarperFileResult,
     HarperLint,
@@ -23,6 +24,7 @@ from great_docs._harper import (
 )
 from great_docs.cli import cli
 from great_docs.core import GreatDocs
+from tests.support import AUTHORED_PAGES, write_authored_pages
 
 _harper_available = find_harper_cli() is not None
 requires_harper = pytest.mark.skipif(not _harper_available, reason="harper-cli not installed")
@@ -161,7 +163,7 @@ def test_harper_file_result_creation():
 
 @requires_harper
 def test_proofread_correct_text():
-    """Proofreading a file with correct text returns expected structure."""
+    """Return a checked file with no error for correctly written text"""
     with tempfile.TemporaryDirectory() as project_dir:
         project_path = Path(project_dir)
         user_guide_dir = project_path / "user_guide"
@@ -177,15 +179,13 @@ This is a simple test document with correct spelling and grammar.
         )
         gd = GreatDocs(project_path=project_path)
         results = gd.proofread()
-        assert "files_checked" in results
-        assert "total_issues" in results
-        assert "by_kind" in results
-        assert "issues" in results
+        assert [r.file for r in results] == ["user_guide/correct.qmd"]
+        assert results[0].error is None
 
 
 @requires_harper
 def test_proofread_with_errors():
-    """Proofreading a file with errors finds issues."""
+    """Report issues for a page containing spelling and grammar errors"""
     with tempfile.TemporaryDirectory() as project_dir:
         project_path = Path(project_dir)
         user_guide_dir = project_path / "user_guide"
@@ -201,13 +201,12 @@ This documment has mispelled words and their going to be detected.
         )
         gd = GreatDocs(project_path=project_path)
         results = gd.proofread()
-        assert results["total_issues"] > 0
-        assert len(results["issues"]) > 0
+        assert sum(len(r.issues) for r in results) > 0
 
 
 @requires_harper
-def test_proofread_with_custom_dictionary():
-    """Custom dictionary reduces griffe-related issues."""
+def test_proofread_with_custom_words():
+    """Report no more `griffe` issues when the word is explicitly accepted"""
     with tempfile.TemporaryDirectory() as project_dir:
         project_path = Path(project_dir)
         user_guide_dir = project_path / "user_guide"
@@ -222,18 +221,20 @@ The griffe library is useful.
 """
         )
         gd = GreatDocs(project_path=project_path)
-        results_without = gd.proofread()
+        results_without = gd.proofread(strict=True)
         griffe_issues_without = [
-            i for i in results_without["issues"] if "griffe" in i["matched_text"]
+            i for r in results_without for i in r.issues if "griffe" in i.matched_text
         ]
-        results_with = gd.proofread(custom_dictionary=["griffe"])
-        griffe_issues_with = [i for i in results_with["issues"] if "griffe" in i["matched_text"]]
+        results_with = gd.proofread(custom_words=["griffe"], strict=True)
+        griffe_issues_with = [
+            i for r in results_with for i in r.issues if "griffe" in i.matched_text
+        ]
         assert len(griffe_issues_with) <= len(griffe_issues_without)
 
 
 @requires_harper
 def test_proofread_only_rules():
-    """Proofreading with only specific rules limits results."""
+    """Return only `SpellCheck` issues when that rule is selected"""
     with tempfile.TemporaryDirectory() as project_dir:
         project_path = Path(project_dir)
         user_guide_dir = project_path / "user_guide"
@@ -249,7 +250,7 @@ This tset has errors. Their going to be caught.
         )
         gd = GreatDocs(project_path=project_path)
         results = gd.proofread(only_rules=["SpellCheck"])
-        assert all(i["rule"] == "SpellCheck" for i in results["issues"])
+        assert all(i.rule == "SpellCheck" for r in results for i in r.issues)
 
 
 def test_proofread_help():
@@ -294,6 +295,50 @@ def test_proofread_compact_output(tmp_path, monkeypatch):
     result = runner.invoke(cli, ["proofread", "README.md", "--compact"])
     if result.exit_code == 1:
         assert "README.md:" in result.output
+
+
+@pytest.fixture
+def stub_harper(monkeypatch):
+    """Report one spelling issue on the first line of any text, without `harper-cli`"""
+
+    def run_harper_on_text(text, **kwargs):
+        return [HarperLint("SpellCheck", "Spelling", 1, 1, "Misspelled", "tset")]
+
+    monkeypatch.setattr(
+        "great_docs._checks.harper.check_harper_available", lambda: (True, "harper-cli 1.0")
+    )
+    monkeypatch.setattr("great_docs._checks.harper.run_harper_on_text", run_harper_on_text)
+
+
+@pytest.mark.parametrize(
+    ("args", "page"),
+    [
+        (["user_guide/a.qmd"], "user_guide/a.qmd"),
+        (["--docs-dir", "user_guide"], "user_guide/a.qmd"),
+    ],
+    ids=["explicit-file", "docs-dir"],
+)
+def test_proofread_relative_qmd_page(tmp_path, monkeypatch, stub_harper, args, page):
+    """Report a `.qmd` page reached by a relative path relative to the project root"""
+    (tmp_path / "user_guide").mkdir()
+    (tmp_path / "user_guide" / "a.qmd").write_text("This is a tset.\n")
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(cli, ["proofread", *args, "--project-path", ".", "--json-output"])
+
+    assert [issue["file"] for issue in json.loads(result.stdout)["issues"]] == [page]
+
+
+def test_check_qmd_page_outside_project_root(tmp_path, stub_harper):
+    """Report a `.qmd` page outside the project root by the path given"""
+    root = tmp_path / "project"
+    root.mkdir()
+    page = tmp_path / "elsewhere.qmd"
+    page.write_text("This is a tset.\n")
+
+    results = proofreading.check([page], root, proofreading.Options(), report=lambda _line: None)
+
+    assert [r.file for r in results] == [str(page)]
 
 
 def test_extract_prose_plain_text():
@@ -378,22 +423,22 @@ def test_get_default_ignore_rules():
     assert len(rules) > 0
 
 
-@patch("great_docs._harper.shutil.which")
+@patch("great_docs._checks.harper.shutil.which")
 def test_find_harper_cli_from_path(mock_which):
     """Finds harper-cli on PATH."""
     mock_which.side_effect = lambda name: "/usr/bin/harper-cli" if name == "harper-cli" else None
     assert find_harper_cli() == "/usr/bin/harper-cli"
 
 
-@patch("great_docs._harper.shutil.which")
+@patch("great_docs._checks.harper.shutil.which")
 def test_find_harper_cli_alternative_name(mock_which):
     """Falls back to 'harper' if 'harper-cli' not found."""
     mock_which.side_effect = lambda name: "/usr/bin/harper" if name == "harper" else None
     assert find_harper_cli() == "/usr/bin/harper"
 
 
-@patch("great_docs._harper.shutil.which", return_value=None)
-@patch("great_docs._harper.Path.home")
+@patch("great_docs._checks.harper.shutil.which", return_value=None)
+@patch("great_docs._checks.harper.Path.home")
 def test_find_harper_cli_cargo_bin(mock_home, mock_which):
     """Falls back to ~/.cargo/bin/harper-cli."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -406,8 +451,8 @@ def test_find_harper_cli_cargo_bin(mock_home, mock_which):
         assert "harper-cli" in result
 
 
-@patch("great_docs._harper.shutil.which", return_value=None)
-@patch("great_docs._harper.Path.home")
+@patch("great_docs._checks.harper.shutil.which", return_value=None)
+@patch("great_docs._checks.harper.Path.home")
 def test_find_harper_cli_not_found(mock_home, mock_which):
     """Returns None when harper-cli is nowhere."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -415,46 +460,46 @@ def test_find_harper_cli_not_found(mock_home, mock_which):
         assert find_harper_cli() is None
 
 
-@patch("great_docs._harper.subprocess.run")
-@patch("great_docs._harper.find_harper_cli", return_value="/usr/bin/harper-cli")
+@patch("great_docs._checks.harper.subprocess.run")
+@patch("great_docs._checks.harper.find_harper_cli", return_value="/usr/bin/harper-cli")
 def test_get_harper_version_success(mock_find, mock_run):
     """Parses version from 'harper-cli 1.12.0' output."""
     mock_run.return_value = MagicMock(returncode=0, stdout="harper-cli 1.12.0\n")
     assert get_harper_version() == "1.12.0"
 
 
-@patch("great_docs._harper.subprocess.run")
-@patch("great_docs._harper.find_harper_cli", return_value="/usr/bin/harper-cli")
+@patch("great_docs._checks.harper.subprocess.run")
+@patch("great_docs._checks.harper.find_harper_cli", return_value="/usr/bin/harper-cli")
 def test_get_harper_version_no_space(mock_find, mock_run):
     """Returns raw output when no space in version string."""
     mock_run.return_value = MagicMock(returncode=0, stdout="1.12.0\n")
     assert get_harper_version() == "1.12.0"
 
 
-@patch("great_docs._harper.find_harper_cli", return_value=None)
+@patch("great_docs._checks.harper.find_harper_cli", return_value=None)
 def test_get_harper_version_not_installed(mock_find):
     """Returns None when harper-cli not installed."""
     assert get_harper_version() is None
 
 
-@patch("great_docs._harper.subprocess.run")
-@patch("great_docs._harper.find_harper_cli", return_value="/usr/bin/harper-cli")
+@patch("great_docs._checks.harper.subprocess.run")
+@patch("great_docs._checks.harper.find_harper_cli", return_value="/usr/bin/harper-cli")
 def test_get_harper_version_subprocess_error(mock_find, mock_run):
     """Returns None on subprocess error."""
     mock_run.side_effect = subprocess.SubprocessError("fail")
     assert get_harper_version() is None
 
 
-@patch("great_docs._harper.subprocess.run")
-@patch("great_docs._harper.find_harper_cli", return_value="/usr/bin/harper-cli")
+@patch("great_docs._checks.harper.subprocess.run")
+@patch("great_docs._checks.harper.find_harper_cli", return_value="/usr/bin/harper-cli")
 def test_get_harper_version_nonzero_exit(mock_find, mock_run):
     """Returns None on non-zero exit code."""
     mock_run.return_value = MagicMock(returncode=1, stdout="")
     assert get_harper_version() is None
 
 
-@patch("great_docs._harper.subprocess.run")
-@patch("great_docs._harper.find_harper_cli", return_value="/usr/bin/harper-cli")
+@patch("great_docs._checks.harper.subprocess.run")
+@patch("great_docs._checks.harper.find_harper_cli", return_value="/usr/bin/harper-cli")
 def test_run_harper_empty_output(mock_find, mock_run):
     """Returns empty list when harper produces no output."""
     mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
@@ -462,7 +507,7 @@ def test_run_harper_empty_output(mock_find, mock_run):
     assert results == []
 
 
-@patch("great_docs._harper.subprocess.run")
+@patch("great_docs._checks.harper.subprocess.run")
 def test_run_harper_json_results(mock_run):
     """Parses JSON output into HarperFileResult objects."""
     harper_output = json.dumps(
@@ -497,14 +542,14 @@ def test_run_harper_json_results(mock_run):
     assert results[0].lints[0].char_end == 24
 
 
-@patch("great_docs._harper.find_harper_cli", return_value=None)
+@patch("great_docs._checks.harper.find_harper_cli", return_value=None)
 def test_run_harper_not_installed(mock_find):
     """Raises HarperNotFoundError when harper-cli not available."""
     with pytest.raises(HarperNotFoundError):
         run_harper([Path("file.md")])
 
 
-@patch("great_docs._harper.subprocess.run")
+@patch("great_docs._checks.harper.subprocess.run")
 def test_run_harper_timeout(mock_run):
     """Raises HarperError on timeout."""
     mock_run.side_effect = subprocess.TimeoutExpired(cmd="harper-cli", timeout=30)
@@ -512,7 +557,7 @@ def test_run_harper_timeout(mock_run):
         run_harper([Path("file.md")], harper_path="/usr/bin/harper-cli")
 
 
-@patch("great_docs._harper.subprocess.run")
+@patch("great_docs._checks.harper.subprocess.run")
 def test_run_harper_os_error(mock_run):
     """Raises HarperError on OSError."""
     mock_run.side_effect = OSError("permission denied")
@@ -520,7 +565,7 @@ def test_run_harper_os_error(mock_run):
         run_harper([Path("file.md")], harper_path="/usr/bin/harper-cli")
 
 
-@patch("great_docs._harper.subprocess.run")
+@patch("great_docs._checks.harper.subprocess.run")
 def test_run_harper_invalid_json(mock_run):
     """Raises HarperError on invalid JSON output."""
     mock_run.return_value = MagicMock(returncode=0, stdout="not json{", stderr="")
@@ -528,7 +573,7 @@ def test_run_harper_invalid_json(mock_run):
         run_harper([Path("file.md")], harper_path="/usr/bin/harper-cli")
 
 
-@patch("great_docs._harper.subprocess.run")
+@patch("great_docs._checks.harper.subprocess.run")
 def test_run_harper_stderr_error(mock_run):
     """Raises HarperError when stderr has real errors (not Note: lines)."""
     mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="Error: file not found\n")
@@ -536,7 +581,7 @@ def test_run_harper_stderr_error(mock_run):
         run_harper([Path("file.md")], harper_path="/usr/bin/harper-cli")
 
 
-@patch("great_docs._harper.subprocess.run")
+@patch("great_docs._checks.harper.subprocess.run")
 def test_run_harper_with_user_dict(mock_run):
     """User dictionary path is added to command."""
     mock_run.return_value = MagicMock(returncode=0, stdout="[]", stderr="")
@@ -550,7 +595,7 @@ def test_run_harper_with_user_dict(mock_run):
     assert "/tmp/dict.txt" in cmd
 
 
-@patch("great_docs._harper.subprocess.run")
+@patch("great_docs._checks.harper.subprocess.run")
 def test_run_harper_on_text_json_results(mock_run):
     """Parses JSON output into HarperLint objects."""
     harper_output = json.dumps(
@@ -581,7 +626,7 @@ def test_run_harper_on_text_json_results(mock_run):
     assert lints[0].file == "<stdin>"
 
 
-@patch("great_docs._harper.subprocess.run")
+@patch("great_docs._checks.harper.subprocess.run")
 def test_run_harper_on_text_empty(mock_run):
     """Returns empty list when no output."""
     mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
@@ -589,14 +634,14 @@ def test_run_harper_on_text_empty(mock_run):
     assert lints == []
 
 
-@patch("great_docs._harper.find_harper_cli", return_value=None)
+@patch("great_docs._checks.harper.find_harper_cli", return_value=None)
 def test_run_harper_on_text_not_installed(mock_find):
     """Raises HarperNotFoundError when harper-cli not available."""
     with pytest.raises(HarperNotFoundError):
         run_harper_on_text("Some text.")
 
 
-@patch("great_docs._harper.subprocess.run")
+@patch("great_docs._checks.harper.subprocess.run")
 def test_run_harper_on_text_with_user_dict(mock_run):
     """User dictionary path is added to command for text checking."""
     mock_run.return_value = MagicMock(returncode=0, stdout="[]", stderr="")
@@ -609,7 +654,7 @@ def test_run_harper_on_text_with_user_dict(mock_run):
     assert "--user-dict-path" in cmd
 
 
-@patch("great_docs._harper.subprocess.run")
+@patch("great_docs._checks.harper.subprocess.run")
 def test_run_harper_on_text_timeout(mock_run):
     """Raises HarperError on timeout."""
     mock_run.side_effect = subprocess.TimeoutExpired(cmd="harper-cli", timeout=30)
@@ -617,7 +662,7 @@ def test_run_harper_on_text_timeout(mock_run):
         run_harper_on_text("Text.", harper_path="/usr/bin/harper-cli")
 
 
-@patch("great_docs._harper.find_harper_cli", return_value=None)
+@patch("great_docs._checks.harper.find_harper_cli", return_value=None)
 def test_check_harper_available_not_installed(mock_find):
     """Returns (False, message) when harper not found."""
     available, msg = check_harper_available()
@@ -625,8 +670,8 @@ def test_check_harper_available_not_installed(mock_find):
     assert "not installed" in msg
 
 
-@patch("great_docs._harper.get_harper_version", return_value="1.12.0")
-@patch("great_docs._harper.find_harper_cli", return_value="/usr/bin/harper-cli")
+@patch("great_docs._checks.harper.get_harper_version", return_value="1.12.0")
+@patch("great_docs._checks.harper.find_harper_cli", return_value="/usr/bin/harper-cli")
 def test_check_harper_available_with_version(mock_find, mock_version):
     """Returns (True, version_string) when installed."""
     available, msg = check_harper_available()
@@ -634,8 +679,8 @@ def test_check_harper_available_with_version(mock_find, mock_version):
     assert "1.12.0" in msg
 
 
-@patch("great_docs._harper.get_harper_version", return_value=None)
-@patch("great_docs._harper.find_harper_cli", return_value="/usr/bin/harper-cli")
+@patch("great_docs._checks.harper.get_harper_version", return_value=None)
+@patch("great_docs._checks.harper.find_harper_cli", return_value="/usr/bin/harper-cli")
 def test_check_harper_available_unknown_version(mock_find, mock_version):
     """Returns (True, unknown) when version can't be determined."""
     available, msg = check_harper_available()
@@ -656,3 +701,166 @@ def test_run_harper_only_rules_extends_cmd(mock_run):
     assert "--only" in cmd
     idx = cmd.index("--only")
     assert cmd[idx + 1] == "spelling,grammar"
+
+
+GUIDE_DIRECTORIES = pytest.mark.parametrize(
+    ("settings", "directory"),
+    [("user_guide: guides\n", "guides"), ("", "user-guide")],
+    ids=["configured", "hyphenated"],
+)
+
+
+@GUIDE_DIRECTORIES
+def test_proofread_reads_the_guide_directory_the_build_uses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, settings: str, directory: str
+):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\n')
+    (tmp_path / "great-docs.yml").write_text(settings)
+    (tmp_path / directory).mkdir()
+    (tmp_path / directory / "page.qmd").write_text("# Page\n")
+    checked: list[Path] = []
+
+    def check(files: list[Path], *args: object, **kwargs: object) -> list[object]:
+        checked.extend(files)
+        return []
+
+    monkeypatch.setattr(proofreading, "check", check)
+
+    GreatDocs(project_path=tmp_path).proofread()
+
+    assert checked == [tmp_path / directory / "page.qmd"]
+
+
+@GUIDE_DIRECTORIES
+def test_proofread_command_reads_the_guide_directory_the_build_uses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, settings: str, directory: str
+):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\n')
+    (tmp_path / "great-docs.yml").write_text(settings)
+    (tmp_path / directory).mkdir()
+    (tmp_path / directory / "page.qmd").write_text("# Page\n")
+    checked: list[Path] = []
+
+    def check(files: list[Path], *args: object, **kwargs: object) -> list[object]:
+        checked.extend(files)
+        return []
+
+    monkeypatch.setattr(proofreading, "check", check)
+    monkeypatch.setattr(
+        "great_docs._checks.harper.check_harper_available", lambda: (True, "harper-cli")
+    )
+
+    result = CliRunner().invoke(cli, ["proofread", "--project-path", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert checked == [tmp_path / directory / "page.qmd"]
+
+
+@pytest.mark.parametrize("directory", ["src", "python", "lib"])
+def test_proofread_reads_docstrings_where_the_build_loads_the_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, directory: str
+):
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\n')
+    (tmp_path / directory / "demo").mkdir(parents=True)
+    (tmp_path / directory / "demo" / "__init__.py").write_text('"""A demo"""\n')
+    checked: list[Path] = []
+
+    def check(files: list[Path], *args: object, **kwargs: object) -> list[object]:
+        checked.extend(files)
+        return []
+
+    monkeypatch.setattr(proofreading, "check", check)
+
+    GreatDocs(project_path=tmp_path).proofread(include_docs=False, include_docstrings=True)
+
+    assert checked == [tmp_path / directory / "demo" / "__init__.py"]
+
+
+def _record_checked_files(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """
+    Record the files passed to proofreading without checking their prose
+
+    Parameters
+    ----------
+    monkeypatch
+        The test's patcher.
+
+    Returns
+    -------
+    :
+        A list populated with project-relative POSIX paths in discovery order.
+    """
+    checked: list[str] = []
+
+    def check(files: list[Path], root: Path, *args: object, **kwargs: object) -> list[object]:
+        checked.extend(path.relative_to(root).as_posix() for path in files)
+        return []
+
+    monkeypatch.setattr(proofreading, "check", check)
+    return checked
+
+
+def test_proofread_reads_the_authored_pages_the_build_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    write_authored_pages(tmp_path)
+    checked = _record_checked_files(monkeypatch)
+
+    GreatDocs(project_path=tmp_path).proofread(include_docstrings=True)
+
+    assert checked == [*AUTHORED_PAGES, "src/demo/__init__.py"]
+
+
+def test_proofread_command_reads_the_authored_pages_the_build_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    write_authored_pages(tmp_path)
+    checked = _record_checked_files(monkeypatch)
+    monkeypatch.setattr(
+        "great_docs._checks.harper.check_harper_available", lambda: (True, "harper-cli")
+    )
+
+    result = CliRunner().invoke(
+        cli, ["proofread", "--project-path", str(tmp_path), "--include-docstrings"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert checked == [*AUTHORED_PAGES, "src/demo/__init__.py"]
+
+
+def _write_unnamed_project(root: Path) -> None:
+    """
+    Write a project with a configured module and no distribution name
+    """
+    (root / "great-docs.yml").write_text("module: beta\n")
+    for package in ("alpha", "beta"):
+        (root / package).mkdir()
+        (root / package / "__init__.py").write_text(f'"""The {package} package"""\n')
+
+
+def test_proofread_reads_the_configured_module_of_a_project_without_a_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _write_unnamed_project(tmp_path)
+    checked = _record_checked_files(monkeypatch)
+
+    GreatDocs(project_path=tmp_path).proofread(include_docs=False, include_docstrings=True)
+
+    assert checked == ["beta/__init__.py"]
+
+
+def test_proofread_command_reads_the_configured_module_of_a_project_without_a_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _write_unnamed_project(tmp_path)
+    checked = _record_checked_files(monkeypatch)
+    monkeypatch.setattr(
+        "great_docs._checks.harper.check_harper_available", lambda: (True, "harper-cli")
+    )
+
+    result = CliRunner().invoke(
+        cli, ["proofread", "--project-path", str(tmp_path), "--include-docstrings"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert checked == ["beta/__init__.py"]

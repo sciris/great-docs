@@ -111,7 +111,7 @@ FROZEN_DEFAULT_CONFIG: dict[str, Any] = {
     "scale_to_fit_min_scale": None,
     "nav_icons": {},
     "keyboard_nav": True,
-    "package_info_page": True,
+    "package_info_page": {"enabled": True, "release_dates": True},
     "back_to_top": True,
     "wide_layout": {
         "enabled": True,
@@ -134,6 +134,14 @@ FROZEN_DEFAULT_CONFIG: dict[str, Any] = {
         "decision_table": [],
         "extra_body": None,
         "skills": [],
+    },
+    # Added after the snapshot: tools for in-browser AI agents.
+    "webmcp": {
+        "enabled": False,
+        "actions": True,
+        "js_api": True,
+        "exclude_tools": [],
+        "origin_trials": [],
     },
     "social_cards": {"enabled": True, "image": None, "twitter_card": None, "twitter_site": None},
     "page_status": {

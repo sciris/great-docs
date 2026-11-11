@@ -152,6 +152,7 @@ class Config:
 
         config = self._normalize_shorthands(config)
         config["parser"] = self._validate_parser(config["parser"], self.config_path)
+        config["webmcp"] = self._validate_webmcp(config["webmcp"], self.config_path)
         return config
 
     @staticmethod
@@ -182,6 +183,67 @@ class Config:
                 f"{config_path}: parser: {value!r} is not one of {', '.join(_PARSERS)}."
             )
         return cast("str", value)
+
+    @staticmethod
+    def _validate_webmcp(value: object, config_path: Path) -> ConfigDict:
+        """
+        Check the `webmcp` lists, and warn about tool names it doesn't know
+
+        An empty list key (`exclude_tools:` with nothing under it) reads as an empty list.
+        An unknown name in `exclude_tools` is only a warning, so a tool renamed in a later
+        release doesn't break the build.
+
+        Parameters
+        ----------
+        value
+            The merged `webmcp` value, after shorthand expansion.
+        config_path
+            The configuration file, named in the errors.
+
+        Returns
+        -------
+        dict
+            The `webmcp` mapping, with empty list keys read as empty lists.
+
+        Raises
+        ------
+        ConfigError
+            If `webmcp` is not a mapping, `exclude_tools` is not a list of strings, or
+            `origin_trials` is not a list of non-empty strings.
+        """
+        from ._website.ai_agents.webmcp_tools import TOOL_NAMES
+
+        if not isinstance(value, dict):
+            raise ConfigError(f"{config_path}: webmcp: {value!r} must be a mapping, true or false.")
+        webmcp = cast("ConfigDict", value)
+        for key in ("exclude_tools", "origin_trials"):
+            if webmcp[key] is None:
+                webmcp[key] = []
+
+        exclude = webmcp["exclude_tools"]
+        if not isinstance(exclude, list) or not all(
+            isinstance(name, str) for name in cast("list[object]", exclude)
+        ):
+            raise ConfigError(
+                f"{config_path}: webmcp.exclude_tools: {exclude!r} must be a list of tool "
+                "names, such as [set_theme]."
+            )
+        unknown = [name for name in cast("list[str]", exclude) if name not in TOOL_NAMES]
+        if unknown:
+            print(
+                f"Warning: webmcp.exclude_tools names unknown tools: {', '.join(unknown)}. "
+                f"Known tools: {', '.join(sorted(TOOL_NAMES))}."
+            )
+
+        tokens = webmcp["origin_trials"]
+        if not isinstance(tokens, list) or not all(
+            isinstance(token, str) and token.strip() for token in cast("list[object]", tokens)
+        ):
+            raise ConfigError(
+                f"{config_path}: webmcp.origin_trials: {tokens!r} must be a list of "
+                "origin-trial tokens (non-empty strings)."
+            )
+        return webmcp
 
     @staticmethod
     def _normalize_legacy_keys(user_config: ConfigDict) -> ConfigDict:
@@ -227,6 +289,7 @@ class Config:
         "mcp",
         "marimo",
         "wide_layout",
+        "webmcp",
     )
 
     def _normalize_shorthands(self, config: ConfigDict) -> ConfigDict:
@@ -268,6 +331,20 @@ class Config:
                 "Use `changelog: {enabled: true}`, `changelog: true` or `changelog: false`."
             )
 
+        # A boolean `package_info_page` sets `enabled`, as for `changelog`. A
+        # null reaches here only through `_NULL_DISABLES` and disables the page.
+        raw = config.get("package_info_page")
+        if isinstance(raw, bool) or raw is None:
+            merged = copy.deepcopy(DEFAULT_CONFIG["package_info_page"])
+            merged["enabled"] = bool(raw)
+            config["package_info_page"] = merged
+        elif not isinstance(raw, dict):
+            raise ConfigError(
+                f"{self.config_path}: package_info_page: {raw!r} must be a mapping, true or "
+                "false. Use `package_info_page: {release_dates: false}`, "
+                "`package_info_page: true` or `package_info_page: false`."
+            )
+
         # `hero` is excluded from the loop above: its `enabled` sub-field
         # defaults to `None` (auto — enable when a logo exists), which the
         # bool-shorthand loop would collapse to `False`.
@@ -292,9 +369,8 @@ class Config:
         if isinstance(hero_logo, dict):
             hero_logo = cast("ConfigDict", hero_logo)
             if not hero_logo.get("light") and hero_logo.get("dark"):
-                # Mirror the top-level `logo` dark-only fallback: a dark-only
-                # hero.logo must still resolve to a `light` asset, or
-                # core.py's _build_hero_section silently drops the image.
+                # A dark-only `hero.logo` falls back as the top-level `logo` does:
+                # without a `light` asset the hero silently drops the image.
                 hero_logo["light"] = hero_logo["dark"]
 
         # A bare `seo: true`/`seo: false` collapses the whole subtree to a bool;
@@ -365,16 +441,15 @@ class Config:
 
         return config
 
-    # A bare `key:` (null) switches these options off. For every other
-    # dict-valued option a null means "not specified" and `_merge` keeps the
-    # packaged defaults, so an empty or commented-out block reads the same as
-    # an absent one. These four are the exception for backward compatibility:
-    # each defaults to on, yet a null has always disabled it.
+    # Preserve the legacy behaviour of a bare `key:` (null): these five options
+    # default to enabled, but null disables them. For other mapping-valued options,
+    # null keeps the packaged defaults, just as an absent or commented-out block does.
     _NULL_DISABLES: tuple[str, ...] = (
         "social_cards",
         "markdown_pages",
         "mcp",
         "freeze",
+        "package_info_page",
     )
 
     @staticmethod
@@ -774,8 +849,13 @@ class Config:
 
     @property
     def package_info_page(self) -> bool:
-        """Check if package info page generation is enabled."""
-        return self["package_info_page"]
+        """Return whether package-info page generation is enabled"""
+        return self["package_info_page.enabled"]
+
+    @property
+    def package_info_page_release_dates(self) -> bool:
+        """Return whether the package-info page includes the latest PyPI release dates"""
+        return self["package_info_page.release_dates"]
 
     @property
     def back_to_top(self) -> bool:
@@ -840,6 +920,31 @@ class Config:
     def markdown_pages_widget(self) -> bool:
         """Whether the copy-page widget is shown (requires markdown_pages)"""
         return bool(self["markdown_pages.widget"]) and self.markdown_pages
+
+    @property
+    def webmcp_enabled(self) -> bool:
+        """Whether pages register tools for in-browser AI agents (WebMCP)"""
+        return bool(self["webmcp.enabled"])
+
+    @property
+    def webmcp_actions(self) -> bool:
+        """Whether the WebMCP action tools are registered (requires webmcp)"""
+        return bool(self["webmcp.actions"]) and self.webmcp_enabled
+
+    @property
+    def webmcp_js_api(self) -> bool:
+        """Whether `window.greatDocs.tools` is exposed in every browser (requires webmcp)"""
+        return bool(self["webmcp.js_api"]) and self.webmcp_enabled
+
+    @property
+    def webmcp_exclude_tools(self) -> list[str]:
+        """Names of the WebMCP tools to leave out"""
+        return self["webmcp.exclude_tools"]
+
+    @property
+    def webmcp_origin_trials(self) -> list[str]:
+        """WebMCP origin-trial tokens, each stripped of surrounding whitespace"""
+        return [token.strip() for token in self["webmcp.origin_trials"]]
 
     @property
     def parser(self) -> str:
@@ -1757,12 +1862,37 @@ class Config:
         """
         Get the full configuration as a dictionary.
 
+        The configuration includes merged defaults, rewritten legacy keys and
+        expanded shorthands. Use `user_settings` for the settings as written
+        in the file.
+
         Returns
         -------
         dict
             The complete configuration.
         """
         return self._config.copy()
+
+    @property
+    def user_settings(self) -> ConfigDict:
+        """
+        Settings as written in `great-docs.yml`
+
+        Nothing is merged, rewritten or expanded. An absent key stays absent,
+        and a legacy key keeps its written spelling. Use `to_dict()` for the
+        configuration with merged defaults, rewritten legacy keys and expanded
+        shorthands.
+
+        The result is empty when the file is missing, is not a mapping or fails
+        to parse.
+
+        Returns
+        -------
+        :
+            A deep copy of the settings, so changing it leaves the loaded
+            configuration unchanged.
+        """
+        return copy.deepcopy(self._user_config)
 
 
 def load_config(project_root: Path | str) -> Config:

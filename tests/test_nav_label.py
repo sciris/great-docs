@@ -14,7 +14,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from great_docs._mcp_docs import (
+from great_docs._cliref import render as cli_render
+from great_docs._mcpref.reference import (
     _generate_mcp_index_page,
     _generate_prompt_page,
     _generate_resource_page,
@@ -82,11 +83,13 @@ def test_cli_pages_turn_breadcrumbs_off():
     """Verify that CLI index and command pages disable breadcrumbs"""
     with tempfile.TemporaryDirectory() as tmp_dir:
         docs = GreatDocs(project_path=tmp_dir)
-        index = docs._generate_cli_index_page(
+        index = cli_render.index_page(
+            docs._config,
             {"name": "tool", "entry_point_name": "tool", "is_group": True, "commands": []},
             "tool",
         )
-        command = docs._generate_cli_command_page(
+        command = cli_render.command_page(
+            docs._config,
             {
                 "name": "build",
                 "full_path": "tool build",
@@ -152,32 +155,3 @@ def test_prefixes_join_any_include_in_header_form(tmp_path: Path, headers: objec
     *existing, added = quarto_config["format"]["html"]["include-in-header"]
     assert existing == kept
     assert added["text"].startswith("<style>:root{--gd-nav-prefix-api:")
-
-
-def test_registering_twice_keeps_one_prefix_style(tmp_path: Path):
-    """Verify that a repeated pass leaves a single navigation prefix style"""
-    quarto_config: dict = {"format": {"html": {"include-in-header": [{"text": "<meta>"}]}}}
-    config = Config(tmp_path)
-
-    label.register(quarto_config, config)
-    label.register(quarto_config, config)
-
-    headers = quarto_config["format"]["html"]["include-in-header"]
-    assert [h for h in headers if "--gd-nav-prefix-api" in str(h)] == headers[1:]
-    assert len(headers) == 2
-
-
-def test_registering_replaces_prefixes_of_another_language(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """Verify that changing the language replaces the navigation prefix style"""
-    quarto_config: dict = {"format": {"html": {}}}
-    config = Config(tmp_path)
-
-    monkeypatch.setattr(label, "get_translations_bundle", lambda lang: {"api": "A1", "cli": "C1"})
-    label.register(quarto_config, config)
-    monkeypatch.setattr(label, "get_translations_bundle", lambda lang: {"api": "A2", "cli": "C2"})
-    label.register(quarto_config, config)
-
-    (header,) = quarto_config["format"]["html"]["include-in-header"]
-    assert '"A2"' in header["text"]

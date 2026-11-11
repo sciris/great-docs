@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from great_docs.pandoc.blocks import DefinitionItem
 
     from .. import content
+    from .._settings import Settings
 
 
 @dataclass
@@ -51,6 +52,14 @@ class __RenderBase(Block):
 
     show_body: bool = True
     """Whether to show the documentation body of the object"""
+
+    settings: Settings = field(kw_only=True)
+    """
+    The settings of the API reference being rendered
+
+    A `Render*` subclass reads the language, signature style and source
+    links of its reference here.
+    """
 
     def __post_init__(self):
         """
@@ -114,12 +123,12 @@ class __RenderBase(Block):
         Render the header of a docstring, including any anchors
         """
 
-    def render_description(self) -> BlockContent:  # pragma: no cover
+    def render_description(self) -> BlockContent:
         """
         Render the description of the object
         """
 
-    def render_body(self) -> BlockContent:  # pragma: no cover
+    def render_body(self) -> BlockContent:
         """
         Render the body of the object being documented
         """
@@ -166,4 +175,4 @@ class RenderBase(__RenderBase):
         # The "filling in" should only happen when extending the Render*
         # classes outside the package.
         if not cls.__module__.startswith("great_docs."):
-            extend_base_class(cls)  # pragma: no cover
+            extend_base_class(cls)

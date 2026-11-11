@@ -12,14 +12,16 @@ from __future__ import annotations
 
 import shlex
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlsplit
 
+from jsonschema import Draft202012Validator
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
     Completion,
     CompletionArgument,
+    CompletionContext,
     GetPromptResult,
     Prompt,
     PromptArgument,
@@ -31,38 +33,17 @@ from mcp.types import (
     TextContent,
     Tool,
 )
-from pydantic import AnyUrl
 
-from ._layout import CONVENTIONAL_DOC_DIRS, Layout, LayoutError
+from ._build import outputs
+from ._build.steps import PROJECT_ERRORS, USER_CODE_ERRORS, BuildError
+from ._content import user_guide
+from ._project.layout import CONVENTIONAL_DOC_DIRS, Layout, LayoutError
 from ._utils import is_in_great_docs_build_dir, recognised_build_dirs
 
-server = Server("great-docs")
-
-# ---------------------------------------------------------------------------
-# mcp v1/v2 compatibility
-# ---------------------------------------------------------------------------
-
-# mcp v2 removed the decorator API from Server; handlers are now passed as
-# constructor kwargs (on_list_tools=...) instead.
-_MCP_V1 = hasattr(server, "list_tools")
-_V2_HANDLERS: dict[str, Any] = {}
-
-
-def _handler(name: str) -> Any:
-    """Return a decorator that registers a handler on the MCP server.
-
-    mcp v1 uses the decorator API; mcp v2 collects handlers for later
-    constructor-based registration at the bottom of this module.
-    """
-    if _MCP_V1:  # pragma: no cover
-        return getattr(server, name)()  # pragma: no cover
-
-    def _collect(func: Any) -> Any:
-        _V2_HANDLERS[name] = func
-        return func
-
-    return _collect
-
+if TYPE_CHECKING:
+    from ._api_evolution.model import ApiSnapshot
+    from ._project import Project
+    from ._reference.exports import Exports
 
 # Server-level instructions — displayed to the AI at connection time
 _INSTRUCTIONS = (
@@ -79,8 +60,15 @@ _INSTRUCTIONS = (
     "Start with `gd_status` to understand the current project state, then use "
     "tools and prompts to accomplish documentation tasks."
 )
-if _MCP_V1:  # pragma: no cover
-    server.instructions = _INSTRUCTIONS  # pragma: no cover
+
+# The server reports these errors as failed tool results, resource error text or no
+# completion suggestions. `USER_CODE_ERRORS` covers package-loading failures and build
+# failures because `BuildError` inherits from `RuntimeError`.
+# The set also includes plain `ValueError`: builds and the lint stale-versions check raise it
+# for an invalid `versions` list. Builds also raise it for output Great Docs did not
+# generate or a directory claimed by both `sections` and either `user_guide` or
+# `custom_pages`. Other exceptions propagate as protocol errors.
+_REPORTED_ERRORS: tuple[type[Exception], ...] = (*PROJECT_ERRORS, *USER_CODE_ERRORS, ValueError)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +140,35 @@ def _get_great_docs(
     return GreatDocs(project_path=project_path, config_path=config_path, create=create)
 
 
+def _get_exports(project_path: str | None, config_path: str | None) -> Exports:
+    """
+    Prepare export discovery for the selected project
+
+    Read the configuration and packaging files now; load packages and discover exports
+    when requested.
+
+    Parameters
+    ----------
+    project_path
+        The project directory, or `None` to use the current directory.
+    config_path
+        The configuration file, or `None` to locate it within the project.
+
+    Returns
+    -------
+    :
+        An export discovery object for the selected project.
+    """
+    from ._reference.exports import Exports
+
+    return Exports.make(
+        Layout.make(
+            Path(project_path) if project_path else Path.cwd(),
+            Path(config_path) if config_path else None,
+        )
+    )
+
+
 def _get_layout(arguments: dict, *, create: bool = False) -> Layout:
     """Resolve paths for a tool's project and configuration arguments"""
     config_path = arguments.get("config_path")
@@ -167,7 +184,6 @@ def _get_layout(arguments: dict, *, create: bool = False) -> Layout:
 # ---------------------------------------------------------------------------
 
 
-@_handler("list_tools")
 async def list_tools() -> list[Tool]:
     """List all available Great Docs tools."""
     tools = [
@@ -364,7 +380,7 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": (
                             "Base version/ref to compare from (git tag, branch, or commit). "
-                            "Defaults to the previous release tag."
+                            "Without it, the tool lists the current API surface."
                         ),
                     },
                     "head": {
@@ -379,7 +395,7 @@ async def list_tools() -> list[Tool]:
     ]
 
     for tool in tools:
-        schema = tool.inputSchema if _MCP_V1 else tool.input_schema
+        schema = tool.input_schema
         schema["properties"]["config_path"] = {
             "type": "string",
             "description": "Configuration file path. Relative paths use the server's current working directory.",
@@ -402,9 +418,68 @@ class _ToolCallContent(list[TextContent]):
     is_error: bool = False
 
 
-@_handler("call_tool")
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    """Dispatch tool calls to their implementations."""
+async def _argument_errors(name: str, arguments: dict[str, Any]) -> list[str]:
+    """
+    List violations of a tool's input schema
+
+    MCP validates request parameters but does not check tool arguments against
+    the tool's schema. Report argument errors before dispatch so clients receive
+    a failed tool result they can correct. Allow arguments the schema does not
+    declare.
+
+    Parameters
+    ----------
+    name
+        The tool name.
+    arguments
+        The supplied argument names and values.
+
+    Returns
+    -------
+    :
+        One message listing any missing required arguments in schema order,
+        followed by one message per other schema violation. Each later message
+        names the argument or list item, such as `checks` or `checks[1]`.
+        The list is empty for valid arguments or an unknown tool.
+    """
+    schema = next((tool.input_schema for tool in await list_tools() if tool.name == name), None)
+    if schema is None:
+        return []
+    errors: list[str] = []
+    required: list[str] = schema.get("required", [])
+    if missing := [argument for argument in required if argument not in arguments]:
+        errors.append(f"Error: missing required argument: {', '.join(missing)}")
+    for error in Draft202012Validator(schema).iter_errors(arguments):
+        if error.validator == "required" and not error.absolute_path:
+            continue
+        path = "".join(
+            f"[{part}]" if isinstance(part, int) else f".{part}" for part in error.absolute_path
+        )
+        errors.append(f"Error: invalid argument {path.removeprefix('.')}: {error.message}")
+    return errors
+
+
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    """
+    Run a tool and return its text output
+
+    Parameters
+    ----------
+    name
+        The tool name.
+    arguments
+        The supplied argument names and values.
+
+    Returns
+    -------
+    :
+        The tool output. Unknown tools, invalid arguments and handled
+        project errors return error text with `is_error=True`.
+    """
+    if errors := await _argument_errors(name, arguments):
+        result = _ToolCallContent([TextContent(type="text", text="\n".join(errors))])
+        result.is_error = True
+        return result
     try:
         if name == "gd_build":
             return await _handle_build(arguments)
@@ -426,7 +501,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = _ToolCallContent([TextContent(type="text", text=f"Unknown tool: {name}")])
             result.is_error = True
             return result
-    except Exception as e:
+    except _REPORTED_ERRORS as e:
         result = _ToolCallContent([TextContent(type="text", text=f"Error: {e}")])
         result.is_error = True
         return result
@@ -445,14 +520,24 @@ async def _handle_build(arguments: dict) -> list[TextContent]:
     if clean:
         import shutil
 
-        docs._validate_build_outputs()
+        outputs.validate(
+            docs.layout.load_config(),
+            docs.layout,
+        )
         for ver_dir in _sibling_build_dirs(_get_project_root(project_path), _get_layout(arguments)):
             shutil.rmtree(ver_dir)
 
-    # Capture build output
+    # Include the build log in both success and error responses
     output = io.StringIO()
-    with redirect_stdout(output):
-        docs.build()
+    try:
+        with redirect_stdout(output):
+            docs.build()
+    except BuildError as e:
+        result = _ToolCallContent(
+            [TextContent(type="text", text=f"Build failed: {e}\n\n{output.getvalue()}")]
+        )
+        result.is_error = True
+        return result
 
     return [TextContent(type="text", text=f"Build complete.\n\n{output.getvalue()}")]
 
@@ -506,25 +591,23 @@ async def _handle_scan(arguments: dict) -> list[TextContent]:
     project_path = arguments.get("project_path")
     verbose = arguments.get("verbose", False)
 
-    docs = _get_great_docs(project_path, arguments.get("config_path"))
-    package_name = docs._detect_package_name()
-    if not package_name:
+    package_exports = _get_exports(project_path, arguments.get("config_path"))
+    project = package_exports.project
+    importable_name = project.importable_name
+    if not project.name or not importable_name:
         return [TextContent(type="text", text="Error: Could not detect package name.")]
 
-    module_name = docs._detect_module_name()
-    importable_name = module_name or docs._normalize_package_name(package_name)
-
-    exports = docs._get_package_exports(importable_name)
+    exports = package_exports.names(importable_name)
     if not exports:
         return [TextContent(type="text", text="No exports discovered.")]
 
-    categories = docs._categorize_api_objects(importable_name, exports)
+    categories = package_exports.categorise(importable_name, exports)
 
     # Build structured output
     lines = [f"Package: {importable_name}", f"Total exports: {len(exports)}", ""]
 
     # Reference config status
-    reference_config = docs._config.reference
+    reference_config = package_exports.config.reference
     ref_items = set()
     for section in reference_config:
         for item in section.get("contents", []):
@@ -576,7 +659,7 @@ async def _handle_scan(arguments: dict) -> list[TextContent]:
 
 async def _handle_lint(arguments: dict) -> list[TextContent]:
     """Run documentation lint checks."""
-    from ._lint import run_lint
+    from ._checks.lint import run_lint
 
     project_path = arguments.get("project_path")
     checks_arg = arguments.get("checks")
@@ -653,13 +736,13 @@ async def _handle_status(arguments: dict) -> list[TextContent]:
     config_path = layout.config_path
     if config_path.exists():
         lines.append(f"Configuration: {config_path.relative_to(root)} ✓")
-        docs = _get_great_docs(project_path, arguments.get("config_path"))
-        pkg = docs._detect_package_name()
+        exports = _get_exports(project_path, arguments.get("config_path"))
+        pkg = exports.project.name
         if pkg:
             lines.append(f"Package: {pkg}")
 
         # Check features
-        cfg = docs._config
+        cfg = exports.config
         features = []
         if cfg.cli_enabled:
             features.append("CLI docs")
@@ -692,13 +775,16 @@ async def _handle_status(arguments: dict) -> list[TextContent]:
 
 async def _handle_add_page(arguments: dict) -> list[TextContent]:
     """Add a new documentation page."""
+    from yaml12 import format_yaml
+
     project_path = arguments.get("project_path")
     title = arguments["title"]
     section = arguments.get("section", "user_guide")
     filename = arguments.get("filename")
     content = arguments.get("content", "")
 
-    root = _get_layout(arguments).source_dir
+    layout = _get_layout(arguments)
+    root = layout.source_dir
 
     # Derive filename from title if not provided
     if not filename:
@@ -708,7 +794,11 @@ async def _handle_add_page(arguments: dict) -> list[TextContent]:
 
     # Determine target directory
     if section == "user_guide":
-        target_dir = root / "user_guide"
+        config = layout.load_config()
+        # A configured directory that does not exist yet receives the page
+        target_dir = user_guide.find_dir(config, layout, report=lambda _: None) or root / (
+            config.user_guide_dir or "user_guide"
+        )
     elif section == "recipes":
         target_dir = root / "recipes"
     else:
@@ -723,7 +813,7 @@ async def _handle_add_page(arguments: dict) -> list[TextContent]:
     # Build page content
     page_lines = [
         "---",
-        f'title: "{title}"',
+        format_yaml({"title": title}).rstrip(),
         "---",
         "",
     ]
@@ -741,68 +831,105 @@ async def _handle_add_page(arguments: dict) -> list[TextContent]:
     ]
 
 
+def _api_snapshot(
+    project: Project, importable_name: str, root: Path, ref: str | None
+) -> ApiSnapshot | None:
+    """
+    Capture the project's public API from a git ref or the working tree
+
+    Parameters
+    ----------
+    project
+        The documented project.
+    importable_name
+        Importable name of the project's package.
+    root
+        Git repository containing the project.
+    ref
+        Git tag, branch or commit; `None` and `HEAD` select the working tree.
+
+    Returns
+    -------
+    :
+        The snapshot, or `None` when the package source cannot be read at `ref`.
+    """
+    from ._api_evolution.snapshot import snapshot_at_tag, snapshot_from_griffe
+
+    if ref is None or ref.upper() == "HEAD":
+        # Read the project source even when the package is uninstalled.
+        search_paths = [str(path) for path in project.search_paths()]
+        return snapshot_from_griffe(importable_name, version="HEAD", search_paths=search_paths)
+    return snapshot_at_tag(root, ref, importable_name)
+
+
 async def _handle_api_diff(arguments: dict) -> list[TextContent]:
-    """Compare API between versions."""
-    from ._api_diff import ApiSnapshot
+    """
+    List the current public API or compare API snapshots
+
+    Omit both refs to list the working tree's API. Supply `base` to compare
+    that ref with the working tree or an explicit `head` ref.
+
+    Parameters
+    ----------
+    arguments
+        Tool arguments selecting the project and optional `base` and `head` refs.
+
+    Returns
+    -------
+    :
+        MCP text responses containing the API listing, comparison or error message.
+    """
+    from ._api_evolution.compare import diff_snapshots
 
     project_path = arguments.get("project_path")
     base_ref = arguments.get("base")
     head_ref = arguments.get("head")
 
-    docs = _get_great_docs(project_path, arguments.get("config_path"))
-    package_name = docs._detect_package_name()
-    if not package_name:
+    project = _get_exports(project_path, arguments.get("config_path")).project
+    importable_name = project.importable_name
+    if not project.name or not importable_name:
         return [TextContent(type="text", text="Error: Could not detect package name.")]
 
-    module_name = docs._detect_module_name()
-    importable_name = module_name or docs._normalize_package_name(package_name)
+    if not base_ref and head_ref:
+        return [TextContent(type="text", text="Provide a base ref to compare against.")]
 
-    # Take current snapshot
-    current = ApiSnapshot.from_live(importable_name)
-
-    if not base_ref and not head_ref:
-        # Just show current API surface
+    root = _get_layout(arguments).package_root
+    head = _api_snapshot(project, importable_name, root, head_ref)
+    if head is not None and not base_ref:
         lines = [f"Current API surface for {importable_name}:", ""]
-        for symbol in sorted(current.symbols.keys()):
-            info = current.symbols[symbol]
-            lines.append(f"  {info.kind}: {symbol}")
+        for symbol in sorted(head.symbols):
+            lines.append(f"  {head.symbols[symbol].kind}: {symbol}")
         return [TextContent(type="text", text="\n".join(lines))]
 
-    # If base_ref provided, try to compare
-    if base_ref:
-        root = _get_project_root(project_path)
-        base_snapshot_path = root / ".great-docs-snapshots" / f"{base_ref}.json"
-        if base_snapshot_path.exists():
-            base = ApiSnapshot.from_json(base_snapshot_path)
-            diff = base.diff(current)
-            lines = [f"API diff: {base_ref} → {'HEAD' if not head_ref else head_ref}", ""]
-            if diff.added:
-                lines.append(f"Added ({len(diff.added)}):")
-                for s in sorted(diff.added, key=lambda x: x.name):
-                    lines.append(f"  + {s.kind}: {s.name}")
-            if diff.removed:
-                lines.append(f"\nRemoved ({len(diff.removed)}):")
-                for s in sorted(diff.removed, key=lambda x: x.name):
-                    lines.append(f"  - {s.kind}: {s.name}")
-            if diff.changed:
-                lines.append(f"\nChanged ({len(diff.changed)}):")
-                for s in sorted(diff.changed, key=lambda x: x.name):
-                    lines.append(f"  ~ {s.name}: {s.change_type}")
-            if not diff.added and not diff.removed and not diff.changed:
-                lines.append("No API changes detected.")
-            return [TextContent(type="text", text="\n".join(lines))]
-        else:
-            return [
-                TextContent(
-                    type="text",
-                    text=(
-                        f"No snapshot found for '{base_ref}'. "
-                        f"Available: run a build for that version first."
-                    ),
-                )
-            ]
+    base = _api_snapshot(project, importable_name, root, base_ref)
+    if base is None or head is None:
+        ref = base_ref if base is None else head_ref
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    f"Could not build an API snapshot at '{ref}'. Check that the ref exists "
+                    "and the package source is present at it."
+                ),
+            )
+        ]
+    diff = diff_snapshots(base, head)
 
-    return [TextContent(type="text", text="Provide a base ref to compare against.")]
+    lines = [f"API diff: {diff.old_version} → {diff.new_version}"]
+    if diff.added:
+        lines += ["", f"Added ({len(diff.added)}):"]
+        lines.extend(f"  + {change.symbol}" for change in diff.added)
+    if diff.removed:
+        lines += ["", f"Removed ({len(diff.removed)}):"]
+        lines.extend(f"  - {change.symbol}" for change in diff.removed)
+    if diff.changed:
+        lines += ["", f"Changed ({len(diff.changed)}):"]
+        for change in diff.changed:
+            lines.append(f"  ~ {change.symbol}")
+            lines.extend(f"      {detail}" for detail in change.details)
+    if not diff.added and not diff.removed and not diff.changed:
+        lines += ["", "No API changes detected."]
+    return [TextContent(type="text", text="\n".join(lines))]
 
 
 # ---------------------------------------------------------------------------
@@ -810,7 +937,6 @@ async def _handle_api_diff(arguments: dict) -> list[TextContent]:
 # ---------------------------------------------------------------------------
 
 
-@_handler("list_prompts")
 async def list_prompts() -> list[Prompt]:
     """List pre-built prompt templates for documentation workflows."""
     return [
@@ -902,7 +1028,6 @@ async def list_prompts() -> list[Prompt]:
     ]
 
 
-@_handler("get_prompt")
 async def get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptResult:
     """Return the expanded prompt messages for a given prompt template."""
     args = arguments or {}
@@ -1051,7 +1176,6 @@ async def get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptRe
 # ---------------------------------------------------------------------------
 
 
-@_handler("list_resources")
 async def list_resources() -> list[Resource]:
     """List available documentation resources."""
     resources = []
@@ -1126,15 +1250,25 @@ async def list_resources() -> list[Resource]:
     return resources
 
 
-@_handler("read_resource")
-async def read_resource(uri: AnyUrl) -> str:
+async def read_resource(uri: str) -> str:
     """
-    Read a resource with optional project and configuration selection
+    Read a documentation resource from a `gd://` URI
 
-    The `project_path` and `config_path` query parameters follow tool argument
-    semantics. Bare URIs use automatic project configuration discovery.
+    The `project_path` and `config_path` query parameters select the project and
+    configuration as they do for tool calls. Without these parameters, use
+    automatic project configuration discovery.
+
+    Parameters
+    ----------
+    uri
+        The resource URI, including any project and configuration query parameters.
+
+    Returns
+    -------
+    :
+        The resource content or a message describing an unavailable resource.
     """
-    parts = urlsplit(str(uri))
+    parts = urlsplit(uri)
     uri_str = parts._replace(query="").geturl()
     query = parse_qs(parts.query)
     arguments = {name: query[name][0] for name in ("project_path", "config_path") if name in query}
@@ -1158,16 +1292,17 @@ async def read_resource(uri: AnyUrl) -> str:
 
     elif uri_str == "gd://api-surface":
         try:
-            docs = _get_great_docs(arguments.get("project_path"), arguments.get("config_path"))
-            package_name = docs._detect_package_name()
-            if not package_name:
+            package_exports = _get_exports(
+                arguments.get("project_path"), arguments.get("config_path")
+            )
+            project = package_exports.project
+            importable_name = project.importable_name
+            if not project.name or not importable_name:
                 return "Error: Could not detect package name."
-            module_name = docs._detect_module_name()
-            importable_name = module_name or docs._normalize_package_name(package_name)
-            exports = docs._get_package_exports(importable_name)
+            exports = package_exports.names(importable_name)
             if not exports:
                 return f"No exports discovered for {importable_name}."
-            categories = docs._categorize_api_objects(importable_name, exports)
+            categories = package_exports.categorise(importable_name, exports)
 
             lines = [f"Package: {importable_name}", f"Total exports: {len(exports)}", ""]
             for cat_key, label in [
@@ -1187,7 +1322,7 @@ async def read_resource(uri: AnyUrl) -> str:
                         lines.append(f"  - {item}")
                     lines.append("")
             return "\n".join(lines)
-        except Exception as e:
+        except _REPORTED_ERRORS as e:
             return f"Error discovering API surface: {e}"
 
     elif uri_str == "gd://status":
@@ -1204,10 +1339,11 @@ async def read_resource(uri: AnyUrl) -> str:
         # Dynamic reference page resource (from template)
         symbol = uri_str.removeprefix("gd://reference/")
         try:
-            docs = _get_great_docs(arguments.get("project_path"), arguments.get("config_path"))
-            package_name = docs._detect_package_name()
-            module_name = docs._detect_module_name()
-            importable_name = module_name or docs._normalize_package_name(package_name)
+            importable_name = _get_exports(
+                arguments.get("project_path"), arguments.get("config_path")
+            ).project.importable_name
+            if not importable_name:
+                return "Error: Could not detect package name."
             # Try to get docstring for the symbol
             import importlib
 
@@ -1218,7 +1354,7 @@ async def read_resource(uri: AnyUrl) -> str:
             doc = getattr(obj, "__doc__", None) or "No docstring available."
             kind = type(obj).__name__
             return f"# {importable_name}.{symbol}\nKind: {kind}\n\n{doc}"
-        except Exception as e:
+        except _REPORTED_ERRORS as e:
             return f"Error reading reference for '{symbol}': {e}"
 
     elif uri_str.startswith("gd://page/"):
@@ -1238,7 +1374,6 @@ async def read_resource(uri: AnyUrl) -> str:
 # ---------------------------------------------------------------------------
 
 
-@_handler("list_resource_templates")
 async def list_resource_templates() -> list[ResourceTemplate]:
     """List dynamic resource templates."""
     return [
@@ -1282,15 +1417,32 @@ async def list_resource_templates() -> list[ResourceTemplate]:
 # ---------------------------------------------------------------------------
 
 
-@_handler("completion")
 async def handle_completion(
     ref: PromptReference | ResourceTemplateReference,
     argument: CompletionArgument,
-    context: object | None = None,
+    context: CompletionContext | None = None,
 ) -> Completion | None:
-    """Provide auto-completions for prompt arguments and resource template URIs."""
+    """
+    Suggest values for prompt and resource template arguments
+
+    Parameters
+    ----------
+    ref
+        The prompt or resource template to complete.
+    argument
+        The argument name and partial value to complete.
+    context
+        Previously supplied arguments, including any project and configuration
+        selection. Omit to use the default project configuration discovery.
+
+    Returns
+    -------
+    :
+        Matching suggestions, or `None` for an unsupported completion or a
+        handled project error.
+    """
     value = argument.value or ""
-    arguments = getattr(context, "arguments", None) or {}
+    arguments = (context.arguments if context else None) or {}
 
     # Prompt argument completions
     if isinstance(ref, PromptReference):
@@ -1323,14 +1475,16 @@ async def handle_completion(
         if ref.name == "improve-docstrings" and argument.name == "symbol":
             # Complete with actual package symbols
             try:
-                docs = _get_great_docs(arguments.get("project_path"), arguments.get("config_path"))
-                package_name = docs._detect_package_name()
-                module_name = docs._detect_module_name()
-                importable_name = module_name or docs._normalize_package_name(package_name)
-                exports = docs._get_package_exports(importable_name)
+                package_exports = _get_exports(
+                    arguments.get("project_path"), arguments.get("config_path")
+                )
+                importable_name = package_exports.project.importable_name
+                if not importable_name:
+                    return Completion(values=[])
+                exports = package_exports.names(importable_name)
                 filtered = [e for e in exports if value.lower() in e.lower()]
                 return Completion(values=filtered[:20], hasMore=len(filtered) > 20)
-            except Exception:
+            except _REPORTED_ERRORS:
                 return None
 
         if argument.name == "project_path":
@@ -1350,14 +1504,16 @@ async def handle_completion(
     if isinstance(ref, ResourceTemplateReference):
         if "reference" in str(ref.uri) and argument.name == "symbol":
             try:
-                docs = _get_great_docs(arguments.get("project_path"), arguments.get("config_path"))
-                package_name = docs._detect_package_name()
-                module_name = docs._detect_module_name()
-                importable_name = module_name or docs._normalize_package_name(package_name)
-                exports = docs._get_package_exports(importable_name)
+                package_exports = _get_exports(
+                    arguments.get("project_path"), arguments.get("config_path")
+                )
+                importable_name = package_exports.project.importable_name
+                if not importable_name:
+                    return Completion(values=[])
+                exports = package_exports.names(importable_name)
                 filtered = [e for e in exports if value.lower() in e.lower()]
                 return Completion(values=filtered[:20], hasMore=len(filtered) > 20)
-            except Exception:
+            except _REPORTED_ERRORS:
                 return None
 
         if "page" in str(ref.uri) and argument.name == "path":
@@ -1377,94 +1533,95 @@ async def handle_completion(
 
 
 # ---------------------------------------------------------------------------
-# mcp v2: rebuild server with handlers as constructor kwargs
+# Server
 # ---------------------------------------------------------------------------
 
-# On mcp v2 the decorator API is gone; reconstruct the server now that all
-# handler functions have been collected in _V2_HANDLERS.
-if not _MCP_V1 and _V2_HANDLERS:
-    _raw = _V2_HANDLERS
+# MCP validates request parameters before these adapters run. The adapters wrap
+# handler output in protocol result models and preserve tool failure status.
+from mcp.server.context import ServerRequestContext
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    CompleteRequestParams,
+    CompleteResult,
+    GetPromptRequestParams,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
+    ListToolsResult,
+    PaginatedRequestParams,
+    ReadResourceRequestParams,
+    ReadResourceResult,
+    TextResourceContents,
+)
 
-    # mcp v2 handlers must return a typed result model (or dict), not the bare
-    # list/str/Completion the v1 decorator API accepted — the v1 decorators used
-    # to wrap those for us. Wrap each return value in the appropriate result
-    # type so the server speaks valid v2 protocol to real clients.
-    from mcp.types import (
-        CallToolResult,
-        CompleteResult,
-        ListPromptsResult,
-        ListResourcesResult,
-        ListResourceTemplatesResult,
-        ListToolsResult,
-        ReadResourceResult,
-        TextResourceContents,
+
+async def _on_list_tools(
+    ctx: ServerRequestContext, params: PaginatedRequestParams | None
+) -> ListToolsResult:
+    return ListToolsResult(tools=await list_tools())
+
+
+async def _on_call_tool(ctx: ServerRequestContext, params: CallToolRequestParams) -> CallToolResult:
+    content = await call_tool(params.name, params.arguments or {})
+    return CallToolResult(
+        content=list(content),
+        is_error=isinstance(content, _ToolCallContent) and content.is_error,
     )
-    from mcp.types import (
-        Completion as _Completion,
-    )
 
-    async def _on_list_tools(ctx: Any, params: Any = None) -> Any:  # pragma: no cover
-        return ListToolsResult(tools=await _raw["list_tools"]())  # pragma: no cover
 
-    async def _on_call_tool(ctx: Any, params: Any) -> Any:  # pragma: no cover
-        content = await _raw["call_tool"](  # pragma: no cover
-            getattr(params, "name", ""),
-            getattr(params, "arguments", {}) or {},
-        )
-        return CallToolResult(  # pragma: no cover
-            content=list(content or []),
-            is_error=getattr(content, "is_error", False),
-        )
+async def _on_list_prompts(
+    ctx: ServerRequestContext, params: PaginatedRequestParams | None
+) -> ListPromptsResult:
+    return ListPromptsResult(prompts=await list_prompts())
 
-    async def _on_list_prompts(ctx: Any, params: Any = None) -> Any:  # pragma: no cover
-        return ListPromptsResult(prompts=await _raw["list_prompts"]())  # pragma: no cover
 
-    async def _on_get_prompt(ctx: Any, params: Any) -> Any:  # pragma: no cover
-        # The v1 handler already returns a GetPromptResult (a valid v2 model).
-        return await _raw["get_prompt"](  # pragma: no cover
-            getattr(params, "name", ""),
-            getattr(params, "arguments", None),
-        )
+async def _on_get_prompt(
+    ctx: ServerRequestContext, params: GetPromptRequestParams
+) -> GetPromptResult:
+    return await get_prompt(params.name, params.arguments)
 
-    async def _on_list_resources(ctx: Any, params: Any = None) -> Any:  # pragma: no cover
-        return ListResourcesResult(resources=await _raw["list_resources"]())  # pragma: no cover
 
-    async def _on_read_resource(ctx: Any, params: Any) -> Any:  # pragma: no cover
-        uri = getattr(params, "uri", "")  # pragma: no cover
-        text = await _raw["read_resource"](uri)
-        return ReadResourceResult(
-            contents=[TextResourceContents(uri=uri, text=text or "")]
-        )  # pragma: no cover
+async def _on_list_resources(
+    ctx: ServerRequestContext, params: PaginatedRequestParams | None
+) -> ListResourcesResult:
+    return ListResourcesResult(resources=await list_resources())
 
-    async def _on_list_resource_templates(ctx: Any, params: Any = None) -> Any:  # pragma: no cover
-        return ListResourceTemplatesResult(  # pragma: no cover
-            resourceTemplates=await _raw["list_resource_templates"]()
-        )
 
-    async def _on_completion(ctx: Any, params: Any) -> Any:  # pragma: no cover
-        completion = await _raw["completion"](  # pragma: no cover
-            getattr(params, "ref", None),
-            getattr(params, "argument", None),
-        )
-        if completion is None:  # pragma: no cover
-            completion = _Completion(values=[])  # pragma: no cover
-        return CompleteResult(completion=completion)  # pragma: no cover
+async def _on_read_resource(
+    ctx: ServerRequestContext, params: ReadResourceRequestParams
+) -> ReadResourceResult:
+    text = await read_resource(params.uri)
+    return ReadResourceResult(contents=[TextResourceContents(uri=params.uri, text=text)])
 
-    server = Server(
-        name="great-docs",
-        on_list_tools=_on_list_tools,
-        on_call_tool=_on_call_tool,
-        on_list_prompts=_on_list_prompts,
-        on_get_prompt=_on_get_prompt,
-        on_list_resources=_on_list_resources,
-        on_read_resource=_on_read_resource,
-        on_list_resource_templates=_on_list_resource_templates,
-        on_completion=_on_completion,
-    )
-    try:
-        server.instructions = _INSTRUCTIONS
-    except AttributeError:  # pragma: no cover
-        pass  # pragma: no cover
+
+async def _on_list_resource_templates(
+    ctx: ServerRequestContext, params: PaginatedRequestParams | None
+) -> ListResourceTemplatesResult:
+    return ListResourceTemplatesResult(resource_templates=await list_resource_templates())
+
+
+async def _on_completion(
+    ctx: ServerRequestContext, params: CompleteRequestParams
+) -> CompleteResult:
+    completion = await handle_completion(params.ref, params.argument, params.context)
+    if completion is None:
+        completion = Completion(values=[])
+    return CompleteResult(completion=completion)
+
+
+server = Server(
+    name="great-docs",
+    instructions=_INSTRUCTIONS,
+    on_list_tools=_on_list_tools,
+    on_call_tool=_on_call_tool,
+    on_list_prompts=_on_list_prompts,
+    on_get_prompt=_on_get_prompt,
+    on_list_resources=_on_list_resources,
+    on_read_resource=_on_read_resource,
+    on_list_resource_templates=_on_list_resource_templates,
+    on_completion=_on_completion,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1472,16 +1629,13 @@ if not _MCP_V1 and _V2_HANDLERS:
 # ---------------------------------------------------------------------------
 
 
-async def run_mcp_server():  # pragma: no cover
+async def run_mcp_server() -> None:
     """Run the Great Docs MCP server over stdio."""
     async with stdio_server() as (read_stream, write_stream):
-        if _MCP_V1:
-            await server.run(read_stream, write_stream, server.create_initialization_options())
-        else:
-            await server.run(read_stream, write_stream)
+        await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     import asyncio
 
     asyncio.run(run_mcp_server())

@@ -4,18 +4,15 @@ from pathlib import Path
 
 import pytest
 
+from great_docs._project.layout import Layout
 from great_docs._website import social_cards
 from great_docs.config import Config
+from tests.support import write_config
 
 
 @pytest.fixture
 def tmp_project(tmp_path: Path) -> Path:
     return tmp_path
-
-
-def _make_config(tmp_path: Path, yaml_text: str) -> Config:
-    (tmp_path / "great-docs.yml").write_text(yaml_text, encoding="utf-8")
-    return Config(tmp_path)
 
 
 class TestSocialCardsConfig:
@@ -26,27 +23,27 @@ class TestSocialCardsConfig:
         assert cfg.social_cards_enabled is True
 
     def test_enabled_true_shorthand(self, tmp_project: Path):
-        cfg = _make_config(tmp_project, "social_cards: true\n")
+        cfg = write_config(tmp_project, "social_cards: true\n")
         assert cfg.social_cards_enabled is True
 
     def test_disabled_false(self, tmp_project: Path):
-        cfg = _make_config(tmp_project, "social_cards: false\n")
+        cfg = write_config(tmp_project, "social_cards: false\n")
         assert cfg.social_cards_enabled is False
 
     def test_disabled_none(self, tmp_project: Path):
-        cfg = _make_config(tmp_project, "social_cards: null\n")
+        cfg = write_config(tmp_project, "social_cards: null\n")
         assert cfg.social_cards_enabled is False
 
     def test_dict_enabled_true(self, tmp_project: Path):
-        cfg = _make_config(tmp_project, "social_cards:\n  enabled: true\n")
+        cfg = write_config(tmp_project, "social_cards:\n  enabled: true\n")
         assert cfg.social_cards_enabled is True
 
     def test_dict_enabled_false(self, tmp_project: Path):
-        cfg = _make_config(tmp_project, "social_cards:\n  enabled: false\n")
+        cfg = write_config(tmp_project, "social_cards:\n  enabled: false\n")
         assert cfg.social_cards_enabled is False
 
     def test_dict_defaults_to_enabled(self, tmp_project: Path):
-        cfg = _make_config(tmp_project, "social_cards:\n  image: assets/og.png\n")
+        cfg = write_config(tmp_project, "social_cards:\n  image: assets/og.png\n")
         assert cfg.social_cards_enabled is True
 
     def test_image_default_none(self, tmp_project: Path):
@@ -54,7 +51,7 @@ class TestSocialCardsConfig:
         assert cfg.social_cards_image is None
 
     def test_image_custom(self, tmp_project: Path):
-        cfg = _make_config(tmp_project, "social_cards:\n  image: assets/social.png\n")
+        cfg = write_config(tmp_project, "social_cards:\n  image: assets/social.png\n")
         assert cfg.social_cards_image == "assets/social.png"
 
     def test_twitter_card_default_none(self, tmp_project: Path):
@@ -62,7 +59,7 @@ class TestSocialCardsConfig:
         assert cfg.social_cards_twitter_card is None
 
     def test_twitter_card_custom(self, tmp_project: Path):
-        cfg = _make_config(
+        cfg = write_config(
             tmp_project,
             "social_cards:\n  twitter_card: summary\n",
         )
@@ -73,14 +70,14 @@ class TestSocialCardsConfig:
         assert cfg.social_cards_twitter_site is None
 
     def test_twitter_site_custom(self, tmp_project: Path):
-        cfg = _make_config(
+        cfg = write_config(
             tmp_project,
             'social_cards:\n  twitter_site: "@myhandle"\n',
         )
         assert cfg.social_cards_twitter_site == "@myhandle"
 
     def test_shorthand_true_image_is_none(self, tmp_project: Path):
-        cfg = _make_config(tmp_project, "social_cards: true\n")
+        cfg = write_config(tmp_project, "social_cards: true\n")
         assert cfg.social_cards_image is None
         assert cfg.social_cards_twitter_site is None
 
@@ -96,7 +93,7 @@ class TestRegister:
         assert quarto["website"] == {"open-graph": True, "twitter-card": True}
 
     def test_image_and_twitter_options(self, tmp_path: Path):
-        config = _make_config(
+        config = write_config(
             tmp_path, "social_cards:\n  twitter_site: myhandle\n  twitter_card: summary\n"
         )
         quarto: dict = {"website": {"title": "Pkg"}}
@@ -108,7 +105,7 @@ class TestRegister:
         }
 
     def test_keeps_an_at_sign(self, tmp_path: Path):
-        config = _make_config(tmp_path, 'social_cards:\n  twitter_site: "@myhandle"\n')
+        config = write_config(tmp_path, 'social_cards:\n  twitter_site: "@myhandle"\n')
         quarto: dict = {}
         social_cards.register(quarto, config, None, tmp_path)
         assert quarto["website"]["twitter-card"] == {"site": "@myhandle"}
@@ -116,13 +113,13 @@ class TestRegister:
     def test_disabled(self, tmp_path: Path):
         quarto: dict = {}
         social_cards.register(
-            quarto, _make_config(tmp_path, "social_cards: false\n"), None, tmp_path
+            quarto, write_config(tmp_path, "social_cards: false\n"), None, tmp_path
         )
         assert quarto == {}
 
     def test_independent_of_seo(self, tmp_path: Path):
         quarto: dict = {}
-        config = _make_config(tmp_path, "seo:\n  enabled: false\n")
+        config = write_config(tmp_path, "seo:\n  enabled: false\n")
         social_cards.register(quarto, config, None, tmp_path)
         assert quarto["website"]["open-graph"] is True
 
@@ -148,7 +145,7 @@ class TestAddToRawPage:
     def _add(self, tmp_path: Path, page: str, yaml: str = "", **kwargs) -> str:
         options = {"site_name": "Pkg", "default": "Default", "url": None, "image_url": None}
         options.update(kwargs)
-        return social_cards.add_to_raw_page(page, _make_config(tmp_path, yaml), **options)
+        return social_cards.add_to_raw_page(page, write_config(tmp_path, yaml), **options)
 
     def test_takes_the_page_title_and_description(self, tmp_path: Path):
         page = self.HEAD.format(
@@ -184,3 +181,51 @@ class TestAddToRawPage:
     def test_disabled(self, tmp_path: Path):
         page = self.HEAD.format("")
         assert self._add(tmp_path, page, "social_cards: false\n") == page
+
+
+class TestPublishImage:
+    """The default card image, copied to the site root and addressed there"""
+
+    def _publish(
+        self, root: Path, image: str | None, base_url: str | None = None
+    ) -> tuple[str | None, Path, list[str]]:
+        config = write_config(root, {"social_cards": {"image": image}} if image else "")
+        layout = Layout.make(root)
+        warnings: list[str] = []
+        url = social_cards.publish_image(config, layout, base_url, report=warnings.append)
+        return url, layout.build_dir, warnings
+
+    def test_without_an_image(self, tmp_path: Path):
+        url, _, warnings = self._publish(tmp_path, None)
+        assert url is None
+        assert warnings == []
+
+    def test_keeps_an_image_url(self, tmp_path: Path):
+        url, build_dir, _ = self._publish(tmp_path, "https://cdn.test/card.png")
+        assert url == "https://cdn.test/card.png"
+        assert not build_dir.exists()
+
+    def test_copies_a_local_image_under_the_base_url(self, tmp_path: Path):
+        (tmp_path / "assets").mkdir()
+        (tmp_path / "assets" / "card.png").write_bytes(b"png")
+
+        url, build_dir, warnings = self._publish(
+            tmp_path, "assets/card.png?v=2", "https://docs.test/pkg/"
+        )
+
+        assert url == "https://docs.test/pkg/card.png?v=2"
+        assert (build_dir / "card.png").read_bytes() == b"png"
+        assert warnings == []
+
+    def test_addresses_a_local_image_from_the_site_root_without_a_base_url(self, tmp_path: Path):
+        (tmp_path / "card.png").write_bytes(b"png")
+
+        url, _, _ = self._publish(tmp_path, "card.png")
+
+        assert url == "card.png"
+
+    def test_warns_about_a_missing_local_image(self, tmp_path: Path):
+        url, _, warnings = self._publish(tmp_path, "assets/missing.png")
+
+        assert url is None
+        assert warnings == ["Social card image not found: assets/missing.png"]

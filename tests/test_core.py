@@ -4,16 +4,42 @@
 from __future__ import annotations
 
 import importlib
+import io
 import sys
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import click
+import griffe
 import pytest
-import requests
+import yaml
 
 from great_docs import GreatDocs
+from great_docs._build import freeze, site
+from great_docs._cliref import click as cli_click
+from great_docs._cliref import render as cli_render
+from great_docs._contribution import Contribution, NavbarLink, Sidebar
+from great_docs._mcpref import build as mcp_build
+from great_docs._reference import block as reference_block
+from great_docs._reference.discovery import (
+    categorise_references,
+    discover_exports,
+    empty_categories,
+)
+from great_docs._reference.exports import Exports
+from great_docs._utils import QUARTO_YML_HEADER
+from great_docs._website.seo import robots
+from tests.support import (
+    StubRemote,
+    custom_pages_step,
+    discover_user_guide,
+    freeze_cache_step,
+    make_exports,
+    make_project,
+    make_run,
+    mock_config,
+)
 
 
 def _make_gd(tmp_path: Path) -> GreatDocs:
@@ -22,109 +48,51 @@ def _make_gd(tmp_path: Path) -> GreatDocs:
     return GreatDocs(project_path=str(tmp_path))
 
 
+def _put_on_github(root: Path) -> None:
+    """
+    Declare the project's repository as `acme/mypkg` on GitHub in its `pyproject.toml`
+
+    Parameters
+    ----------
+    root
+        The project directory.
+    """
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "mypkg"\n\n[project.urls]\n'
+        'Repository = "https://github.com/acme/mypkg"\n',
+        encoding="utf-8",
+    )
+
+
 def _patch_cfg(monkeypatch, gd, name, value):
     """Patch a Config property on the class so the instance returns *value*."""
     monkeypatch.setattr(type(gd._config), name, property(lambda self: value))
 
 
-class TestFetchGithubRepoStats:
-    """Cover _fetch_github_repo_stats auth header and response paths."""
+class TestFindCommand:
+    """
+    Command discovery with configured names and fallback searches
+    """
 
-    def test_success_with_token(self, tmp_path, monkeypatch):
-        """Token is used and success data returned."""
-        gd = _make_gd(tmp_path)
-        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test123")
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {"stargazers_count": 42, "forks_count": 7}
-
-        monkeypatch.setattr(requests, "get", lambda *a, **kw: mock_resp)
-
-        result = gd._fetch_github_repo_stats("posit-dev", "great-docs")
-        assert result == {"stars": 42, "forks": 7}
-
-    def test_request_exception_returns_empty(self, tmp_path, monkeypatch):
-        """RequestException is swallowed, returns {}."""
-        gd = _make_gd(tmp_path)
-        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        monkeypatch.delenv("GH_TOKEN", raising=False)
-
-        def raise_exc(*a, **kw):
-            raise requests.RequestException("network error")
-
-        monkeypatch.setattr(requests, "get", raise_exc)
-
-        result = gd._fetch_github_repo_stats("owner", "repo")
-        assert result == {}
-
-    def test_non_200_returns_empty(self, tmp_path, monkeypatch):
-        """Non-200 status code returns empty dict."""
-        gd = _make_gd(tmp_path)
-        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        monkeypatch.delenv("GH_TOKEN", raising=False)
-
-        mock_resp = MagicMock()
-        mock_resp.status_code = 404
-
-        monkeypatch.setattr(requests, "get", lambda *a, **kw: mock_resp)
-
-        result = gd._fetch_github_repo_stats("owner", "repo")
-        assert result == {}
-
-
-class TestFindClickCliObj:
-    """Cover all branches of _find_click_cli_obj."""
-
-    def test_cli_not_enabled_returns_none(self, tmp_path, monkeypatch):
-        """cli_enabled=False returns None."""
-        gd = _make_gd(tmp_path)
-        monkeypatch.setattr(gd, "_get_package_metadata", lambda: {"cli_enabled": False})
-        assert gd._find_click_cli_obj("mypkg") is None
-
-    def test_click_not_installed_returns_none(self, tmp_path, monkeypatch):
-        """ImportError on click returns None."""
-        gd = _make_gd(tmp_path)
-        monkeypatch.setattr(gd, "_get_package_metadata", lambda: {"cli_enabled": True})
-
-        import sys
-
-        click_mod = sys.modules.pop("click", None)
-        click_testing = sys.modules.pop("click.testing", None)
-        click_keys = [k for k in sys.modules if k.startswith("click")]
-        hidden = {k: sys.modules.pop(k) for k in click_keys}
-        try:
-            with patch("builtins.__import__", side_effect=ImportError("no click")):
-                result = gd._find_click_cli_obj("mypkg")
-            assert result is None
-        finally:
-            if click_mod:
-                sys.modules["click"] = click_mod
-            if click_testing:
-                sys.modules["click.testing"] = click_testing
-            sys.modules.update(hidden)
-
-    def test_no_cli_module_auto_discovers(self, tmp_path, monkeypatch):
-        """auto-discovers CLI module from common names."""
-        gd = _make_gd(tmp_path)
-        monkeypatch.setattr(gd, "_get_package_metadata", lambda: {"cli_enabled": True})
-
+    def test_no_cli_module_auto_discovers(self, tmp_path):
+        """
+        Return `None` when no candidate CLI module can be imported
+        """
         real_import = importlib.import_module
 
         def fail_import(name, *args, **kwargs):
             if name in ("mypkg.cli", "mypkg.__main__", "mypkg.main"):
-                raise ImportError(f"no module {name}")
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
             return real_import(name, *args, **kwargs)
 
         with patch("importlib.import_module", side_effect=fail_import):
-            result = gd._find_click_cli_obj("mypkg")
+            result = cli_click.find_command("mypkg", tmp_path, cli_module=None, cli_name=None)
         assert result is None
 
-    def test_auto_discovers_module_with_click_obj(self, tmp_path, monkeypatch):
-        """finds a module with a Click command."""
-        gd = _make_gd(tmp_path)
-        monkeypatch.setattr(gd, "_get_package_metadata", lambda: {"cli_enabled": True})
-
+    def test_auto_discovers_module_with_click_obj(self, tmp_path):
+        """
+        Find a candidate module containing a Click command
+        """
         fake_mod = types.ModuleType("mypkg.cli")
         fake_cmd = click.Command("test")
         fake_mod.cli = fake_cmd
@@ -137,18 +105,13 @@ class TestFindClickCliObj:
             return real_import(name, *args, **kwargs)
 
         with patch("importlib.import_module", side_effect=mock_import):
-            result = gd._find_click_cli_obj("mypkg")
-        assert result is fake_cmd
+            result = cli_click.find_command("mypkg", tmp_path, cli_module=None, cli_name=None)
+        assert result.command is fake_cmd
 
-    def test_explicit_cli_module_import_fails(self, tmp_path, monkeypatch):
-        """explicit cli_module can't be imported returns None."""
-        gd = _make_gd(tmp_path)
-        monkeypatch.setattr(
-            gd,
-            "_get_package_metadata",
-            lambda: {"cli_enabled": True, "cli_module": "mypkg.custom_cli"},
-        )
-
+    def test_explicit_cli_module_import_fails(self, tmp_path):
+        """
+        Return `None` when the configured CLI module cannot be imported
+        """
         real_import = importlib.import_module
 
         def mock_import(name, *args, **kwargs):
@@ -157,21 +120,18 @@ class TestFindClickCliObj:
             return real_import(name, *args, **kwargs)
 
         with patch("importlib.import_module", side_effect=mock_import):
-            result = gd._find_click_cli_obj("mypkg")
+            result = cli_click.find_command(
+                "mypkg", tmp_path, cli_module="mypkg.custom_cli", cli_name=None
+            )
         assert result is None
 
-    def test_explicit_cli_name_found(self, tmp_path, monkeypatch):
-        """metadata has cli_name and it's found."""
-        gd = _make_gd(tmp_path)
+    def test_explicit_cli_name_found(self, tmp_path):
+        """
+        Find the command named by `cli.name`
+        """
         fake_mod = types.ModuleType("mypkg.custom_cli")
         fake_cmd = click.Command("mycmd")
         fake_mod.mycmd = fake_cmd
-
-        monkeypatch.setattr(
-            gd,
-            "_get_package_metadata",
-            lambda: {"cli_enabled": True, "cli_module": "mypkg.custom_cli", "cli_name": "mycmd"},
-        )
 
         real_import = importlib.import_module
 
@@ -181,22 +141,19 @@ class TestFindClickCliObj:
             return real_import(name, *args, **kwargs)
 
         with patch("importlib.import_module", side_effect=mock_import):
-            result = gd._find_click_cli_obj("mypkg")
-        assert result is fake_cmd
+            result = cli_click.find_command(
+                "mypkg", tmp_path, cli_module="mypkg.custom_cli", cli_name="mycmd"
+            )
+        assert result.command is fake_cmd
 
-    def test_common_attr_names_found(self, tmp_path, monkeypatch):
-        """finds click obj via common attr names (cli/main/app)."""
-        gd = _make_gd(tmp_path)
+    def test_common_attr_names_found(self, tmp_path):
+        """
+        Find a command under a conventional attribute name
+        """
         fake_mod = types.ModuleType("mypkg.cli_mod")
         fake_group = click.Group("main")
         fake_mod.main = fake_group
 
-        monkeypatch.setattr(
-            gd,
-            "_get_package_metadata",
-            lambda: {"cli_enabled": True, "cli_module": "mypkg.cli_mod"},
-        )
-
         real_import = importlib.import_module
 
         def mock_import(name, *args, **kwargs):
@@ -205,22 +162,19 @@ class TestFindClickCliObj:
             return real_import(name, *args, **kwargs)
 
         with patch("importlib.import_module", side_effect=mock_import):
-            result = gd._find_click_cli_obj("mypkg")
-        assert result is fake_group
+            result = cli_click.find_command(
+                "mypkg", tmp_path, cli_module="mypkg.cli_mod", cli_name=None
+            )
+        assert result.command is fake_group
 
-    def test_scan_all_attrs_fallback(self, tmp_path, monkeypatch):
-        """scans all module attrs to find click command."""
-        gd = _make_gd(tmp_path)
+    def test_scan_all_attrs_fallback(self, tmp_path):
+        """
+        Find a command under a non-standard public attribute name
+        """
         fake_mod = types.ModuleType("mypkg.cli_mod")
         fake_cmd = click.Command("hidden_cmd")
         fake_mod.my_special_command = fake_cmd
 
-        monkeypatch.setattr(
-            gd,
-            "_get_package_metadata",
-            lambda: {"cli_enabled": True, "cli_module": "mypkg.cli_mod"},
-        )
-
         real_import = importlib.import_module
 
         def mock_import(name, *args, **kwargs):
@@ -229,21 +183,18 @@ class TestFindClickCliObj:
             return real_import(name, *args, **kwargs)
 
         with patch("importlib.import_module", side_effect=mock_import):
-            result = gd._find_click_cli_obj("mypkg")
-        assert result is fake_cmd
+            result = cli_click.find_command(
+                "mypkg", tmp_path, cli_module="mypkg.cli_mod", cli_name=None
+            )
+        assert result.command is fake_cmd
 
-    def test_no_click_obj_found_returns_none(self, tmp_path, monkeypatch):
-        """no Click object found at all returns None."""
-        gd = _make_gd(tmp_path)
+    def test_no_click_obj_found_returns_none(self, tmp_path):
+        """
+        Return `None` when the module contains no command
+        """
         fake_mod = types.ModuleType("mypkg.cli_mod")
         fake_mod.something = "not a click command"
 
-        monkeypatch.setattr(
-            gd,
-            "_get_package_metadata",
-            lambda: {"cli_enabled": True, "cli_module": "mypkg.cli_mod"},
-        )
-
         real_import = importlib.import_module
 
         def mock_import(name, *args, **kwargs):
@@ -252,7 +203,113 @@ class TestFindClickCliObj:
             return real_import(name, *args, **kwargs)
 
         with patch("importlib.import_module", side_effect=mock_import):
-            result = gd._find_click_cli_obj("mypkg")
+            result = cli_click.find_command(
+                "mypkg", tmp_path, cli_module="mypkg.cli_mod", cli_name=None
+            )
+        assert result is None
+
+    @pytest.mark.parametrize("candidate", ["console", "commands"])
+    def test_finds_command_in_late_candidate_module(self, tmp_path, candidate):
+        """
+        Find a command in `console` or `commands`, matching reference page discovery
+        """
+        fake_mod = types.ModuleType(f"mypkg.{candidate}")
+        fake_cmd = click.Command("tool")
+        fake_mod.cli = fake_cmd
+
+        def mock_import(name, *args, **kwargs):
+            if name == f"mypkg.{candidate}":
+                return fake_mod
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+
+        with patch("importlib.import_module", side_effect=mock_import):
+            result = cli_click.find_command("mypkg", tmp_path, cli_module=None, cli_name=None)
+        assert result.command is fake_cmd
+
+    def test_candidate_that_exits_on_import_is_skipped(self, tmp_path):
+        """
+        Skip a `__main__` that runs its command on import and search the next candidate
+        """
+        fake_mod = types.ModuleType("mypkg.main")
+        fake_cmd = click.Command("tool")
+        fake_mod.cli = fake_cmd
+
+        def mock_import(name, *args, **kwargs):
+            if name == "mypkg.__main__":
+                # An unguarded `cli()` makes Click parse the build's argv and exit.
+                raise SystemExit(2)
+            if name == "mypkg.main":
+                return fake_mod
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+
+        with patch("importlib.import_module", side_effect=mock_import):
+            result = cli_click.find_command("mypkg", tmp_path, cli_module=None, cli_name=None)
+        assert result.command is fake_cmd
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ModuleNotFoundError("No module named 'requests'", name="requests"),
+            ImportError("cannot import name 'run' from 'mypkg.core'"),
+            SyntaxError("invalid syntax"),
+        ],
+    )
+    def test_candidate_that_fails_on_import_raises(self, tmp_path, error):
+        """
+        Name the failing candidate in `ImportError` and preserve the original cause
+        """
+        real_import = importlib.import_module
+
+        def mock_import(name, *args, **kwargs):
+            if name == "mypkg.cli":
+                raise error
+            return real_import(name, *args, **kwargs)
+
+        with (
+            patch("importlib.import_module", side_effect=mock_import),
+            pytest.raises(ImportError, match="mypkg.cli") as raised,
+        ):
+            cli_click.find_command("mypkg", tmp_path, cli_module=None, cli_name=None)
+        assert raised.value.__cause__ is error
+
+    def test_configured_module_that_exits_on_import_finds_none(self, tmp_path):
+        """
+        Report a configured CLI module that exits on import instead of ending the build
+        """
+        lines: list[str] = []
+
+        def mock_import(name, *args, **kwargs):
+            raise SystemExit(2)
+
+        with patch("importlib.import_module", side_effect=mock_import):
+            result = cli_click.find_command(
+                "mypkg", tmp_path, cli_module="mypkg.__main__", cli_name=None, report=lines.append
+            )
+        assert result is None
+        assert lines == [
+            "Could not import CLI module mypkg.__main__: "
+            "importing mypkg.__main__ exited with status 2"
+        ]
+
+    def test_cli_name_naming_a_non_command_finds_none(self, tmp_path):
+        """
+        Return no command when `cli.name` names a non-command despite another command in the module
+        """
+        fake_mod = types.ModuleType("mypkg.custom_cli")
+        fake_mod.helper = "not a command"
+        fake_mod.cli = click.Command("other")
+
+        real_import = importlib.import_module
+
+        def mock_import(name, *args, **kwargs):
+            if name == "mypkg.custom_cli":
+                return fake_mod
+            return real_import(name, *args, **kwargs)
+
+        with patch("importlib.import_module", side_effect=mock_import):
+            result = cli_click.find_command(
+                "mypkg", tmp_path, cli_module="mypkg.custom_cli", cli_name="helper"
+            )
         assert result is None
 
 
@@ -315,13 +372,13 @@ def _build_mcp_candidates(gd: GreatDocs, monkeypatch: pytest.MonkeyPatch) -> lis
         imported.append(name)
         return real_import(name, package)
 
-    def stop_build() -> None:
+    def stop_build(*args: object, **kwargs: object) -> None:
         raise McpStepPassed
 
-    monkeypatch.setattr("great_docs.core._ensure_quarto_installed", lambda: None)
+    monkeypatch.setattr("great_docs._build.quarto.ensure_installed", lambda: None)
     monkeypatch.setattr(importlib, "import_module", record_import)
     # The user guide is the first step after MCP discovery.
-    monkeypatch.setattr(gd, "_process_user_guide", stop_build)
+    monkeypatch.setattr("great_docs._build.content.user_guide", stop_build)
     with pytest.raises(McpStepPassed):
         gd.build(refresh=False)
 
@@ -341,7 +398,7 @@ class TestDiscoverMcpServer:
         candidates = _build_mcp_candidates(gd, monkeypatch)
 
         assert candidates == ["mypkgxyz.mcp", "mypkgxyz.mcp_server", "mypkgxyz.server"]
-        assert not (gd.build_dir / "reference" / "mcp").exists()
+        assert not (gd.layout.build_dir / "reference" / "mcp").exists()
 
     def test_build_tries_configured_module_without_package_name(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -353,13 +410,8 @@ class TestDiscoverMcpServer:
         (tmp_path / "great-docs.yml").write_text("module: mypkgxyz\n", encoding="utf-8")
         gd = GreatDocs(project_path=str(tmp_path))
         # Two package directories and no `pyproject.toml` leave the package name undetected.
-        assert gd._detect_package_name() is None
+        assert make_project(gd).name is None
 
-        def no_terminal(prompt: str) -> str:
-            raise EOFError
-
-        # Closed standard input keeps the package-name prompt from blocking the test.
-        monkeypatch.setattr("builtins.input", no_terminal)
         candidates = _build_mcp_candidates(gd, monkeypatch)
 
         assert candidates == ["mypkgxyz.mcp", "mypkgxyz.mcp_server", "mypkgxyz.server"]
@@ -376,9 +428,11 @@ class TestDiscoverMcpServer:
 
         with (
             patch.dict(sys.modules),
-            patch("great_docs._mcp_docs.discover_mcp_server", return_value=server_info) as discover,
+            patch(
+                "great_docs._mcpref.reference.discover_mcp_server", return_value=server_info
+            ) as discover,
         ):
-            result = gd._discover_mcp_server("mypkgxyz")
+            result = mcp_build.discover_server(gd._config, "mypkgxyz")
 
         assert result == server_info
         discover.assert_called_once_with(module_path=f"mypkgxyz.{module}", server_var=None)
@@ -391,9 +445,11 @@ class TestDiscoverMcpServer:
 
         with (
             patch.dict(sys.modules),
-            patch("great_docs._mcp_docs.discover_mcp_server", return_value=None) as discover,
+            patch(
+                "great_docs._mcpref.reference.discover_mcp_server", return_value=None
+            ) as discover,
         ):
-            gd._discover_mcp_server("mypkgxyz")
+            mcp_build.discover_server(gd._config, "mypkgxyz")
 
         discover.assert_called_once_with(module_path="elsewhere.tools", server_var=None)
 
@@ -401,248 +457,123 @@ class TestDiscoverMcpServer:
         """With no package and no `mcp.module`, discovery introspects nothing and returns `None`"""
         gd = _make_root_project(tmp_path)
 
-        with patch("great_docs._mcp_docs.discover_mcp_server") as discover:
-            result = gd._discover_mcp_server(None)
+        with patch("great_docs._mcpref.reference.discover_mcp_server") as discover:
+            result = mcp_build.discover_server(gd._config, None)
 
         assert result is None
         discover.assert_not_called()
 
 
-class TestUpdateSidebarWithMcp:
-    """Cover _update_sidebar_with_mcp branching."""
-
-    def test_empty_mcp_files_returns_early(self, tmp_path):
-        """empty list returns immediately."""
+class TestBuildMcpReference:
+    def test_passes_metadata_and_language(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        quarto_yml = gd.build_dir / "_quarto.yml"
-        quarto_yml.write_text("website:\n  sidebar: []\n", encoding="utf-8")
-        gd._update_sidebar_with_mcp([])
-        content = quarto_yml.read_text()
-        assert "mcp-reference" not in content
+        gd._config._config["site"]["lang"] = "fr"
+        gd._config._config["site_url"] = "https://example.org"
+        pages: dict[str, object] = {}
+        manifest: dict[str, object] = {}
 
-    def test_no_quarto_yml_returns_early(self, tmp_path):
-        """no _quarto.yml returns."""
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        gd._update_sidebar_with_mcp(["reference/mcp/tools.qmd"])
+        def fake_pages(**kwargs):
+            pages.update(kwargs)
+            return ["reference/mcp/tool.qmd"]
 
-    def test_adds_mcp_section_to_sidebar(self, tmp_path, monkeypatch):
-        """creates MCP section in sidebar and writes."""
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        quarto_yml = gd.build_dir / "_quarto.yml"
-        quarto_yml.write_text(
-            "website:\n  sidebar:\n    - id: api-reference\n      contents: []\n",
-            encoding="utf-8",
+        def fake_manifest(**kwargs):
+            manifest.update(kwargs)
+
+        monkeypatch.setattr("great_docs._mcpref.reference.generate_mcp_reference_pages", fake_pages)
+        monkeypatch.setattr("great_docs._mcpref.reference.generate_mcp_manifest", fake_manifest)
+        server = {"name": "test", "tools": []}
+
+        files = mcp_build.build_mcp_reference(
+            gd._config, server, gd.layout, "mypkg", "https://github.com/owner/repo"
         )
 
-        written = {}
+        assert files == ["reference/mcp/tool.qmd"]
+        assert pages["language"] == "fr"
+        assert manifest["package_name"] == "mypkg"
+        assert manifest["repo_url"] == "https://github.com/owner/repo"
+        assert manifest["site_url"] == "https://example.org"
+        assert manifest["server_info"] == server
 
-        def fake_write(path, config):
-            written["config"] = config
 
-        monkeypatch.setattr(gd, "_write_quarto_yml", fake_write)
+class TestMcpContribution:
+    def test_index_link_precedes_the_pages(self):
+        contribution = mcp_build.contribution(mock_config(lang="en"), ["reference/mcp/tool.qmd"])
 
-        mcp_files = ["reference/mcp/tools.qmd", "reference/mcp/resources.qmd"]
-        gd._update_sidebar_with_mcp(mcp_files)
-
-        assert "config" in written
-        sidebar = written["config"]["website"]["sidebar"]
-        mcp_section = next(s for s in sidebar if s.get("id") == "mcp-reference")
-        assert "MCP Reference" in mcp_section["title"]
-
-    def test_updates_existing_mcp_section(self, tmp_path, monkeypatch):
-        """existing mcp-reference section gets updated."""
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        quarto_yml = gd.build_dir / "_quarto.yml"
-        quarto_yml.write_text(
-            "website:\n  sidebar:\n    - id: mcp-reference\n      title: MCP Reference\n      contents:\n        - old.qmd\n",
-            encoding="utf-8",
+        assert contribution == Contribution(
+            sidebars=(
+                Sidebar(
+                    id="mcp-reference",
+                    title="MCP Reference",
+                    contents=(
+                        {"text": "MCP Index", "href": "reference/mcp/index.qmd"},
+                        "reference/mcp/tool.qmd",
+                    ),
+                ),
+            )
         )
 
-        written = {}
+    def test_translated_site_labels_the_index_with_the_title(self):
+        (sidebar,) = mcp_build.contribution(mock_config(lang="fr"), []).sidebars
 
-        def fake_write(path, config):
-            written["config"] = config
-
-        monkeypatch.setattr(gd, "_write_quarto_yml", fake_write)
-
-        new_files = ["new-tools.qmd"]
-        gd._update_sidebar_with_mcp(new_files)
-
-        sidebar = written["config"]["website"]["sidebar"]
-        mcp_section = next(s for s in sidebar if s.get("id") == "mcp-reference")
-        assert mcp_section["contents"] == new_files
-
-    def test_creates_website_and_sidebar_keys(self, tmp_path, monkeypatch):
-        """creates website.sidebar when absent."""
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        quarto_yml = gd.build_dir / "_quarto.yml"
-        quarto_yml.write_text("project:\n  type: website\n", encoding="utf-8")
-
-        written = {}
-
-        def fake_write(path, config):
-            written["config"] = config
-
-        monkeypatch.setattr(gd, "_write_quarto_yml", fake_write)
-
-        gd._update_sidebar_with_mcp(["tool.qmd"])
-
-        assert "website" in written["config"]
-        assert "sidebar" in written["config"]["website"]
+        assert sidebar.title == "Référence MCP"
+        assert sidebar.contents == ({"text": "Référence MCP", "href": "reference/mcp/index.qmd"},)
 
 
-class TestGenerateMcpManifest:
-    """Cover _generate_mcp_manifest orchestration."""
+class TestCliContribution:
+    def test_sidebar_and_reference_link(self):
+        items = [{"text": "CLI Index", "href": "reference/cli/index.qmd"}, "reference/cli/app.qmd"]
 
-    def test_calls_generate_mcp_manifest(self, tmp_path, monkeypatch):
-        """Gathers metadata and calls generate_mcp_manifest."""
-        gd = _make_gd(tmp_path)
-        monkeypatch.setattr(gd, "_detect_package_name", lambda: "mypkg")
-        monkeypatch.setattr(
-            gd,
-            "_get_github_repo_info",
-            lambda: ("posit-dev", "mypkg", "https://github.com/posit-dev/mypkg"),
+        contribution = cli_render.contribution(mock_config(lang="en"), items)
+
+        assert contribution == Contribution(
+            navbar=(NavbarLink("Reference", "reference/cli/index.qmd"),),
+            sidebars=(Sidebar("cli-reference", "CLI Reference", tuple(items)),),
         )
-        gd._config._config["site_url"] = "https://mypkg.readthedocs.io"
 
-        called_with = {}
+    def test_configured_title_names_the_sidebar(self):
+        config = mock_config(lang="fr", cli_title="Commandes")
 
-        def fake_gen(**kwargs):
-            called_with.update(kwargs)
+        (sidebar,) = cli_render.contribution(config, ["reference/cli/app.qmd"]).sidebars
 
-        with patch("great_docs.core.generate_mcp_manifest", create=True):
-            monkeypatch.setattr("great_docs._mcp_docs.generate_mcp_manifest", fake_gen)
-            gd._generate_mcp_manifest({"name": "test", "tools": []})
-
-        assert called_with["package_name"] == "mypkg"
-        assert called_with["repo_url"] == "https://github.com/posit-dev/mypkg"
-        assert called_with["site_url"] == "https://mypkg.readthedocs.io"
-        assert called_with["server_info"] == {"name": "test", "tools": []}
+        assert sidebar.title == "Commandes"
 
 
-class TestReorderNavbar:
-    """Cover _reorder_navbar edge case."""
-
-    def test_empty_navbar_left_returns_early(self, tmp_path, monkeypatch):
-        """Navbar left is empty returns early."""
-        gd = _make_gd(tmp_path)
-        monkeypatch.setattr(
-            type(gd._config), "navbar_order", property(lambda self: ["Reference", "API"])
-        )
-        config = {"website": {"navbar": {"left": []}}}
-        gd._reorder_navbar(config)
-
-        assert config["website"]["navbar"]["left"] == []
-
-
-class TestRemoveMcpFromRefSections:
-    """Cover _remove_mcp_from_ref_sections branching."""
-
-    def test_no_quarto_yml_returns_early(self, tmp_path):
-        """No _quarto.yml file returns immediately."""
-        gd = _make_gd(tmp_path)
-        gd.build_dir = tmp_path / "subdir"
-        gd.build_dir.mkdir()
-        gd._remove_mcp_from_ref_sections()
-
-    def test_no_ref_sections_script_no_update(self, tmp_path, monkeypatch):
-        """include-in-header has no data-gd-ref-sections so no write happens."""
-        gd = _make_gd(tmp_path)
-        gd.build_dir = tmp_path
-        quarto_yml = tmp_path / "_quarto.yml"
-        quarto_yml.write_text(
-            "format:\n  html:\n    include-in-header:\n      - text: 'unrelated'\n",
-            encoding="utf-8",
-        )
-        written = []
-        monkeypatch.setattr(gd, "_write_quarto_yml", lambda p, c: written.append(c))
-        gd._remove_mcp_from_ref_sections()
-        assert written == []
-
-    def test_removes_mcp_from_multi_section_list(self, tmp_path, monkeypatch):
-        """Sections 'api,cli,mcp' becomes 'api,cli', script kept."""
-        gd = _make_gd(tmp_path)
-        gd.build_dir = tmp_path
-        quarto_yml = tmp_path / "_quarto.yml"
-        script_text = (
-            "<script>document.body.setAttribute('data-gd-ref-sections','api,cli,mcp')</script>"
-        )
-        quarto_yml.write_text(
-            f'format:\n  html:\n    include-in-header:\n      - text: "{script_text}"\n'
-            f"    include-after-body:\n      - text: 'other.js'\n",
-            encoding="utf-8",
-        )
-        written = []
-        monkeypatch.setattr(gd, "_write_quarto_yml", lambda p, c: written.append(c))
-        gd._remove_mcp_from_ref_sections()
-        assert len(written) == 1
-        header_items = written[0]["format"]["html"]["include-in-header"]
-        assert "api,cli" in header_items[0]["text"]
-        assert "mcp" not in header_items[0]["text"]
-
-    def test_removes_script_entirely_when_only_api_remains(self, tmp_path, monkeypatch):
-        """Sections 'api,mcp' with only 'api' remaining removes script entirely."""
-        gd = _make_gd(tmp_path)
-        gd.build_dir = tmp_path
-        quarto_yml = tmp_path / "_quarto.yml"
-        ref_script = "<script>document.body.setAttribute('data-gd-ref-sections','api,mcp')</script>"
-        switcher_script = "<script src='reference-switcher.js'></script>"
-        quarto_yml.write_text(
-            f'format:\n  html:\n    include-in-header:\n      - text: "{ref_script}"\n'
-            f'    include-after-body:\n      - text: "{switcher_script}"\n',
-            encoding="utf-8",
-        )
-        written = []
-        monkeypatch.setattr(gd, "_write_quarto_yml", lambda p, c: written.append(c))
-        gd._remove_mcp_from_ref_sections()
-        assert len(written) == 1
-        header_items = written[0]["format"]["html"]["include-in-header"]
-        assert len(header_items) == 0
-        after_body = written[0]["format"]["html"]["include-after-body"]
-        assert all("reference-switcher" not in e.get("text", "") for e in after_body)
-
-
-class TestDiscoverPackageExportsValidation:
-    """Cover the griffe export validation block inside _discover_package_exports."""
+class TestDiscoverExportsValidation:
+    """Export validation for unresolved aliases and external re-exports"""
 
     def _setup(self, tmp_path, monkeypatch):
         """Set up a GreatDocs instance with mocked griffe package."""
         gd = _make_gd(tmp_path)
-        monkeypatch.setattr(gd, "_get_package_metadata", lambda: {})
         return gd
 
     def _make_mock_pkg(self, members_dict, exports=None):
         """Build a mock griffe package with controlled members."""
         pkg = MagicMock()
+        pkg.path = "mypkg"
         pkg.members = members_dict
         pkg.exports = exports
         return pkg
 
     def test_not_found_in_pkg_members(self, tmp_path, monkeypatch):
-        """Name not in pkg.members is excluded from safe_exports."""
+        """Verify that undefined names are excluded from discovered exports"""
         import griffe
 
         gd = self._setup(tmp_path, monkeypatch)
         good_obj = MagicMock()
-        good_obj.kind.value = "function"
+        good_obj.kind = griffe.Kind.FUNCTION
         good_obj.members = {}
         good_obj.is_alias = False
         pkg = self._make_mock_pkg(
             {"good_func": good_obj},
             exports=["good_func", "MissingClass"],
         )
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._discover_package_exports("mypkg")
+        result = discover_exports(pkg, gd._config, report=print)
+        assert result is not None
         assert "good_func" in result
         assert "MissingClass" not in result
 
     def test_cyclic_alias_on_kind(self, tmp_path, monkeypatch):
-        """CyclicAliasError on obj.kind excludes the export."""
+        """Verify that a cyclic alias is excluded during kind lookup"""
         import griffe
 
         gd = self._setup(tmp_path, monkeypatch)
@@ -651,12 +582,11 @@ class TestDiscoverPackageExportsValidation:
             lambda s: (_ for _ in ()).throw(griffe.CyclicAliasError(["x", "y"]))
         )
         pkg = self._make_mock_pkg({"BadAlias": obj}, exports=["BadAlias"])
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._discover_package_exports("mypkg")
+        result = discover_exports(pkg, gd._config, report=print)
         assert result == []
 
     def test_alias_resolution_error_on_kind(self, tmp_path, monkeypatch):
-        """AliasResolutionError on obj.kind excludes the export."""
+        """Verify that an unresolved alias is excluded during kind lookup"""
         import griffe
 
         gd = self._setup(tmp_path, monkeypatch)
@@ -665,225 +595,183 @@ class TestDiscoverPackageExportsValidation:
             lambda s: (_ for _ in ()).throw(griffe.AliasResolutionError(MagicMock()))
         )
         pkg = self._make_mock_pkg({"Unresolvable": obj}, exports=["Unresolvable"])
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._discover_package_exports("mypkg")
+        result = discover_exports(pkg, gd._config, report=print)
         assert result == []
 
     def test_key_error_on_kind(self, tmp_path, monkeypatch):
-        """KeyError on obj.kind excludes the export (likely Rust/PyO3)."""
+        """Verify that an object missing from the static model is excluded"""
         gd = self._setup(tmp_path, monkeypatch)
         obj = MagicMock()
         type(obj).kind = property(lambda s: (_ for _ in ()).throw(KeyError("missing")))
         pkg = self._make_mock_pkg({"RustObj": obj}, exports=["RustObj"])
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._discover_package_exports("mypkg")
+        result = discover_exports(pkg, gd._config, report=print)
         assert result == []
 
-    def test_generic_exception_on_kind(self, tmp_path, monkeypatch):
-        """Generic Exception on obj.kind excludes the export."""
+    def test_unexpected_error_on_kind_propagates(self, tmp_path, monkeypatch):
+        """Verify that unexpected errors reading an object kind propagate"""
         gd = self._setup(tmp_path, monkeypatch)
         obj = MagicMock()
         type(obj).kind = property(lambda s: (_ for _ in ()).throw(RuntimeError("oops")))
         pkg = self._make_mock_pkg({"Broken": obj}, exports=["Broken"])
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._discover_package_exports("mypkg")
-        assert result == []
+        with pytest.raises(RuntimeError, match="oops"):
+            discover_exports(pkg, gd._config, report=print)
 
     def test_module_kind_passes_without_members_check(self, tmp_path, monkeypatch):
-        """Module kind passes directly to safe_exports."""
+        """Verify that module exports are retained without resolving their members"""
         gd = self._setup(tmp_path, monkeypatch)
         obj = MagicMock()
-        obj.kind.value = "module"
+        obj.kind = griffe.Kind.MODULE
         obj.is_alias = False
         pkg = self._make_mock_pkg({"submod": obj}, exports=["submod"])
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._discover_package_exports("mypkg")
+        result = discover_exports(pkg, gd._config, report=print)
+        assert result is not None
         assert "submod" in result
 
     def test_cyclic_alias_on_members_access(self, tmp_path, monkeypatch):
-        """CyclicAliasError accessing .members excludes the export."""
+        """Verify that a cycle during member lookup excludes the export"""
         import griffe
 
         gd = self._setup(tmp_path, monkeypatch)
         obj = MagicMock()
-        obj.kind.value = "class"
+        obj.kind = griffe.Kind.CLASS
         type(obj).members = property(
             lambda s: (_ for _ in ()).throw(griffe.CyclicAliasError(["x", "y"]))
         )
         pkg = self._make_mock_pkg({"CyclicClass": obj}, exports=["CyclicClass"])
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._discover_package_exports("mypkg")
+        result = discover_exports(pkg, gd._config, report=print)
         assert result == []
 
     def test_alias_resolution_error_on_members_access(self, tmp_path, monkeypatch):
-        """AliasResolutionError accessing .members excludes the export."""
+        """Verify that an alias failure during member lookup excludes the export"""
         import griffe
 
         gd = self._setup(tmp_path, monkeypatch)
         obj = MagicMock()
-        obj.kind.value = "class"
+        obj.kind = griffe.Kind.CLASS
         type(obj).members = property(
             lambda s: (_ for _ in ()).throw(griffe.AliasResolutionError(MagicMock()))
         )
         pkg = self._make_mock_pkg({"Unresolvable": obj}, exports=["Unresolvable"])
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._discover_package_exports("mypkg")
+        result = discover_exports(pkg, gd._config, report=print)
         assert result == []
 
-    def test_generic_exception_on_members_access(self, tmp_path, monkeypatch):
-        """Generic Exception accessing .members excludes the export."""
+    def test_unexpected_error_on_members_access_propagates(self, tmp_path, monkeypatch):
+        """Verify that unexpected errors reading members propagate"""
         gd = self._setup(tmp_path, monkeypatch)
         obj = MagicMock()
-        obj.kind.value = "class"
+        obj.kind = griffe.Kind.CLASS
         type(obj).members = property(lambda s: (_ for _ in ()).throw(TypeError("bad")))
         pkg = self._make_mock_pkg({"BadClass": obj}, exports=["BadClass"])
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._discover_package_exports("mypkg")
-        assert result == []
+        with pytest.raises(TypeError, match="bad"):
+            discover_exports(pkg, gd._config, report=print)
 
     def test_external_re_export_excluded(self, tmp_path, monkeypatch):
-        """Alias pointing to external package is excluded as re-export."""
+        """Verify that aliases to external packages are excluded"""
         gd = self._setup(tmp_path, monkeypatch)
-        obj = MagicMock()
-        obj.kind.value = "class"
+        import griffe
+
+        obj = MagicMock(spec=griffe.Alias)
+        obj.kind = griffe.Kind.CLASS
         obj.members = {}
-        obj.is_alias = True
         obj.canonical_path = "other_package.SomeClass"
         pkg = self._make_mock_pkg({"SomeClass": obj}, exports=["SomeClass"])
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._discover_package_exports("mypkg")
+        result = discover_exports(pkg, gd._config, report=print)
         assert result == []
 
     def test_internal_alias_passes(self, tmp_path, monkeypatch):
-        """Alias pointing inside the package passes."""
+        """Verify that aliases within the package are retained"""
         gd = self._setup(tmp_path, monkeypatch)
-        obj = MagicMock()
-        obj.kind.value = "class"
+        import griffe
+
+        obj = MagicMock(spec=griffe.Alias)
+        obj.kind = griffe.Kind.CLASS
         obj.members = {}
-        obj.is_alias = True
         obj.canonical_path = "mypkg.internal.MyClass"
         pkg = self._make_mock_pkg({"MyClass": obj}, exports=["MyClass"])
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._discover_package_exports("mypkg")
+        result = discover_exports(pkg, gd._config, report=print)
+        assert result is not None
         assert "MyClass" in result
 
-    def test_canonical_path_raises_still_passes(self, tmp_path, monkeypatch):
-        """Exception on canonical_path means the alias still passes."""
-        gd = self._setup(tmp_path, monkeypatch)
 
-        class _FakeAlias:
-            class kind:
-                value = "function"
-
-            members = {}
-            is_alias = True
-
-            @property
-            def canonical_path(self):
-                raise AttributeError("oops")
-
-        obj = _FakeAlias()
-        pkg = self._make_mock_pkg({"myfn": obj}, exports=["myfn"])
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._discover_package_exports("mypkg")
-        assert "myfn" in result
-
-
-class TestCategorizeReferencedObjects:
-    """Cover _categorize_referenced_objects classification logic."""
+class TestCategoriseReferences:
+    """Reference classification and missing-name handling"""
 
     def _setup(self, tmp_path, monkeypatch):
         gd = _make_gd(tmp_path)
         return gd
 
-    def test_griffe_load_fails_returns_empty(self, tmp_path, monkeypatch):
-        """Exception from _get_griffe_package returns empty categories."""
-        gd = self._setup(tmp_path, monkeypatch)
-        monkeypatch.setattr(
-            gd, "_get_griffe_package", lambda name: (_ for _ in ()).throw(RuntimeError("fail"))
-        )
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["Foo"]}])
-        assert result["classes"] == []
-        assert result["functions"] == []
-
     def test_non_dict_section_skipped(self, tmp_path, monkeypatch):
-        """Non-dict entries in reference_config are skipped."""
+        """Verify that reference sections other than dictionaries are ignored"""
         gd = self._setup(tmp_path, monkeypatch)
         pkg = MagicMock()
         pkg.members = {}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._categorize_referenced_objects("mypkg", ["not_a_dict", {"contents": []}])
+        result = categorise_references(pkg, ["not_a_dict", {"contents": []}])
         assert result["other"] == []
 
     def test_classifies_function(self, tmp_path, monkeypatch):
-        """Function kind is categorized into 'functions'."""
+        """Verify that functions are grouped under `functions`"""
         gd = self._setup(tmp_path, monkeypatch)
         obj = MagicMock()
-        obj.kind.value = "function"
+        obj.kind = griffe.Kind.FUNCTION
         obj.labels = set()
         pkg = MagicMock()
         pkg.members = {"my_func": obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_function", lambda o: "function")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["my_func"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.function_kind", lambda o: "function")
+        result = categorise_references(pkg, [{"contents": ["my_func"]}])
         assert "my_func" in result["functions"]
 
     def test_classifies_async_function(self, tmp_path, monkeypatch):
-        """Async function is categorized into 'async_functions'."""
+        """Verify that asynchronous functions are grouped under `async_functions`"""
         gd = self._setup(tmp_path, monkeypatch)
         obj = MagicMock()
-        obj.kind.value = "function"
+        obj.kind = griffe.Kind.FUNCTION
         obj.labels = {"async"}
         pkg = MagicMock()
         pkg.members = {"afunc": obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_function", lambda o: "async")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["afunc"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.function_kind", lambda o: "async")
+        result = categorise_references(pkg, [{"contents": ["afunc"]}])
         assert "afunc" in result["async_functions"]
 
     def test_classifies_class_as_dataclass(self, tmp_path, monkeypatch):
-        """Class sub-classified as dataclass goes to 'dataclasses'."""
+        """Verify that dataclasses are grouped under `dataclasses`"""
         gd = self._setup(tmp_path, monkeypatch)
         obj = MagicMock()
-        obj.kind.value = "class"
+        obj.kind = griffe.Kind.CLASS
         obj.members = {"__init__": MagicMock()}
         obj.members["__init__"].kind.value = "function"
         pkg = MagicMock()
         pkg.members = {"MyDC": obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_class", lambda o: "dataclass")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["MyDC"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.class_kind", lambda o: "dataclass")
+        result = categorise_references(pkg, [{"contents": ["MyDC"]}])
         assert "MyDC" in result["dataclasses"]
 
     def test_classifies_attribute_as_constant(self, tmp_path, monkeypatch):
-        """Attribute kind goes to 'constants'."""
+        """Verify that ordinary attributes are grouped under `constants`"""
         gd = self._setup(tmp_path, monkeypatch)
         obj = MagicMock()
-        obj.kind.value = "attribute"
+        obj.kind = griffe.Kind.ATTRIBUTE
         obj.labels = set()
         obj.annotation = None
         pkg = MagicMock()
         pkg.members = {"MY_CONST": obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_attribute", lambda o: "constant")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["MY_CONST"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.attribute_kind", lambda o: "constant")
+        result = categorise_references(pkg, [{"contents": ["MY_CONST"]}])
         assert "MY_CONST" in result["constants"]
 
     def test_classifies_type_alias(self, tmp_path, monkeypatch):
-        """Type alias attribute goes to 'type_aliases'."""
+        """Verify that type aliases are grouped under `type_aliases`"""
         gd = self._setup(tmp_path, monkeypatch)
         obj = MagicMock()
-        obj.kind.value = "type alias"
+        obj.kind = griffe.Kind.TYPE_ALIAS
         obj.labels = set()
         pkg = MagicMock()
         pkg.members = {"MyAlias": obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_attribute", lambda o: "type_alias")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["MyAlias"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.attribute_kind", lambda o: "typealias")
+        result = categorise_references(pkg, [{"contents": ["MyAlias"]}])
         assert "MyAlias" in result["type_aliases"]
 
     def test_cyclic_alias_on_kind_goes_to_other(self, tmp_path, monkeypatch):
-        """CyclicAliasError on obj.kind goes to 'other'."""
+        """Verify that configured cyclic aliases are grouped under `other`"""
         import griffe
 
         gd = self._setup(tmp_path, monkeypatch)
@@ -893,62 +781,60 @@ class TestCategorizeReferencedObjects:
         )
         pkg = MagicMock()
         pkg.members = {"CyclicThing": obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["CyclicThing"]}])
+        result = categorise_references(pkg, [{"contents": ["CyclicThing"]}])
         assert "CyclicThing" in result["other"]
 
-    def test_generic_exception_on_kind_goes_to_other(self, tmp_path, monkeypatch):
-        """Generic Exception on obj.kind goes to 'other'."""
+    def test_unexpected_error_on_kind_propagates(self, tmp_path, monkeypatch):
+        """Verify that unexpected errors reading an object kind propagate"""
         gd = self._setup(tmp_path, monkeypatch)
         obj = MagicMock()
         type(obj).kind = property(lambda s: (_ for _ in ()).throw(ValueError("bad")))
         pkg = MagicMock()
         pkg.members = {"BrokenObj": obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["BrokenObj"]}])
-        assert "BrokenObj" in result["other"]
+        with pytest.raises(ValueError, match="bad"):
+            categorise_references(pkg, [{"contents": ["BrokenObj"]}])
 
     def test_missing_name_with_installed_package_raises(self, tmp_path, monkeypatch):
-        """Missing name + installed package raises SystemExit."""
+        """Verify that an installed package missing a configured name raises `BuildError`"""
         import pytest
 
         gd = self._setup(tmp_path, monkeypatch)
         pkg = MagicMock()
         pkg.members = {}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
         monkeypatch.setattr("importlib.metadata.version", lambda name: "1.2.3")
-        with pytest.raises(SystemExit, match="not found"):
-            gd._categorize_referenced_objects("mypkg", [{"contents": ["Missing"]}])
+        from great_docs import BuildError
+
+        with pytest.raises(BuildError, match="not found"):
+            categorise_references(pkg, [{"contents": ["Missing"]}])
 
     def test_missing_name_uninstalled_package_goes_to_other(self, tmp_path, monkeypatch):
-        """Missing name + uninstalled package falls to 'other'."""
+        """Verify that missing names are grouped under `other` for an uninstalled package"""
         gd = self._setup(tmp_path, monkeypatch)
         pkg = MagicMock()
         pkg.members = {}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
         monkeypatch.setattr(
             "importlib.metadata.version",
-            lambda name: (_ for _ in ()).throw(Exception("not installed")),
+            lambda name: (_ for _ in ()).throw(importlib.metadata.PackageNotFoundError(name)),
         )
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["Missing"]}])
+        result = categorise_references(pkg, [{"contents": ["Missing"]}])
         assert "Missing" in result["other"]
 
     def test_class_method_counting(self, tmp_path, monkeypatch):
-        """Class with public methods populates class_methods count."""
+        """Verify that public methods contribute to the class method count"""
         gd = self._setup(tmp_path, monkeypatch)
 
         method_obj = MagicMock()
-        method_obj.kind.value = "function"
+        method_obj.kind = griffe.Kind.FUNCTION
 
         private_obj = MagicMock()
-        private_obj.kind.value = "function"
+        private_obj.kind = griffe.Kind.FUNCTION
 
         prop_obj = MagicMock()
-        prop_obj.kind.value = "attribute"
+        prop_obj.kind = griffe.Kind.ATTRIBUTE
         prop_obj.labels = {"property"}
 
         cls_obj = MagicMock()
-        cls_obj.kind.value = "class"
+        cls_obj.kind = griffe.Kind.CLASS
         cls_obj.members = {
             "do_stuff": method_obj,
             "_private": private_obj,
@@ -957,16 +843,15 @@ class TestCategorizeReferencedObjects:
 
         pkg = MagicMock()
         pkg.members = {"MyClass": cls_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_class", lambda o: "class")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["MyClass"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.class_kind", lambda o: "class")
+        result = categorise_references(pkg, [{"contents": ["MyClass"]}])
         assert result["class_methods"]["MyClass"] == 2
         assert "do_stuff" in result["class_method_names"]["MyClass"]
         assert "value" in result["class_method_names"]["MyClass"]
         assert "_private" not in result["class_method_names"]["MyClass"]
 
     def test_class_member_cyclic_alias_skipped(self, tmp_path, monkeypatch):
-        """CyclicAliasError on member.kind skips the member."""
+        """Verify that class members with cyclic aliases are excluded"""
         import griffe
 
         gd = self._setup(tmp_path, monkeypatch)
@@ -977,47 +862,29 @@ class TestCategorizeReferencedObjects:
         )
 
         cls_obj = MagicMock()
-        cls_obj.kind.value = "class"
+        cls_obj.kind = griffe.Kind.CLASS
         cls_obj.members = {"bad_member": bad_member}
 
         pkg = MagicMock()
         pkg.members = {"MyClass": cls_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_class", lambda o: "class")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["MyClass"]}])
-        assert result["class_methods"]["MyClass"] == 0
-
-    def test_class_member_generic_exception_skipped(self, tmp_path, monkeypatch):
-        """Generic Exception on member.kind skips the member."""
-        gd = self._setup(tmp_path, monkeypatch)
-
-        bad_member = MagicMock()
-        type(bad_member).kind = property(lambda s: (_ for _ in ()).throw(TypeError("oops")))
-
-        cls_obj = MagicMock()
-        cls_obj.kind.value = "class"
-        cls_obj.members = {"broken": bad_member}
-
-        pkg = MagicMock()
-        pkg.members = {"MyClass": cls_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_class", lambda o: "class")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["MyClass"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.class_kind", lambda o: "class")
+        result = categorise_references(pkg, [{"contents": ["MyClass"]}])
         assert result["class_methods"]["MyClass"] == 0
 
     def test_module_kind_expands_members(self, tmp_path, monkeypatch):
-        """Module kind expands members into qualified names."""
+        """Verify that listed modules expand to qualified member names"""
         gd = self._setup(tmp_path, monkeypatch)
 
         sub_class = MagicMock()
-        sub_class.kind.value = "class"
+        sub_class.kind = griffe.Kind.CLASS
         sub_func = MagicMock()
-        sub_func.kind.value = "function"
+        sub_func.kind = griffe.Kind.FUNCTION
         sub_attr = MagicMock()
-        sub_attr.kind.value = "attribute"
+        sub_attr.kind = griffe.Kind.ATTRIBUTE
 
         mod_obj = MagicMock()
-        mod_obj.kind.value = "module"
+        mod_obj.kind = griffe.Kind.MODULE
+        mod_obj.exports = None
         mod_obj.members = {
             "SubClass": sub_class,
             "sub_func": sub_func,
@@ -1026,31 +893,31 @@ class TestCategorizeReferencedObjects:
         }
 
         anchor_cls = MagicMock()
-        anchor_cls.kind.value = "class"
+        anchor_cls.kind = griffe.Kind.CLASS
         anchor_cls.members = {}
         anchor_cls.labels = set()
         anchor_cls.bases = []
 
         pkg = MagicMock()
         pkg.members = {"AClass": anchor_cls, "mymod": mod_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_class", lambda o: "class")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["AClass", "mymod"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.class_kind", lambda o: "class")
+        result = categorise_references(pkg, [{"contents": ["AClass", "mymod"]}])
         assert "mymod.SubClass" in result["classes"]
         assert "mymod.sub_func" in result["functions"]
         assert "mymod.CONST" in result["constants"]
 
     def test_module_expansion_without_top_level_class(self, tmp_path, monkeypatch):
-        """A module listed alone expands its classes and the members after them."""
+        """Verify that a listed module contributes its classes and subsequent members"""
         gd = self._setup(tmp_path, monkeypatch)
 
         def _member(kind):
             m = MagicMock()
-            m.kind.value = kind
+            m.kind = griffe.Kind(kind)
             return m
 
         mod_obj = MagicMock()
-        mod_obj.kind.value = "module"
+        mod_obj.kind = griffe.Kind.MODULE
+        mod_obj.exports = None
         # Dict order is the order the expansion visits the members in.
         mod_obj.members = {
             "AFunc": _member("function"),
@@ -1062,13 +929,11 @@ class TestCategorizeReferencedObjects:
 
         pkg = MagicMock()
         pkg.members = {"mymod": mod_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
         monkeypatch.setattr(
-            gd,
-            "_sub_classify_class",
+            "great_docs._reference.discovery.class_kind",
             lambda o: "dataclass" if o is mod_obj.members["BDataclass"] else "class",
         )
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["mymod"]}])
+        result = categorise_references(pkg, [{"contents": ["mymod"]}])
         assert "mymod.BDataclass" in result["dataclasses"]
         assert "mymod.CPlain" in result["classes"]
         assert "mymod.AFunc" in result["functions"]
@@ -1076,7 +941,7 @@ class TestCategorizeReferencedObjects:
         assert "mymod.E_CONST" in result["constants"]
 
     def test_module_member_cyclic_alias_skipped(self, tmp_path, monkeypatch):
-        """CyclicAliasError on module member's kind skips it."""
+        """Verify that module members with cyclic aliases are excluded"""
         import griffe
 
         gd = self._setup(tmp_path, monkeypatch)
@@ -1087,116 +952,90 @@ class TestCategorizeReferencedObjects:
         )
 
         mod_obj = MagicMock()
-        mod_obj.kind.value = "module"
+        mod_obj.kind = griffe.Kind.MODULE
+        mod_obj.exports = None
         mod_obj.members = {"broken": bad_member}
 
         pkg = MagicMock()
         pkg.members = {"mymod": mod_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["mymod"]}])
+        result = categorise_references(pkg, [{"contents": ["mymod"]}])
         assert "mymod.broken" not in result.get("other", [])
 
     def test_module_members_iteration_raises(self, tmp_path, monkeypatch):
-        """Exception iterating module.members is caught by outer except."""
+        """Verify that an unresolved module contributes no members"""
         import griffe
 
         gd = self._setup(tmp_path, monkeypatch)
 
         mod_obj = MagicMock()
-        mod_obj.kind.value = "module"
+        mod_obj.kind = griffe.Kind.MODULE
+        mod_obj.exports = None
         type(mod_obj).members = property(
             lambda s: (_ for _ in ()).throw(griffe.CyclicAliasError(["x", "y"]))
         )
 
         pkg = MagicMock()
         pkg.members = {"mymod": mod_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["mymod"]}])
+        result = categorise_references(pkg, [{"contents": ["mymod"]}])
         assert "mymod" not in result.get("classes", [])
 
     def test_dict_item_in_contents(self, tmp_path, monkeypatch):
-        """Dict item with 'name' key in contents is recognized."""
+        """Verify that reference dictionaries identify objects through `name`"""
         gd = self._setup(tmp_path, monkeypatch)
 
         obj = MagicMock()
-        obj.kind.value = "function"
+        obj.kind = griffe.Kind.FUNCTION
         obj.labels = set()
 
         pkg = MagicMock()
         pkg.members = {"named_func": obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_function", lambda o: "function")
-        result = gd._categorize_referenced_objects(
-            "mypkg", [{"contents": [{"name": "named_func"}]}]
-        )
+        monkeypatch.setattr("great_docs._reference.discovery.function_kind", lambda o: "function")
+        result = categorise_references(pkg, [{"contents": [{"name": "named_func"}]}])
         assert "named_func" in result["functions"]
 
     def test_class_property_member_counted(self, tmp_path, monkeypatch):
-        """@property attribute counted as method."""
+        """Verify that properties contribute to the class method count"""
         gd = self._setup(tmp_path, monkeypatch)
 
         prop_member = MagicMock()
-        prop_member.kind.value = "attribute"
+        prop_member.kind = griffe.Kind.ATTRIBUTE
         prop_member.labels = {"property"}
 
         cls_obj = MagicMock()
-        cls_obj.kind.value = "class"
+        cls_obj.kind = griffe.Kind.CLASS
         cls_obj.members = {"name": prop_member}
 
         pkg = MagicMock()
         pkg.members = {"MyClass": cls_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_class", lambda o: "class")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["MyClass"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.class_kind", lambda o: "class")
+        result = categorise_references(pkg, [{"contents": ["MyClass"]}])
         assert result["class_methods"]["MyClass"] == 1
         assert "name" in result["class_method_names"]["MyClass"]
 
     def test_class_init_dunder_skipped(self, tmp_path, monkeypatch):
-        """__init__ dunder is skipped in method count."""
+        """Verify that constructors are excluded from the class method count"""
         gd = self._setup(tmp_path, monkeypatch)
 
         init_member = MagicMock()
-        init_member.kind.value = "function"
+        init_member.kind = griffe.Kind.FUNCTION
 
         public_method = MagicMock()
-        public_method.kind.value = "function"
+        public_method.kind = griffe.Kind.FUNCTION
 
         cls_obj = MagicMock()
-        cls_obj.kind.value = "class"
+        cls_obj.kind = griffe.Kind.CLASS
         cls_obj.members = {"__init__": init_member, "run": public_method}
 
         pkg = MagicMock()
         pkg.members = {"MyClass": cls_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_class", lambda o: "class")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["MyClass"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.class_kind", lambda o: "class")
+        result = categorise_references(pkg, [{"contents": ["MyClass"]}])
         assert result["class_methods"]["MyClass"] == 1
         assert "run" in result["class_method_names"]["MyClass"]
         assert "__init__" not in result["class_method_names"]["MyClass"]
 
-    def test_class_property_labels_raises(self, tmp_path, monkeypatch):
-        """Exception accessing member.labels for property check passes."""
-        gd = self._setup(tmp_path, monkeypatch)
-
-        attr_member = MagicMock()
-        attr_member.kind.value = "attribute"
-        type(attr_member).labels = property(
-            lambda s: (_ for _ in ()).throw(RuntimeError("no labels"))
-        )
-
-        cls_obj = MagicMock()
-        cls_obj.kind.value = "class"
-        cls_obj.members = {"prop": attr_member}
-
-        pkg = MagicMock()
-        pkg.members = {"MyClass": cls_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_class", lambda o: "class")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["MyClass"]}])
-        assert result["class_methods"]["MyClass"] == 0
-
     def test_class_members_outer_cyclic_alias(self, tmp_path, monkeypatch):
-        """CyclicAliasError iterating class members is caught by outer except."""
+        """Verify that a cycle while listing class members yields no methods"""
         import griffe
 
         gd = self._setup(tmp_path, monkeypatch)
@@ -1206,178 +1045,46 @@ class TestCategorizeReferencedObjects:
                 raise griffe.CyclicAliasError(["x", "y"])
 
         cls_obj = MagicMock()
-        cls_obj.kind.value = "class"
+        cls_obj.kind = griffe.Kind.CLASS
         cls_obj.members = _BadItems()
 
         pkg = MagicMock()
         pkg.members = {"MyClass": cls_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_class", lambda o: "class")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["MyClass"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.class_kind", lambda o: "class")
+        result = categorise_references(pkg, [{"contents": ["MyClass"]}])
         assert result["class_methods"]["MyClass"] == 0
 
     def test_typevar_attribute(self, tmp_path, monkeypatch):
-        """TypeVar attribute goes to type_aliases."""
+        """Verify that type variables are grouped under `type_aliases`"""
         gd = self._setup(tmp_path, monkeypatch)
 
         obj = MagicMock()
-        obj.kind.value = "attribute"
+        obj.kind = griffe.Kind.ATTRIBUTE
         obj.labels = set()
 
         pkg = MagicMock()
         pkg.members = {"T": obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_attribute", lambda o: "typevar")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["T"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.attribute_kind", lambda o: "typevar")
+        result = categorise_references(pkg, [{"contents": ["T"]}])
         assert "T" in result["type_aliases"]
 
-    def test_module_member_generic_exception_skipped(self, tmp_path, monkeypatch):
-        """Generic Exception on module member's kind skips it."""
-        gd = self._setup(tmp_path, monkeypatch)
-
-        bad_member = MagicMock()
-        type(bad_member).kind = property(lambda s: (_ for _ in ()).throw(ValueError("bad")))
-
-        anchor = MagicMock()
-        anchor.kind.value = "class"
-        anchor.members = {}
-
-        mod_obj = MagicMock()
-        mod_obj.kind.value = "module"
-        mod_obj.members = {"broken": bad_member}
-
-        pkg = MagicMock()
-        pkg.members = {"AClass": anchor, "mymod": mod_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_class", lambda o: "class")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["AClass", "mymod"]}])
-        assert "mymod.broken" not in result.get("functions", [])
-
-    def test_module_members_outer_exception(self, tmp_path, monkeypatch):
-        """Generic Exception iterating module members is caught by outer except."""
-        gd = self._setup(tmp_path, monkeypatch)
-
-        class _BadItems(dict):
-            def items(self):
-                raise TypeError("bad iteration")
-
-        anchor = MagicMock()
-        anchor.kind.value = "class"
-        anchor.members = {}
-
-        mod_obj = MagicMock()
-        mod_obj.kind.value = "module"
-        mod_obj.members = _BadItems()
-
-        pkg = MagicMock()
-        pkg.members = {"AClass": anchor, "mymod": mod_obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_class", lambda o: "class")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["AClass", "mymod"]}])
-        assert "mymod" not in result.get("classes", [])
-
     def test_other_kind_goes_to_other(self, tmp_path, monkeypatch):
-        """Unknown kind value goes to 'other'."""
+        """Verify that unclassified objects are grouped under `other`"""
         gd = self._setup(tmp_path, monkeypatch)
 
         anchor = MagicMock()
-        anchor.kind.value = "class"
+        anchor.kind = griffe.Kind.CLASS
         anchor.members = {}
 
         obj = MagicMock()
-        obj.kind.value = "alias"
+        obj.kind = griffe.Kind.ALIAS
 
         pkg = MagicMock()
         pkg.members = {"AClass": anchor, "weird": obj}
-        monkeypatch.setattr(gd, "_get_griffe_package", lambda name: pkg)
-        monkeypatch.setattr(gd, "_sub_classify_class", lambda o: "class")
-        result = gd._categorize_referenced_objects("mypkg", [{"contents": ["AClass", "weird"]}])
+        monkeypatch.setattr("great_docs._reference.discovery.class_kind", lambda o: "class")
+        result = categorise_references(pkg, [{"contents": ["AClass", "weird"]}])
 
         assert "weird" in result["other"]
-
-
-# ---------------------------------------------------------------------------
-# Module-level utility functions
-# ---------------------------------------------------------------------------
-
-
-class TestMigrateLegacyGitignore:
-    def test_migrates_bare_entry(self):
-        from great_docs.core import _migrate_legacy_gitignore_entry
-
-        content = "node_modules/\ngreat-docs/\n.env\n"
-        result = _migrate_legacy_gitignore_entry(content)
-        assert "/great-docs/\n" in result
-        assert "\ngreat-docs/\n" not in result
-
-    def test_preserves_already_anchored(self):
-        from great_docs.core import _migrate_legacy_gitignore_entry
-
-        content = "/great-docs/\n"
-        result = _migrate_legacy_gitignore_entry(content)
-        assert result == content
-
-    def test_no_entry_returns_unchanged(self):
-        from great_docs.core import _migrate_legacy_gitignore_entry
-
-        content = "*.pyc\n__pycache__/\n"
-        result = _migrate_legacy_gitignore_entry(content)
-        assert result is content
-
-
-class TestGitignoreHasEntry:
-    def test_exact_match(self):
-        from great_docs.core import _gitignore_has_entry
-
-        assert _gitignore_has_entry("/great-docs/\n.env\n", "/great-docs/")
-
-    def test_no_match(self):
-        from great_docs.core import _gitignore_has_entry
-
-        assert not _gitignore_has_entry("*.pyc\n", "/great-docs/")
-
-    def test_negated_entry_not_matched(self):
-        from great_docs.core import _gitignore_has_entry
-
-        assert not _gitignore_has_entry("!/great-docs/skills/\n", "/great-docs/")
-
-
-# ---------------------------------------------------------------------------
-# Linkify GitHub references
-# ---------------------------------------------------------------------------
-
-
-class TestLinkifyGithubReferences:
-    def test_bare_issue_number(self):
-        result = GreatDocs._linkify_github_references("Fixed #42", "owner", "repo")
-        assert "[#42](https://github.com/owner/repo/issues/42)" in result
-
-    def test_gh_issue_keyword(self):
-        result = GreatDocs._linkify_github_references("gh issue #7", "owner", "repo")
-        assert "[#7](https://github.com/owner/repo/issues/7)" in result
-
-    def test_gh_pr_keyword(self):
-        result = GreatDocs._linkify_github_references("gh PR #99", "owner", "repo")
-        assert "[#99](https://github.com/owner/repo/issues/99)" in result
-
-    def test_at_username(self):
-        result = GreatDocs._linkify_github_references("Thanks @alice", "o", "r")
-        assert "[@alice](https://github.com/alice)" in result
-
-    def test_backslash_escapes_removed(self):
-        result = GreatDocs._linkify_github_references(r"\#123 by \@bob", "o", "r")
-        assert "[#123]" in result
-        assert "[@bob]" in result
-
-    def test_compare_url_linked(self):
-        url = "https://github.com/owner/repo/compare/v1.0...v2.0"
-        result = GreatDocs._linkify_github_references(f"Full Changelog: {url}", "owner", "repo")
-        assert f"[{url}]({url})" in result
-
-    def test_already_linked_not_doubled(self):
-        text = "[#10](https://github.com/owner/repo/issues/10)"
-        result = GreatDocs._linkify_github_references(text, "owner", "repo")
-        assert result.count("[#10]") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1385,18 +1092,18 @@ class TestLinkifyGithubReferences:
 # ---------------------------------------------------------------------------
 
 
-class TestParseClickHelpParts:
+class TestParseHelpParts:
     def test_empty_help(self):
-        desc, examples = GreatDocs._parse_click_help_parts("")
+        desc, examples = cli_click.parse_help_parts("")
         assert desc == ""
         assert examples == []
 
     def test_none_help(self):
-        desc, examples = GreatDocs._parse_click_help_parts(None)
+        desc, examples = cli_click.parse_help_parts(None)
         assert desc == ""
 
     def test_description_only(self):
-        desc, examples = GreatDocs._parse_click_help_parts("Build the docs site.")
+        desc, examples = cli_click.parse_help_parts("Build the docs site.")
         assert desc == "Build the docs site."
         assert examples == []
 
@@ -1404,35 +1111,35 @@ class TestParseClickHelpParts:
         help_text = (
             "Build the site.\n\nExamples:\n    great-docs build\n    great-docs build --watch\n"
         )
-        desc, examples = GreatDocs._parse_click_help_parts(help_text)
+        desc, examples = cli_click.parse_help_parts(help_text)
         assert desc == "Build the site."
         assert "great-docs build" in examples[0]
         assert len(examples) == 2
 
     def test_backspace_marker_stripped(self):
         help_text = "Some text\n\x08\nMore text"
-        desc, examples = GreatDocs._parse_click_help_parts(help_text)
+        desc, examples = cli_click.parse_help_parts(help_text)
         assert "\x08" not in desc
         assert "Some text" in desc
 
     def test_collapses_blank_lines(self):
         help_text = "Line one\n\n\n\nLine two"
-        desc, _ = GreatDocs._parse_click_help_parts(help_text)
+        desc, _ = cli_click.parse_help_parts(help_text)
         assert "\n\n\n" not in desc
 
     def test_examples_dedented_4_spaces(self):
         help_text = "Desc\n\nExamples:\n    cmd --flag\n"
-        _, examples = GreatDocs._parse_click_help_parts(help_text)
+        _, examples = cli_click.parse_help_parts(help_text)
         assert examples[0] == "cmd --flag"
 
     def test_examples_dedented_2_spaces(self):
         help_text = "Desc\n\nExamples:\n  cmd --flag\n"
-        _, examples = GreatDocs._parse_click_help_parts(help_text)
+        _, examples = cli_click.parse_help_parts(help_text)
         assert examples[0] == "cmd --flag"
 
     def test_examples_trailing_blanks_trimmed(self):
         help_text = "Desc\n\nExamples:\n    cmd\n    \n"
-        _, examples = GreatDocs._parse_click_help_parts(help_text)
+        _, examples = cli_click.parse_help_parts(help_text)
         assert not examples[-1].strip() == ""
 
 
@@ -1441,213 +1148,25 @@ class TestParseClickHelpParts:
 # ---------------------------------------------------------------------------
 
 
-class TestBacktickCliProse:
+class TestBacktickProse:
     def test_empty_returns_empty(self):
-        assert GreatDocs._backtick_cli_prose("", set()) == ""
+        assert cli_render.backtick_prose("", set()) == ""
 
     def test_wraps_single_quoted_text(self):
-        result = GreatDocs._backtick_cli_prose("Use 'great-docs/' for output", set())
+        result = cli_render.backtick_prose("Use 'great-docs/' for output", set())
         assert "`great-docs/`" in result
 
     def test_wraps_known_option(self):
-        result = GreatDocs._backtick_cli_prose("Use --watch for live reload", {"--watch"})
+        result = cli_render.backtick_prose("Use --watch for live reload", {"--watch"})
         assert "`--watch`" in result
 
     def test_avoids_possessives(self):
-        result = GreatDocs._backtick_cli_prose("The package's config", set())
+        result = cli_render.backtick_prose("The package's config", set())
         assert "`" not in result
 
     def test_already_backticked_not_doubled(self):
-        result = GreatDocs._backtick_cli_prose("Use `--watch` now", {"--watch"})
+        result = cli_render.backtick_prose("Use `--watch` now", {"--watch"})
         assert result.count("`--watch`") == 1
-
-
-# ---------------------------------------------------------------------------
-# Bump heading levels
-# ---------------------------------------------------------------------------
-
-
-class TestBumpHeadingLevels:
-    def test_h1_becomes_h2(self):
-        result = GreatDocs._bump_heading_levels("# Title\n\nParagraph")
-        assert result.startswith("## Title")
-
-    def test_h3_becomes_h4(self):
-        result = GreatDocs._bump_heading_levels("### Section")
-        assert result == "#### Section"
-
-    def test_headings_in_fenced_block_untouched(self):
-        content = "```python\n# this is a comment\n```"
-        result = GreatDocs._bump_heading_levels(content)
-        assert "## this is a comment" not in result
-        assert "# this is a comment" in result
-
-    def test_tilde_fence_respected(self):
-        content = "~~~\n# comment\n~~~"
-        result = GreatDocs._bump_heading_levels(content)
-        assert "# comment" in result
-        assert "## comment" not in result
-
-    def test_mixed_content(self):
-        content = "# Top\n\n```\n# inside\n```\n\n## Below"
-        result = GreatDocs._bump_heading_levels(content)
-        assert "## Top" in result
-        assert "# inside" in result
-        assert "### Below" in result
-
-
-# ---------------------------------------------------------------------------
-# Sub-classify class / function / attribute
-# ---------------------------------------------------------------------------
-
-
-class TestSubClassifyClass:
-    def test_dataclass(self):
-        obj = MagicMock()
-        obj.labels = {"dataclass"}
-        assert GreatDocs._sub_classify_class(obj) == "dataclass"
-
-    def test_enum_via_bases(self):
-        obj = MagicMock()
-        obj.labels = set()
-        base = MagicMock()
-        base.__str__ = lambda s: "enum.IntEnum"
-        obj.bases = [base]
-        obj.decorators = []
-        assert GreatDocs._sub_classify_class(obj) == "enum"
-
-    def test_exception_via_bases(self):
-        obj = MagicMock()
-        obj.labels = set()
-        base = MagicMock()
-        base.__str__ = lambda s: "ValueError"
-        obj.bases = [base]
-        obj.decorators = []
-        assert GreatDocs._sub_classify_class(obj) == "exception"
-
-    def test_namedtuple(self):
-        obj = MagicMock()
-        obj.labels = set()
-        base = MagicMock()
-        base.__str__ = lambda s: "NamedTuple"
-        obj.bases = [base]
-        obj.decorators = []
-        assert GreatDocs._sub_classify_class(obj) == "namedtuple"
-
-    def test_typeddict(self):
-        obj = MagicMock()
-        obj.labels = set()
-        base = MagicMock()
-        base.__str__ = lambda s: "TypedDict"
-        obj.bases = [base]
-        obj.decorators = []
-        assert GreatDocs._sub_classify_class(obj) == "typeddict"
-
-    def test_protocol(self):
-        obj = MagicMock()
-        obj.labels = set()
-        base = MagicMock()
-        base.__str__ = lambda s: "Protocol"
-        obj.bases = [base]
-        obj.decorators = []
-        assert GreatDocs._sub_classify_class(obj) == "protocol"
-
-    def test_abc_via_bases(self):
-        obj = MagicMock()
-        obj.labels = set()
-        base = MagicMock()
-        base.__str__ = lambda s: "ABC"
-        obj.bases = [base]
-        obj.decorators = []
-        assert GreatDocs._sub_classify_class(obj) == "abc"
-
-    def test_abc_via_decorator(self):
-        obj = MagicMock()
-        obj.labels = set()
-        base = MagicMock()
-        base.__str__ = lambda s: "object"
-        obj.bases = [base]
-        dec = MagicMock()
-        dec.value = "abstractmethod"
-        obj.decorators = [dec]
-        assert GreatDocs._sub_classify_class(obj) == "abc"
-
-    def test_plain_class_fallback(self):
-        obj = MagicMock()
-        obj.labels = set()
-        base = MagicMock()
-        base.__str__ = lambda s: "object"
-        obj.bases = [base]
-        obj.decorators = []
-        assert GreatDocs._sub_classify_class(obj) == "class"
-
-
-class TestSubClassifyFunction:
-    def test_async(self):
-        obj = MagicMock()
-        obj.labels = {"async"}
-        assert GreatDocs._sub_classify_function(obj) == "async"
-
-    def test_classmethod(self):
-        obj = MagicMock()
-        obj.labels = {"classmethod"}
-        assert GreatDocs._sub_classify_function(obj) == "classmethod"
-
-    def test_staticmethod(self):
-        obj = MagicMock()
-        obj.labels = {"staticmethod"}
-        assert GreatDocs._sub_classify_function(obj) == "staticmethod"
-
-    def test_property(self):
-        obj = MagicMock()
-        obj.labels = {"property"}
-        assert GreatDocs._sub_classify_function(obj) == "property"
-
-    def test_plain_function(self):
-        obj = MagicMock()
-        obj.labels = set()
-        assert GreatDocs._sub_classify_function(obj) == "function"
-
-    def test_labels_raises_falls_back(self):
-        obj = MagicMock()
-        type(obj).labels = property(lambda s: (_ for _ in ()).throw(Exception()))
-        assert GreatDocs._sub_classify_function(obj) == "function"
-
-
-class TestSubClassifyAttribute:
-    def test_type_alias_via_kind(self):
-        obj = MagicMock()
-        obj.labels = set()
-        obj.kind.value = "type alias"
-        assert GreatDocs._sub_classify_attribute(obj) == "type_alias"
-
-    def test_typevar_via_annotation(self):
-        obj = MagicMock()
-        obj.labels = set()
-        obj.kind.value = "attribute"
-        obj.annotation = "TypeVar('T')"
-        assert GreatDocs._sub_classify_attribute(obj) == "typevar"
-
-    def test_paramspec_via_annotation(self):
-        obj = MagicMock()
-        obj.labels = set()
-        obj.kind.value = "attribute"
-        obj.annotation = "ParamSpec('P')"
-        assert GreatDocs._sub_classify_attribute(obj) == "typevar"
-
-    def test_constant_fallback(self):
-        obj = MagicMock()
-        obj.labels = set()
-        obj.kind.value = "attribute"
-        obj.annotation = None
-        assert GreatDocs._sub_classify_attribute(obj) == "constant"
-
-    def test_kind_raises_falls_through(self):
-        obj = MagicMock()
-        obj.labels = set()
-        type(obj).kind = property(lambda s: (_ for _ in ()).throw(Exception()))
-        obj.annotation = None
-        assert GreatDocs._sub_classify_attribute(obj) == "constant"
 
 
 # ---------------------------------------------------------------------------
@@ -1657,7 +1176,7 @@ class TestSubClassifyAttribute:
 
 class TestEmptyCategories:
     def test_all_keys_present(self):
-        cats = GreatDocs._empty_categories()
+        cats = empty_categories()
         assert "classes" in cats
         assert "functions" in cats
         assert "constants" in cats
@@ -1665,8 +1184,8 @@ class TestEmptyCategories:
         assert cats["cyclic_alias_count"] == 0
 
     def test_returns_fresh_instance(self):
-        a = GreatDocs._empty_categories()
-        b = GreatDocs._empty_categories()
+        a = empty_categories()
+        b = empty_categories()
         a["classes"].append("X")
         assert b["classes"] == []
 
@@ -1676,7 +1195,7 @@ class TestEmptyCategories:
 # ---------------------------------------------------------------------------
 
 
-class TestExtractClickOption:
+class TestExtractOption:
     def test_basic_option(self):
         param = MagicMock()
         param.name = "verbose"
@@ -1692,7 +1211,7 @@ class TestExtractClickOption:
         param.is_eager = False
         param.hidden = False
         param.show_default = False
-        result = GreatDocs._extract_click_option(param)
+        result = cli_click.extract_option(param)
         assert result["name_display"] == "-v, --verbose"
         assert result["help"] == "Enable verbose output"
         assert result["is_flag"] is True
@@ -1700,7 +1219,7 @@ class TestExtractClickOption:
     def test_help_option_skipped(self):
         param = MagicMock()
         param.name = "help"
-        assert GreatDocs._extract_click_option(param) is None
+        assert cli_click.extract_option(param) is None
 
     def test_type_name_uppercased(self):
         param = MagicMock()
@@ -1717,7 +1236,7 @@ class TestExtractClickOption:
         param.is_eager = False
         param.hidden = False
         param.show_default = True
-        result = GreatDocs._extract_click_option(param)
+        result = cli_click.extract_option(param)
         assert result["type"] == "INT"
         assert result["default"] == 3000
 
@@ -1737,11 +1256,23 @@ class TestExtractClickOption:
         param.envvar = None
         param.is_eager = False
         param.hidden = False
-        result = GreatDocs._extract_click_option(param)
+        result = cli_click.extract_option(param)
         assert result["default"] is None
 
+    def test_choice_values_extracted(self):
+        param = click.Option(["--format"], type=click.Choice(["json", "yaml"]))
+        result = cli_click.extract_option(param)
+        assert result["choices"] == ["json", "yaml"]
 
-class TestExtractClickArgument:
+    def test_deprecation_message_extracted(self):
+        param = click.Option(["--old"], help="Old behaviour.", deprecated="Use --new instead.")
+        result = cli_click.extract_option(param)
+        assert result["deprecated"] == "Use --new instead."
+        # Removing Click's appended notice prevents the page from showing it twice.
+        assert result["help"] == "Old behaviour."
+
+
+class TestExtractArgument:
     def test_basic_argument(self):
         param = MagicMock()
         param.name = "path"
@@ -1749,10 +1280,36 @@ class TestExtractClickArgument:
         param.type.name = "TEXT"
         param.required = True
         param.nargs = 1
-        result = GreatDocs._extract_click_argument(param)
+        result = cli_click.extract_argument(param)
         assert result["name"] == "path"
         assert result["type"] is None
         assert result["required"] is True
+
+    @pytest.mark.parametrize("framework", ["click", "typer"])
+    def test_text_argument_has_no_type(self, framework):
+        if framework == "click":
+            click = pytest.importorskip("click")
+            param = click.Argument(["name"], type=click.STRING)
+        else:
+            pytest.importorskip("typer")
+            import typer
+            from typer.main import get_command
+
+            app = typer.Typer()
+
+            @app.command()
+            def run(name: str): ...
+
+            @app.command()
+            def other(): ...
+
+            param = get_command(app).commands["run"].params[0]
+        assert cli_click.extract_argument(param)["type"] is None
+
+    def test_path_argument_keeps_type(self):
+        click = pytest.importorskip("click")
+        param = click.Argument(["src"], type=click.Path())
+        assert cli_click.extract_argument(param)["type"] == "PATH"
 
     def test_non_text_type_uppercased(self):
         param = MagicMock()
@@ -1761,282 +1318,17 @@ class TestExtractClickArgument:
         param.type.name = "int"
         param.required = False
         param.nargs = -1
-        result = GreatDocs._extract_click_argument(param)
+        result = cli_click.extract_argument(param)
         assert result["type"] == "INT"
         assert result["nargs"] == -1
 
 
 # ---------------------------------------------------------------------------
-# Tag utilities
+# Command pages with variadic arguments, hidden options, environment variables and defaults
 # ---------------------------------------------------------------------------
 
 
-class TestSplitTagParts:
-    def test_simple_slash(self):
-        assert GreatDocs._split_tag_parts("A/B/C") == ["A", "B", "C"]
-
-    def test_escaped_slash_preserved(self):
-        assert GreatDocs._split_tag_parts(r"AI\/LLM") == ["AI/LLM"]
-
-    def test_mixed_escaped_and_real(self):
-        parts = GreatDocs._split_tag_parts(r"AI\/ML/Frameworks")
-        assert parts == ["AI/ML", "Frameworks"]
-
-    def test_empty_parts_stripped(self):
-        assert GreatDocs._split_tag_parts("A//B") == ["A", "B"]
-
-
-class TestTagTooltip:
-    def test_empty_pages(self):
-        assert GreatDocs._tag_tooltip([]) == ""
-
-    def test_single_page_with_section(self):
-        pages = [{"title": "Intro", "section": "Guide"}]
-        result = GreatDocs._tag_tooltip(pages)
-        assert "1" in result
-        assert "Guide" in result
-
-    def test_multiple_pages_no_section(self):
-        pages = [{"title": "A"}, {"title": "B"}]
-        result = GreatDocs._tag_tooltip(pages)
-        assert "2" in result
-
-
-class TestTagHeadingPill:
-    def test_simple_pill(self):
-        result = GreatDocs._tag_heading_pill("Basics", "<svg/>")
-        assert "gd-tag-pill" in result
-        assert "Basics" in result
-        assert "<svg/>" in result
-
-    def test_segmented_pill_with_parent(self):
-        result = GreatDocs._tag_heading_pill("Child", "", parent="Parent", parent_icon="<i/>")
-        assert "gd-tag-pill-segmented" in result
-        assert "Parent" in result
-        assert "Child" in result
-        assert "<i/>" in result
-
-    def test_tooltip_attribute(self):
-        result = GreatDocs._tag_heading_pill("Tag", "", tooltip="5 pages")
-        assert 'data-tippy-content="5 pages"' in result
-
-
-class TestGetTagIconHtml:
-    def test_no_icon_returns_empty(self):
-        result = GreatDocs._get_tag_icon_html("Unknown", {})
-        assert result == ""
-
-    def test_icon_found_returns_svg_span(self):
-        with patch("great_docs._icons.get_icon_svg", return_value="<svg>ok</svg>"):
-            result = GreatDocs._get_tag_icon_html("Guide", {"Guide": "book"})
-        assert "<svg>ok</svg>" in result
-        assert "margin-right" in result
-
-    def test_svg_returns_empty_when_icon_missing(self):
-        with patch("great_docs._icons.get_icon_svg", return_value=None):
-            result = GreatDocs._get_tag_icon_html("X", {"X": "missing-icon"})
-        assert result == ""
-
-
-# ---------------------------------------------------------------------------
-# Page title derivation
-# ---------------------------------------------------------------------------
-
-
-class TestDerivePageTitle:
-    def test_converts_hyphens_and_underscores(self, tmp_path):
-        gd = _make_gd(tmp_path)
-        assert gd._derive_page_title(Path("user-guide_intro.qmd")) == "User Guide Intro"
-
-
-# ---------------------------------------------------------------------------
-# Strip frontmatter
-# ---------------------------------------------------------------------------
-
-
-class TestStripFrontmatter:
-    def test_removes_frontmatter(self, tmp_path):
-        gd = _make_gd(tmp_path)
-        content = "---\ntitle: Hello\n---\nBody text"
-        assert gd._strip_frontmatter(content) == "Body text"
-
-    def test_no_frontmatter_unchanged(self, tmp_path):
-        gd = _make_gd(tmp_path)
-        content = "Just body text"
-        assert gd._strip_frontmatter(content) == content
-
-    def test_incomplete_frontmatter_unchanged(self, tmp_path):
-        gd = _make_gd(tmp_path)
-        content = "---\ntitle: Hello\nNo closing"
-        assert gd._strip_frontmatter(content) == content
-
-
-# ---------------------------------------------------------------------------
-# Detect install extras
-# ---------------------------------------------------------------------------
-
-
-class TestDetectInstallExtras:
-    def test_finds_dev_and_docs(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text(
-            '[project.optional-dependencies]\ndev = ["pytest"]\ndocs = ["sphinx"]\n',
-            encoding="utf-8",
-        )
-        result = GreatDocs._detect_install_extras(tmp_path)
-        assert "dev" in result
-        assert "docs" in result
-
-    def test_no_pyproject_returns_empty(self, tmp_path):
-        assert GreatDocs._detect_install_extras(tmp_path) == ""
-
-    def test_no_optional_deps_returns_empty(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text("[project]\nname = 'pkg'\n", encoding="utf-8")
-        assert GreatDocs._detect_install_extras(tmp_path) == ""
-
-    def test_invalid_toml_returns_empty(self, tmp_path):
-        pyproject = tmp_path / "pyproject.toml"
-        pyproject.write_text("{{{{invalid", encoding="utf-8")
-        assert GreatDocs._detect_install_extras(tmp_path) == ""
-
-
-# ---------------------------------------------------------------------------
-# Inspect repo git needs
-# ---------------------------------------------------------------------------
-
-
-class TestInspectRepoGitNeeds:
-    def test_no_config_returns_none(self, tmp_path):
-        assert GreatDocs._inspect_repo_git_needs(tmp_path) == "none"
-
-    def test_versions_returns_full(self, tmp_path):
-        cfg = tmp_path / "great-docs.yml"
-        cfg.write_text("versions:\n  - v1.0\n  - v2.0\n", encoding="utf-8")
-        assert GreatDocs._inspect_repo_git_needs(tmp_path) == "full"
-
-    def test_show_dates_returns_full(self, tmp_path):
-        cfg = tmp_path / "great-docs.yml"
-        cfg.write_text("show_dates: true\n", encoding="utf-8")
-        assert GreatDocs._inspect_repo_git_needs(tmp_path) == "full"
-
-    def test_show_dates_in_site_returns_full(self, tmp_path):
-        cfg = tmp_path / "great-docs.yml"
-        cfg.write_text("site:\n  show_dates: true\n", encoding="utf-8")
-        assert GreatDocs._inspect_repo_git_needs(tmp_path) == "full"
-
-    def test_source_without_branch_returns_tags(self, tmp_path):
-        cfg = tmp_path / "great-docs.yml"
-        cfg.write_text("source:\n  repository: https://github.com/org/repo\n", encoding="utf-8")
-        assert GreatDocs._inspect_repo_git_needs(tmp_path) == "tags"
-
-    def test_source_with_branch_returns_none(self, tmp_path):
-        cfg = tmp_path / "great-docs.yml"
-        cfg.write_text("source:\n  branch: main\n", encoding="utf-8")
-        assert GreatDocs._inspect_repo_git_needs(tmp_path) == "none"
-
-    def test_invalid_yaml_returns_none(self, tmp_path):
-        cfg = tmp_path / "great-docs.yml"
-        cfg.write_text("{{invalid yaml", encoding="utf-8")
-        assert GreatDocs._inspect_repo_git_needs(tmp_path) == "none"
-
-
-# ---------------------------------------------------------------------------
-# _get_package_exports – cache hit path
-# ---------------------------------------------------------------------------
-
-
-class TestGetPackageExportsCacheHit:
-    def test_returns_cached_exports(self, tmp_path):
-        gd = _make_gd(tmp_path)
-        gd._cached_package_name = "mypkg"
-        gd._cached_exports = ["Foo", "Bar"]
-        result = gd._get_package_exports("mypkg")
-        assert result == ["Foo", "Bar"]
-
-    def test_cache_miss_triggers_discovery(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd._cached_package_name = None
-        gd._cached_exports = None
-        monkeypatch.setattr(gd, "_discover_package_exports", lambda p: ["X"])
-        result = gd._get_package_exports("mypkg")
-        assert result == ["X"]
-        assert gd._cached_package_name == "mypkg"
-        assert gd._cached_exports == ["X"]
-
-    def test_fallback_to_parse_when_discover_returns_none(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd._cached_package_name = None
-        gd._cached_exports = None
-        monkeypatch.setattr(gd, "_discover_package_exports", lambda p: None)
-        monkeypatch.setattr(gd, "_parse_package_exports", lambda p: ["Y"])
-        result = gd._get_package_exports("mypkg")
-        assert result == ["Y"]
-
-
-# ---------------------------------------------------------------------------
-# _add_tags_to_navbar – all branches
-# ---------------------------------------------------------------------------
-
-
-class TestAddTagsToNavbar:
-    def test_no_quarto_yml_returns_early(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
-        gd._add_tags_to_navbar()
-
-    def test_no_navbar_returns_early(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
-        quarto = gd.build_dir / "_quarto.yml"
-        quarto.write_text("website:\n  title: Test\n", encoding="utf-8")
-        gd._add_tags_to_navbar()
-
-    def test_no_left_key_returns_early(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
-        quarto = gd.build_dir / "_quarto.yml"
-        quarto.write_text(
-            "website:\n  navbar:\n    right:\n      - icon: github\n", encoding="utf-8"
-        )
-        gd._add_tags_to_navbar()
-
-    def test_already_present_skips(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
-        quarto = gd.build_dir / "_quarto.yml"
-        quarto.write_text(
-            "website:\n  navbar:\n    left:\n      - text: Site Tags\n        href: tags/index.qmd\n",
-            encoding="utf-8",
-        )
-        gd._add_tags_to_navbar()
-        content = quarto.read_text(encoding="utf-8")
-        assert content.count("Site Tags") == 1
-
-    def test_adds_tags_link(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
-        quarto = gd.build_dir / "_quarto.yml"
-        quarto.write_text(
-            "website:\n  navbar:\n    left:\n      - text: Reference\n        href: reference/index.qmd\n",
-            encoding="utf-8",
-        )
-        gd._add_tags_to_navbar()
-        content = quarto.read_text(encoding="utf-8")
-        assert "Tags" in content
-
-
-# ---------------------------------------------------------------------------
-# _generate_cli_command_page – edge cases (nargs, hidden, bullets, envvar, default)
-# ---------------------------------------------------------------------------
-
-
-class TestGenerateCliCommandPage:
+class TestCommandPage:
     def _make_cli_info(self, **overrides):
         base = {
             "name": "mycli",
@@ -2049,20 +1341,14 @@ class TestGenerateCliCommandPage:
         base.update(overrides)
         return base
 
-    def test_nargs_minus1_gets_ellipsis(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
+    def test_nargs_minus1_gets_ellipsis(self):
         cli_info = self._make_cli_info(
             arguments=[{"name": "FILES", "name_display": "FILES", "required": True, "nargs": -1}]
         )
-        result = gd._generate_cli_command_page(cli_info, is_main=True)
+        result = cli_render.command_page(mock_config(lang="en"), cli_info, is_main=True)
         assert "FILES..." in result
 
-    def test_hidden_option_skipped(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
+    def test_hidden_option_skipped(self):
         cli_info = self._make_cli_info(
             options=[
                 {"name": "--verbose", "name_display": "--verbose", "hidden": True, "help": "debug"},
@@ -2074,14 +1360,11 @@ class TestGenerateCliCommandPage:
                 },
             ]
         )
-        result = gd._generate_cli_command_page(cli_info, is_main=True)
+        result = cli_render.command_page(mock_config(lang="en"), cli_info, is_main=True)
         assert "output" in result
         assert "verbose" not in result
 
-    def test_option_with_type_and_default(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
+    def test_option_with_type_and_default(self):
         cli_info = self._make_cli_info(
             options=[
                 {
@@ -2094,14 +1377,11 @@ class TestGenerateCliCommandPage:
                 }
             ]
         )
-        result = gd._generate_cli_command_page(cli_info, is_main=True)
+        result = cli_render.command_page(mock_config(lang="en"), cli_info, is_main=True)
         assert "INT" in result
         assert "5" in result
 
-    def test_required_option(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
+    def test_required_option(self):
         cli_info = self._make_cli_info(
             options=[
                 {
@@ -2112,13 +1392,10 @@ class TestGenerateCliCommandPage:
                 }
             ]
         )
-        result = gd._generate_cli_command_page(cli_info, is_main=True)
+        result = cli_render.command_page(mock_config(lang="en"), cli_info, is_main=True)
         assert "**Required.**" in result
 
-    def test_envvar_option(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
+    def test_envvar_option(self):
         cli_info = self._make_cli_info(
             options=[
                 {
@@ -2129,13 +1406,10 @@ class TestGenerateCliCommandPage:
                 }
             ]
         )
-        result = gd._generate_cli_command_page(cli_info, is_main=True)
+        result = cli_render.command_page(mock_config(lang="en"), cli_info, is_main=True)
         assert "`MY_TOKEN`" in result
 
-    def test_envvar_list_joined(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
+    def test_envvar_list_joined(self):
         cli_info = self._make_cli_info(
             options=[
                 {
@@ -2146,115 +1420,150 @@ class TestGenerateCliCommandPage:
                 }
             ]
         )
-        result = gd._generate_cli_command_page(cli_info, is_main=True)
+        result = cli_render.command_page(mock_config(lang="en"), cli_info, is_main=True)
         assert "TOKEN_A, TOKEN_B" in result
 
+    def test_choice_values_shown_as_type(self):
+        cli_info = self._make_cli_info(
+            options=[
+                {"names": ["--format"], "type": "CHOICE", "choices": ["json", "yaml"]},
+            ]
+        )
+        result = cli_render.command_page(mock_config(lang="en"), cli_info, is_main=True)
+        assert '<span class="doc-parameter-annotation">[json|yaml]</span>' in result
+
+    def test_deprecated_option_marked_with_message(self):
+        cli_info = self._make_cli_info(
+            options=[
+                {
+                    "names": ["--old"],
+                    "name_display": "--old",
+                    "deprecated": "Use --new instead.",
+                    "help": "Old behaviour.",
+                },
+            ]
+        )
+        result = cli_render.command_page(mock_config(lang="en"), cli_info, is_main=True)
+        assert ":   **Deprecated.** Use --new instead.\\\n    Old behaviour." in result
+
+    def test_deprecated_command_gets_warning_callout(self):
+        cli_info = self._make_cli_info(deprecated="Use `mycli run` instead.")
+        result = cli_render.command_page(mock_config(lang="en"), cli_info, is_main=True)
+        assert '::: {.callout-warning title="Deprecated"}\nUse `mycli run` instead.\n:::' in result
+
+    def test_argument_help_rendered(self):
+        cli_info = self._make_cli_info(
+            arguments=[{"name": "input", "required": True, "help": "The file to read."}]
+        )
+        result = cli_render.command_page(mock_config(lang="en"), cli_info, is_main=True)
+        assert ":   Required. The file to read." in result
+
+    def test_parameter_markup_characters_escaped(self):
+        # A clap option's name carries its value name, as in `--config <PATH>`.
+        cli_info = self._make_cli_info(
+            arguments=[{"name": "src", "name_display": "<src>", "type": "<T>"}],
+            options=[
+                {
+                    "name_display": "-c, --config <PATH>",
+                    "type": "A&B",
+                    "default": "<stdin>",
+                    "is_flag": False,
+                }
+            ],
+        )
+        result = cli_render.command_page(mock_config(lang="en"), cli_info, is_main=True)
+        assert '<span class="doc-parameter-name">&lt;SRC&gt;</span>' in result
+        assert '<span class="doc-parameter-annotation">&lt;T&gt;</span>' in result
+        assert "-c, &#45;&#45;config &lt;PATH&gt;</span>" in result
+        assert '<span class="doc-parameter-annotation">A&amp;B</span>' in result
+        assert '<span class="doc-parameter-default">&lt;stdin&gt;</span>' in result
+
+    def test_index_title_with_quotes_is_valid_yaml(self):
+        config = mock_config(lang="en", cli_title='The "gd" tool')
+        page = cli_render.index_page(config, self._make_cli_info(), "mycli")
+        front_matter = page.split("---\n")[1]
+        assert yaml.safe_load(front_matter)["title"] == 'The "gd" tool'
+
+    def test_sections_order_the_sidebar_entries(self, tmp_path):
+        cli_info = self._make_cli_info(
+            commands=[
+                self._make_cli_info(name=n, full_path=f"mycli {n}")
+                for n in ("build", "deploy", "init")
+            ]
+        )
+        config = mock_config(
+            lang="en", cli_sections=[{"title": "Main", "contents": ["init", "build", "deploy"]}]
+        )
+        layout = _make_gd(tmp_path).layout
+        items = cli_render.write_pages(config, layout, cli_info, report=lambda _: None)
+        assert items[2:] == [f"reference/cli/{n}.qmd" for n in ("init", "build", "deploy")]
+
+    def test_index_skips_section_commands_that_are_missing_or_hidden(self):
+        cli_info = self._make_cli_info(
+            commands=[
+                self._make_cli_info(name="build"),
+                self._make_cli_info(name="secret", hidden=True),
+            ]
+        )
+        config = mock_config(
+            lang="en", cli_sections=[{"title": "Main", "contents": ["build", "secret", "gone"]}]
+        )
+        page = cli_render.index_page(config, cli_info, "mycli")
+        assert "(build.qmd)" in page
+        assert "secret" not in page
+        assert "gone" not in page
+
+    def test_bullet_markers_are_stripped_into_list_items(self):
+        description = "Summary.\n\nSteps:\n• first\n- second\n* third\n  \nplain"
+        page = cli_render.command_page(
+            mock_config(lang="en"), self._make_cli_info(description=description), is_main=True
+        )
+        assert "- first\n- second\n- third\n- plain\n" in page
+        assert "• first" not in page
+
+    def test_pages_written_as_utf8_whatever_the_locale(self, tmp_path, monkeypatch):
+        # Stand in for a locale whose code page lacks `•`, such as cp1252 on Windows.
+        monkeypatch.setattr(io, "text_encoding", lambda encoding, stacklevel=2: encoding or "ascii")
+        sub = self._make_cli_info(
+            name="sub", full_path="mycli sub", short_help="Run • fast.", description="Run • fast."
+        )
+        cli_info = self._make_cli_info(description="Root • tool.", commands=[sub])
+        layout = _make_gd(tmp_path).layout
+        cli_render.write_pages(mock_config(lang="en"), layout, cli_info, report=lambda _: None)
+        cli_dir = layout.build_dir / "reference" / "cli"
+        assert "Run • fast." in (cli_dir / "index.qmd").read_text(encoding="utf-8")
+        assert "Root • tool." in (cli_dir / "mycli.qmd").read_text(encoding="utf-8")
+        assert "Run • fast." in (cli_dir / "sub.qmd").read_text(encoding="utf-8")
+
 
 # ---------------------------------------------------------------------------
-# _count_cli_sidebar_items – dict with href
+# Labelled sidebar links
 # ---------------------------------------------------------------------------
 
 
-class TestCountCliSidebarItems:
+class TestCountPages:
     def test_string_items_counted(self):
-        assert GreatDocs._count_cli_sidebar_items(["a.qmd", "b.qmd"]) == 2
+        assert cli_render.count_pages(["a.qmd", "b.qmd"]) == 2
 
     def test_dict_with_href_counted_as_one(self):
         items = [{"text": "Index", "href": "index.qmd"}]
-        assert GreatDocs._count_cli_sidebar_items(items) == 1
+        assert cli_render.count_pages(items) == 1
 
     def test_nested_contents(self):
         items = [{"contents": ["a.qmd", "b.qmd"]}]
-        assert GreatDocs._count_cli_sidebar_items(items) == 2
+        assert cli_render.count_pages(items) == 2
 
 
 # ---------------------------------------------------------------------------
-# _generate_package_info_page – early returns and marker branch
+# Crawler rules, sitemap references and AI context file references
 # ---------------------------------------------------------------------------
 
 
-class TestGeneratePackageInfoPage:
-    def test_disabled_returns_none(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        _patch_cfg(monkeypatch, gd, "package_info_page", False)
-        assert gd._generate_package_info_page() is None
-
-    def test_not_python_project_returns_none(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        _patch_cfg(monkeypatch, gd, "package_info_page", True)
-        _patch_cfg(monkeypatch, gd, "is_python_project", False)
-        assert gd._generate_package_info_page() is None
-
-    def test_no_deps_returns_none(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        _patch_cfg(monkeypatch, gd, "package_info_page", True)
-        _patch_cfg(monkeypatch, gd, "is_python_project", True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
-        monkeypatch.setattr(
-            gd,
-            "_get_package_metadata",
-            lambda: {"dependencies": [], "optional_dependencies_full": {}, "requires_python": ""},
-        )
-        assert gd._generate_package_info_page() is None
-
-    def test_generates_page_with_optional_markers(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "package_info_page", True)
-        _patch_cfg(monkeypatch, gd, "is_python_project", True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
-        monkeypatch.setattr(
-            gd,
-            "_get_package_metadata",
-            lambda: {
-                "dependencies": [{"name": "click", "specifier": ">=8.0"}],
-                "optional_dependencies_full": {
-                    "dev": [
-                        {"name": "pytest", "specifier": ">=7.0", "marker": 'python_version>="3.9"'},
-                    ]
-                },
-                "requires_python": ">=3.9",
-            },
-        )
-        monkeypatch.setattr(gd, "_fetch_pypi_dates", lambda names: {})
-        result = gd._generate_package_info_page()
-        assert result == "package-info.qmd"
-        content = (gd.build_dir / "package-info.qmd").read_text()
-        assert "click" in content
-        assert "pytest" in content
-
-    def test_empty_optional_group(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "package_info_page", True)
-        _patch_cfg(monkeypatch, gd, "is_python_project", True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
-        monkeypatch.setattr(
-            gd,
-            "_get_package_metadata",
-            lambda: {
-                "dependencies": [{"name": "click", "specifier": ">=8.0"}],
-                "optional_dependencies_full": {"empty": []},
-                "requires_python": "",
-            },
-        )
-        monkeypatch.setattr(gd, "_fetch_pypi_dates", lambda names: {})
-        result = gd._generate_package_info_page()
-        assert result == "package-info.qmd"
-        content = (gd.build_dir / "package-info.qmd").read_text()
-        assert "No dependencies declared" in content
-
-
-# ---------------------------------------------------------------------------
-# _generate_robots_txt – llms.txt and sitemap branches
-# ---------------------------------------------------------------------------
-
-
-class TestGenerateRobotsTxt:
+class TestRobotsWrite:
     def _setup_gd(self, tmp_path, monkeypatch, **config_overrides):
         gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        site_dir = gd.build_dir / "_site"
+        gd.layout.build_dir.mkdir(parents=True, exist_ok=True)
+        site_dir = gd.layout.build_dir / "_site"
         site_dir.mkdir()
         _patch_cfg(monkeypatch, gd, "robots_enabled", True)
         _patch_cfg(monkeypatch, gd, "robots_allow_all", True)
@@ -2268,23 +1577,22 @@ class TestGenerateRobotsTxt:
 
     def test_basic_robots_txt(self, tmp_path, monkeypatch):
         gd, site_dir = self._setup_gd(tmp_path, monkeypatch)
-        monkeypatch.setattr(gd, "_get_canonical_base_url", lambda: None)
-        gd._generate_robots_txt()
+        robots.write(site_dir, gd._config, None, report=print)
         content = (site_dir / "robots.txt").read_text()
         assert "Allow: /" in content
 
     def test_no_site_dir_skips(self, tmp_path, monkeypatch):
         gd = _make_gd(tmp_path)
         _patch_cfg(monkeypatch, gd, "robots_enabled", True)
-        gd._generate_robots_txt()
-        assert not (gd.build_dir / "_site" / "robots.txt").exists()
+        site_dir = gd.layout.build_dir / "_site"
+        robots.write(site_dir, gd._config, None, report=print)
+        assert not (site_dir / "robots.txt").exists()
 
     def test_disallow_rules(self, tmp_path, monkeypatch):
         gd, site_dir = self._setup_gd(
             tmp_path, monkeypatch, robots_disallow=["/private/", "/admin/"]
         )
-        monkeypatch.setattr(gd, "_get_canonical_base_url", lambda: None)
-        gd._generate_robots_txt()
+        robots.write(site_dir, gd._config, None, report=print)
         content = (site_dir / "robots.txt").read_text()
         assert "Disallow: /private/" in content
         assert "Disallow: /admin/" in content
@@ -2295,33 +1603,29 @@ class TestGenerateRobotsTxt:
             monkeypatch,
             robots_extra_rules=["User-agent: GPTBot", "Disallow: /"],
         )
-        monkeypatch.setattr(gd, "_get_canonical_base_url", lambda: None)
-        gd._generate_robots_txt()
+        robots.write(site_dir, gd._config, None, report=print)
         content = (site_dir / "robots.txt").read_text()
         assert "User-agent: GPTBot" in content
 
     def test_sitemap_reference(self, tmp_path, monkeypatch):
         gd, site_dir = self._setup_gd(tmp_path, monkeypatch, sitemap_enabled=True)
-        monkeypatch.setattr(gd, "_get_canonical_base_url", lambda: "https://example.com/")
-        gd._generate_robots_txt()
+        robots.write(site_dir, gd._config, "https://example.com/", report=print)
         content = (site_dir / "robots.txt").read_text()
         assert "Sitemap: https://example.com/sitemap.xml" in content
 
     def test_llms_txt_references(self, tmp_path, monkeypatch):
         gd, site_dir = self._setup_gd(tmp_path, monkeypatch)
-        monkeypatch.setattr(gd, "_get_canonical_base_url", lambda: "https://example.com/")
         (site_dir / "llms.txt").write_text("llms content", encoding="utf-8")
         (site_dir / "llms-full.txt").write_text("full content", encoding="utf-8")
-        gd._generate_robots_txt()
+        robots.write(site_dir, gd._config, "https://example.com/", report=print)
         content = (site_dir / "robots.txt").read_text()
         assert "Llms-txt: https://example.com/llms.txt" in content
         assert "Llms-txt: https://example.com/llms-full.txt" in content
 
     def test_llms_txt_only_one(self, tmp_path, monkeypatch):
         gd, site_dir = self._setup_gd(tmp_path, monkeypatch)
-        monkeypatch.setattr(gd, "_get_canonical_base_url", lambda: "https://example.com/")
         (site_dir / "llms.txt").write_text("llms content", encoding="utf-8")
-        gd._generate_robots_txt()
+        robots.write(site_dir, gd._config, "https://example.com/", report=print)
         content = (site_dir / "robots.txt").read_text()
         assert "Llms-txt: https://example.com/llms.txt" in content
         assert "llms-full.txt" not in content
@@ -2332,38 +1636,41 @@ class TestCanonicalIntegration:
 
     def test_base_url_falls_back_to_the_github_pages_address(self, tmp_path, monkeypatch):
         gd = _make_gd(tmp_path)
-        monkeypatch.setattr(gd, "_get_github_repo_info", lambda: ("acme", "mypkg", None))
-        assert gd._get_canonical_base_url() == "https://acme.github.io/mypkg/"
+        _put_on_github(tmp_path)
+        assert (
+            site.identity(gd._config, gd.layout, make_project(gd)).base_url
+            == "https://acme.github.io/mypkg/"
+        )
 
     def test_raw_custom_page_gets_a_canonical_link(self, tmp_path, monkeypatch):
         gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        (gd.build_dir / "_quarto.yml").write_text(
+        gd.layout.build_dir.mkdir(parents=True, exist_ok=True)
+        (gd.layout.build_dir / "_quarto.yml").write_text(
             "website:\n  sidebar: []\n  navbar:\n    left: []\n", encoding="utf-8"
         )
-        monkeypatch.setattr(gd, "_get_canonical_base_url", lambda: "https://docs.example.com/pkg/")
+        _put_on_github(tmp_path)
         custom = tmp_path / "custom"
         custom.mkdir()
         (custom / "widget.html").write_text(
             "---\nlayout: raw\n---\n<html><head></head></html>", encoding="utf-8"
         )
 
-        gd._process_custom_pages()
+        custom_pages_step(gd, discover_user_guide(gd))
 
-        page = (gd.build_dir / "custom" / "widget.html").read_text(encoding="utf-8")
+        page = (gd.layout.build_dir / "custom" / "widget.html").read_text(encoding="utf-8")
         assert (
-            '<link rel="canonical" href="https://docs.example.com/pkg/custom/widget.html">' in page
+            '<link rel="canonical" href="https://acme.github.io/mypkg/custom/widget.html">' in page
         )
 
     def test_raw_custom_reference_page_gets_structured_data(self, tmp_path):
         (tmp_path / "great-docs.yml").write_text(
-            "module: mypkg\ncustom_pages:\n  - dir: custom\n    output: reference\n",
+            "module: mypkg\ndisplay_name: Pkg\ncustom_pages:\n  - dir: custom\n    output: reference\n",
             encoding="utf-8",
         )
         gd = GreatDocs(project_path=str(tmp_path))
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        (gd.build_dir / "_quarto.yml").write_text(
-            "website:\n  title: Pkg\n  sidebar: []\n  navbar:\n    left: []\n", encoding="utf-8"
+        gd.layout.build_dir.mkdir(parents=True, exist_ok=True)
+        (gd.layout.build_dir / "_quarto.yml").write_text(
+            "website:\n  sidebar: []\n  navbar:\n    left: []\n", encoding="utf-8"
         )
         custom = tmp_path / "custom"
         custom.mkdir()
@@ -2371,23 +1678,23 @@ class TestCanonicalIntegration:
             "---\nlayout: raw\n---\n<html><head></head></html>", encoding="utf-8"
         )
 
-        gd._process_custom_pages()
+        custom_pages_step(gd, discover_user_guide(gd))
 
-        page = (gd.build_dir / "reference" / "demo.html").read_text(encoding="utf-8")
+        page = (gd.layout.build_dir / "reference" / "demo.html").read_text(encoding="utf-8")
         assert page.count('<script type="application/ld+json">') == 1
         assert '"name": "demo - Pkg"' in page
 
     @pytest.mark.parametrize("seo", ["true", "false"])
     def test_raw_custom_page_gets_social_cards(self, tmp_path, monkeypatch, seo):
         (tmp_path / "great-docs.yml").write_text(
-            f"module: mypkg\nseo:\n  enabled: {seo}\n", encoding="utf-8"
+            f"module: mypkg\ndisplay_name: Pkg\nseo:\n  enabled: {seo}\n", encoding="utf-8"
         )
         gd = GreatDocs(project_path=str(tmp_path))
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        (gd.build_dir / "_quarto.yml").write_text(
-            "website:\n  title: Pkg\n  sidebar: []\n  navbar:\n    left: []\n", encoding="utf-8"
+        gd.layout.build_dir.mkdir(parents=True, exist_ok=True)
+        (gd.layout.build_dir / "_quarto.yml").write_text(
+            "website:\n  sidebar: []\n  navbar:\n    left: []\n", encoding="utf-8"
         )
-        monkeypatch.setattr(gd, "_get_canonical_base_url", lambda: "https://docs.example.com/pkg/")
+        _put_on_github(tmp_path)
         custom = tmp_path / "custom"
         custom.mkdir()
         (custom / "widget.html").write_text(
@@ -2395,13 +1702,13 @@ class TestCanonicalIntegration:
             encoding="utf-8",
         )
 
-        gd._process_custom_pages()
+        custom_pages_step(gd, discover_user_guide(gd))
 
-        page = (gd.build_dir / "custom" / "widget.html").read_text(encoding="utf-8")
+        page = (gd.layout.build_dir / "custom" / "widget.html").read_text(encoding="utf-8")
         assert page.count('<meta property="og:title" content="Widget Lab">') == 1
         assert '<meta property="og:site_name" content="Pkg">' in page
         assert (
-            '<meta property="og:url" content="https://docs.example.com/pkg/custom/widget.html">'
+            '<meta property="og:url" content="https://acme.github.io/mypkg/custom/widget.html">'
             in page
         )
         assert '<meta name="twitter:card" content="summary">' in page
@@ -2411,8 +1718,8 @@ class TestCanonicalIntegration:
             "module: mypkg\nsite:\n  lang: fr\n", encoding="utf-8"
         )
         gd = GreatDocs(project_path=str(tmp_path))
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        (gd.build_dir / "_quarto.yml").write_text(
+        gd.layout.build_dir.mkdir(parents=True, exist_ok=True)
+        (gd.layout.build_dir / "_quarto.yml").write_text(
             "website:\n  sidebar: []\n  navbar:\n    left: []\n", encoding="utf-8"
         )
         custom = tmp_path / "custom"
@@ -2421,9 +1728,9 @@ class TestCanonicalIntegration:
             "---\nlayout: raw\n---\n<html><head></head></html>", encoding="utf-8"
         )
 
-        gd._process_custom_pages()
+        custom_pages_step(gd, discover_user_guide(gd))
 
-        page = (gd.build_dir / "custom" / "widget.html").read_text(encoding="utf-8")
+        page = (gd.layout.build_dir / "custom" / "widget.html").read_text(encoding="utf-8")
         assert page.count('<meta name="gd-i18n"') == 1
 
 
@@ -2434,22 +1741,21 @@ class TestPageDescriptions:
 
     def _gd(self, tmp_path: Path, monkeypatch, *, default: str | None = "Site default"):
         gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        (gd.build_dir / "_quarto.yml").write_text(
+        gd.layout.build_dir.mkdir(parents=True, exist_ok=True)
+        (gd.layout.build_dir / "_quarto.yml").write_text(
             "website:\n  sidebar: []\n  navbar:\n    left: []\n", encoding="utf-8"
         )
         _patch_cfg(monkeypatch, gd, "seo_default_description", default)
-        monkeypatch.setattr(gd, "_get_package_metadata", lambda: {})
         return gd
 
     def test_pages_get_their_opening_paragraph_or_the_default(self, tmp_path, monkeypatch):
         gd = self._gd(tmp_path, monkeypatch)
-        prose = gd.build_dir / "guide.qmd"
+        prose = gd.layout.build_dir / "guide.qmd"
         prose.write_text(f"---\ntitle: Guide\n---\n\n{self.LONG}\n", encoding="utf-8")
-        code = gd.build_dir / "code.qmd"
+        code = gd.layout.build_dir / "code.qmd"
         code.write_text("```python\nx = 1\n```\n", encoding="utf-8")
 
-        gd._write_page_metadata()
+        freeze_cache_step(gd)
 
         assert f"description-meta: {self.LONG}" in prose.read_text(encoding="utf-8")
         assert "description-meta: Site default" in code.read_text(encoding="utf-8")
@@ -2458,30 +1764,30 @@ class TestPageDescriptions:
         gd = self._gd(tmp_path, monkeypatch)
         _patch_cfg(monkeypatch, gd, "seo_enabled", False)
         _patch_cfg(monkeypatch, gd, "social_cards_enabled", False)
-        page = gd.build_dir / "guide.qmd"
+        page = gd.layout.build_dir / "guide.qmd"
         page.write_text(f"{self.LONG}\n", encoding="utf-8")
 
-        gd._write_page_metadata()
+        freeze_cache_step(gd)
 
         assert "description-meta" not in page.read_text(encoding="utf-8")
 
     def test_versioned_sites_are_described_per_version(self, tmp_path, monkeypatch):
         gd = self._gd(tmp_path, monkeypatch)
         _patch_cfg(monkeypatch, gd, "has_versions", True)
-        page = gd.build_dir / "guide.qmd"
+        page = gd.layout.build_dir / "guide.qmd"
         page.write_text(f"{self.LONG}\n", encoding="utf-8")
 
-        gd._write_page_metadata()
+        freeze_cache_step(gd)
 
         assert "description-meta" not in page.read_text(encoding="utf-8")
 
     def test_versioned_sites_are_described_when_watching(self, tmp_path, monkeypatch):
         gd = self._gd(tmp_path, monkeypatch)
         _patch_cfg(monkeypatch, gd, "has_versions", True)
-        page = gd.build_dir / "guide.qmd"
+        page = gd.layout.build_dir / "guide.qmd"
         page.write_text(f"---\nscale-to-fit: [.wide]\n---\n\n{self.LONG}\n", encoding="utf-8")
 
-        gd._write_page_metadata(watch=True)
+        freeze_cache_step(gd, watch=True)
 
         content = page.read_text(encoding="utf-8")
         assert "description-meta" in content
@@ -2489,11 +1795,11 @@ class TestPageDescriptions:
 
     def test_default_falls_back_to_the_package_description(self, tmp_path, monkeypatch):
         gd = self._gd(tmp_path, monkeypatch, default=None)
-        monkeypatch.setattr(
-            gd, "_get_package_metadata", lambda: {"description": "From `pyproject`"}
+        (tmp_path / "pyproject.toml").write_text(
+            '[project]\nname = "mypkg"\ndescription = "From `pyproject`"\n', encoding="utf-8"
         )
 
-        assert gd._default_description() == "From pyproject"
+        assert site.default_description(gd._config, make_project(gd)) == "From pyproject"
 
     def test_raw_custom_page_gets_the_default(self, tmp_path, monkeypatch):
         gd = self._gd(tmp_path, monkeypatch, default="Tom & Jerry")
@@ -2503,401 +1809,87 @@ class TestPageDescriptions:
             "---\nlayout: raw\n---\n<html><head></head></html>", encoding="utf-8"
         )
 
-        gd._process_custom_pages()
+        custom_pages_step(gd, discover_user_guide(gd))
 
-        page = (gd.build_dir / "custom" / "widget.html").read_text(encoding="utf-8")
+        page = (gd.layout.build_dir / "custom" / "widget.html").read_text(encoding="utf-8")
         assert page.count('<meta name="description" content="Tom &amp; Jerry">') == 1
 
 
 # ---------------------------------------------------------------------------
-# _inject_version_selector – full function coverage
+# Freeze cache merging and JavaScript newlines
 # ---------------------------------------------------------------------------
 
 
-class TestInjectVersionSelector:
-    def test_basic_injection(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        quarto_yml = gd.build_dir / "_quarto.yml"
-        quarto_yml.write_text(
-            "project:\n  resources: []\nformat:\n  html:\n    include-in-header: []\n    include-after-body: []\n",
-            encoding="utf-8",
-        )
-        mock_versions = [MagicMock(tag="v1.0"), MagicMock(tag="v2.0")]
-        monkeypatch.setattr(
-            "great_docs._versioning.parse_versions_config",
-            lambda v: mock_versions,
-        )
-        monkeypatch.setattr(
-            "great_docs._versioning.build_version_map",
-            lambda versions, pages: {"versions": [{"tag": "v1.0"}, {"tag": "v2.0"}]},
-        )
-        _patch_cfg(monkeypatch, gd, "versions", [{"tag": "v1.0"}, {"tag": "v2.0"}])
-        _patch_cfg(monkeypatch, gd, "version_warning_banner", True)
-        gd._inject_version_selector(quarto_yml)
-        content = quarto_yml.read_text()
-        assert "gd-version-map" in content
-        assert "version-selector.js" in content
+def _historical_cache(root: Path, name: str) -> Path:
+    """
+    Create an empty freeze cache in a recognised historical build directory
 
-    def test_string_header_converted_to_list(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        quarto_yml = gd.build_dir / "_quarto.yml"
-        quarto_yml.write_text(
-            "project:\n  resources: []\nformat:\n  html:\n    include-in-header: old-header.html\n    include-after-body: []\n",
-            encoding="utf-8",
-        )
-        mock_versions = [MagicMock(tag="v1.0")]
-        monkeypatch.setattr(
-            "great_docs._versioning.parse_versions_config",
-            lambda v: mock_versions,
-        )
-        monkeypatch.setattr(
-            "great_docs._versioning.build_version_map",
-            lambda versions, pages: {},
-        )
-        _patch_cfg(monkeypatch, gd, "versions", [])
-        _patch_cfg(monkeypatch, gd, "version_warning_banner", True)
-        gd._inject_version_selector(quarto_yml)
-        content = quarto_yml.read_text()
-        assert "gd-version-map" in content
+    Parameters
+    ----------
+    root
+        The project root containing root-layout build directories.
+    name
+        The build directory's name.
 
-    def test_string_after_body_converted_to_list(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        quarto_yml = gd.build_dir / "_quarto.yml"
-        quarto_yml.write_text(
-            "project:\n  resources: []\nformat:\n  html:\n    include-in-header: []\n    include-after-body: old-body.html\n",
-            encoding="utf-8",
-        )
-        mock_versions = [MagicMock(tag="v1.0")]
-        monkeypatch.setattr(
-            "great_docs._versioning.parse_versions_config",
-            lambda v: mock_versions,
-        )
-        monkeypatch.setattr(
-            "great_docs._versioning.build_version_map",
-            lambda versions, pages: {},
-        )
-        _patch_cfg(monkeypatch, gd, "versions", [])
-        _patch_cfg(monkeypatch, gd, "version_warning_banner", True)
-        gd._inject_version_selector(quarto_yml)
-        content = quarto_yml.read_text()
-        assert "version-selector" in content
-
-    def test_warning_banner_disabled(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        quarto_yml = gd.build_dir / "_quarto.yml"
-        quarto_yml.write_text(
-            "project:\n  resources: []\nformat:\n  html:\n    include-in-header: []\n    include-after-body: []\n",
-            encoding="utf-8",
-        )
-        mock_versions = [MagicMock(tag="v1.0")]
-        monkeypatch.setattr(
-            "great_docs._versioning.parse_versions_config",
-            lambda v: mock_versions,
-        )
-        monkeypatch.setattr(
-            "great_docs._versioning.build_version_map",
-            lambda versions, pages: {},
-        )
-        _patch_cfg(monkeypatch, gd, "versions", [])
-        _patch_cfg(monkeypatch, gd, "version_warning_banner", False)
-        gd._inject_version_selector(quarto_yml)
-        content = quarto_yml.read_text()
-        assert "gd-version-warning-banner" in content
-
-    def test_inserts_before_navbar_widgets(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        quarto_yml = gd.build_dir / "_quarto.yml"
-        quarto_yml.write_text(
-            "project:\n  resources: []\nformat:\n  html:\n    include-in-header: []\n    include-after-body:\n      - text: '<script src=\"navbar-widgets.js\"></script>'\n",
-            encoding="utf-8",
-        )
-        mock_versions = [MagicMock(tag="v1.0")]
-        monkeypatch.setattr(
-            "great_docs._versioning.parse_versions_config",
-            lambda v: mock_versions,
-        )
-        monkeypatch.setattr(
-            "great_docs._versioning.build_version_map",
-            lambda versions, pages: {},
-        )
-        _patch_cfg(monkeypatch, gd, "versions", [])
-        _patch_cfg(monkeypatch, gd, "version_warning_banner", True)
-        gd._inject_version_selector(quarto_yml)
-        content = quarto_yml.read_text()
-        assert "version-selector" in content
-
-    def test_resources_list_not_duplicated(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        quarto_yml = gd.build_dir / "_quarto.yml"
-        quarto_yml.write_text(
-            "project:\n  resources:\n    - version-selector.js\nformat:\n  html:\n    include-in-header: []\n    include-after-body: []\n",
-            encoding="utf-8",
-        )
-        mock_versions = [MagicMock(tag="v1.0")]
-        monkeypatch.setattr(
-            "great_docs._versioning.parse_versions_config",
-            lambda v: mock_versions,
-        )
-        monkeypatch.setattr(
-            "great_docs._versioning.build_version_map",
-            lambda versions, pages: {},
-        )
-        _patch_cfg(monkeypatch, gd, "versions", [])
-        _patch_cfg(monkeypatch, gd, "version_warning_banner", True)
-        gd._inject_version_selector(quarto_yml)
+    Returns
+    -------
+    :
+        The build's freeze cache directory.
+    """
+    build = root / name
+    build.mkdir()
+    (build / "_quarto.yml").write_text(QUARTO_YML_HEADER, encoding="utf-8")
+    cache = build / "_freeze"
+    cache.mkdir()
+    return cache
 
 
-# ---------------------------------------------------------------------------
-# _persist_freeze_cache – merge and JS newline
-# ---------------------------------------------------------------------------
-
-
-class TestPersistFreezeCache:
+class TestSaveFreezeCache:
     def test_no_freeze_sources_returns_none(self, tmp_path):
         gd = _make_gd(tmp_path)
-        result = gd._persist_freeze_cache()
-        assert result is None
+        assert freeze.save(gd.layout) is None
 
-    def test_merges_freeze_caches(self, tmp_path, monkeypatch):
+    def test_keeps_each_historical_cache_apart(self, tmp_path):
         gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
+        gd.layout.build_dir.mkdir(parents=True, exist_ok=True)
+        (_historical_cache(tmp_path, "great-docs-v1") / "page1.json").write_text('{"v": 1}')
+        (_historical_cache(tmp_path, "great-docs-v2") / "page1.json").write_text('{"v": 2}')
+        removed = tmp_path / "_freeze" / "_versions" / "great-docs-v0"
+        removed.mkdir(parents=True)
+        (removed / "page1.json").write_text('{"v": 0}')
 
-        monkeypatch.setattr(
-            "great_docs.core.is_great_docs_build_dir",
-            lambda d: d.name.startswith("great-docs-"),
-        )
+        assert freeze.save(gd.layout) == 2
+        versions = tmp_path / "_freeze" / "_versions"
+        assert {path.name for path in versions.iterdir()} == {"great-docs-v1", "great-docs-v2"}
+        assert (versions / "great-docs-v1" / "page1.json").read_text() == '{"v": 1}'
+        assert (versions / "great-docs-v2" / "page1.json").read_text() == '{"v": 2}'
+        assert not (tmp_path / "_freeze" / "page1.json").exists()
 
-        v1_freeze = tmp_path / "great-docs-v1" / "_freeze" / "page1.json"
-        v1_freeze.parent.mkdir(parents=True)
-        v1_freeze.write_text('{"v": 1}', encoding="utf-8")
-
-        v2_freeze = tmp_path / "great-docs-v2" / "_freeze" / "page1.json"
-        v2_freeze.parent.mkdir(parents=True)
-        v2_freeze.write_text('{"v": 2}', encoding="utf-8")
-
-        result = gd._persist_freeze_cache()
-        assert result is not None
-        merged = tmp_path / "_freeze" / "page1.json"
-        assert merged.exists()
-        assert '"v": 2' in merged.read_text()
-
-    def test_js_newline_appended(self, tmp_path, monkeypatch):
+    def test_non_versioned_build_persists_at_top_level(self, tmp_path):
         gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
+        (gd.layout.build_dir / "_freeze").mkdir(parents=True)
+        (gd.layout.build_dir / "_freeze" / "page1.json").write_text('{"v": 1}')
 
-        monkeypatch.setattr(
-            "great_docs.core.is_great_docs_build_dir",
-            lambda d: d.name.startswith("great-docs-"),
-        )
+        assert freeze.save(gd.layout) == 1
+        assert [path.name for path in (tmp_path / "_freeze").iterdir()] == ["page1.json"]
 
-        freeze_dir = tmp_path / "great-docs-v1" / "_freeze"
-        js_file = freeze_dir / "chunk.js"
-        js_file.parent.mkdir(parents=True)
-        js_file.write_bytes(b"var x = 1;")
-
-        gd._persist_freeze_cache()
-        merged_js = tmp_path / "_freeze" / "chunk.js"
-        assert merged_js.read_bytes().endswith(b"\n")
-
-
-# ---------------------------------------------------------------------------
-# _generate_tags_json – shadow tags, tag-location override, icon resolution
-# ---------------------------------------------------------------------------
-
-
-class TestGenerateTagsJson:
-    def _setup_gd(self, tmp_path, monkeypatch):
+    def test_js_newline_appended(self, tmp_path):
         gd = _make_gd(tmp_path)
-        gd.build_dir.mkdir(parents=True, exist_ok=True)
-        _patch_cfg(monkeypatch, gd, "lang", "en")
-        _patch_cfg(monkeypatch, gd, "tags_shadow", {"internal"})
-        _patch_cfg(monkeypatch, gd, "sections", [])
-        _patch_cfg(monkeypatch, gd, "tags_icons", {})
-        _patch_cfg(monkeypatch, gd, "tags_hierarchical", False)
-        _patch_cfg(monkeypatch, gd, "tags_location", "bottom")
-        return gd
+        gd.layout.build_dir.mkdir(parents=True, exist_ok=True)
+        (_historical_cache(tmp_path, "great-docs-v1") / "chunk.js").write_bytes(b"var x = 1;")
 
-    def test_writes_tags_json(self, tmp_path, monkeypatch):
-        gd = self._setup_gd(tmp_path, monkeypatch)
-        tag_index = {"mytag": [{"title": "Page 1", "href": "page1.qmd", "section": "Guide"}]}
-        gd._generate_tags_json(tag_index)
-        import json
-
-        data = json.loads((gd.build_dir / "_tags.json").read_text())
-        assert "page_tags" in data
-        assert "tag_meta" in data
-        assert data["tag_meta"]["mytag"]["count"] == 1
-
-    def test_shadow_tag_scanned(self, tmp_path, monkeypatch):
-        gd = self._setup_gd(tmp_path, monkeypatch)
-        ug_dir = gd.build_dir / "user-guide"
-        ug_dir.mkdir()
-        qmd = ug_dir / "page.qmd"
-        qmd.write_text("---\ntags:\n  - internal\ntitle: Secret\n---\nbody\n", encoding="utf-8")
-        tag_index = {}
-        gd._generate_tags_json(tag_index)
-        import json
-
-        data = json.loads((gd.build_dir / "_tags.json").read_text())
-        assert "internal" in data["shadow"]
-
-    def test_shadow_tags_keep_configured_order_without_duplicates(self, tmp_path, monkeypatch):
-        gd = self._setup_gd(tmp_path, monkeypatch)
-        configured = ["zeta", "alpha", "mu", "beta", "omega", "gamma", "pi", "delta", "kappa"]
-        _patch_cfg(monkeypatch, gd, "tags_shadow", [*configured, "alpha", "zeta"])
-        gd._generate_tags_json({})
-        import json
-
-        data = json.loads((gd.build_dir / "_tags.json").read_text())
-        assert data["shadow"] == configured
-
-    def test_tag_location_override(self, tmp_path, monkeypatch):
-        gd = self._setup_gd(tmp_path, monkeypatch)
-        ug_dir = gd.build_dir / "user-guide"
-        ug_dir.mkdir()
-        qmd = ug_dir / "page.qmd"
-        qmd.write_text(
-            "---\ntags:\n  - visible\ntag-location: top\ntitle: P\n---\nbody\n", encoding="utf-8"
-        )
-        tag_index = {"visible": [{"title": "P", "href": "user-guide/page.qmd", "section": "UG"}]}
-        gd._generate_tags_json(tag_index)
-        import json
-
-        data = json.loads((gd.build_dir / "_tags.json").read_text())
-        assert data["page_tag_locations"].get("user-guide/page.qmd") == "top"
-
-    def test_icon_resolution(self, tmp_path, monkeypatch):
-        gd = self._setup_gd(tmp_path, monkeypatch)
-        _patch_cfg(monkeypatch, gd, "tags_icons", {"mytag": "star"})
-        monkeypatch.setattr("great_docs._icons.get_icon_svg", lambda name, **kw: "<svg>star</svg>")
-        tag_index = {"mytag": [{"title": "P", "href": "p.qmd", "section": "S"}]}
-        gd._generate_tags_json(tag_index)
-        import json
-
-        data = json.loads((gd.build_dir / "_tags.json").read_text())
-        assert data["icons"]["mytag"] == "<svg>star</svg>"
-
-    def test_unknown_icon_warns(self, tmp_path, monkeypatch, capsys):
-        gd = self._setup_gd(tmp_path, monkeypatch)
-        _patch_cfg(monkeypatch, gd, "tags_icons", {"bad": "nonexistent"})
-        monkeypatch.setattr("great_docs._icons.get_icon_svg", lambda name, **kw: None)
-        tag_index = {}
-        gd._generate_tags_json(tag_index)
-        captured = capsys.readouterr()
-        assert "Unknown tag icon" in captured.out
+        freeze.save(gd.layout)
+        saved_js = tmp_path / "_freeze" / "_versions" / "great-docs-v1" / "chunk.js"
+        assert saved_js.read_bytes().endswith(b"\n")
 
 
-# ---------------------------------------------------------------------------
-# _create_api_sections_from_config – include_inherited
-# ---------------------------------------------------------------------------
+def test_constructing_a_project_runs_no_git(tmp_path: Path):
+    """
+    Create a project without running `git`
+    """
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "mypkg"\n', encoding="utf-8")
 
+    with patch("subprocess.run") as run:
+        GreatDocs(project_path=str(tmp_path))
 
-class TestCreateApiSectionsFromConfig:
-    def test_no_reference_returns_none(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        _patch_cfg(monkeypatch, gd, "reference", None)
-        assert gd._create_api_sections_from_config("mypkg") is None
-
-    def test_include_inherited_on_explicit_members(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        _patch_cfg(
-            monkeypatch,
-            gd,
-            "reference",
-            [
-                {
-                    "title": "Classes",
-                    "contents": [
-                        {"name": "MyClass", "members": ["method_a"], "include_inherited": True},
-                    ],
-                }
-            ],
-        )
-        monkeypatch.setattr(
-            gd,
-            "_categorize_referenced_objects",
-            lambda pkg, ref: {"classes": [], "functions": []},
-        )
-        result = gd._create_api_sections_from_config("mypkg")
-        assert result is not None
-        found = False
-        for section in result:
-            for item in section.get("contents", []):
-                if isinstance(item, dict) and item.get("name") == "MyClass":
-                    assert item.get("include_inherited") is True
-                    found = True
-        assert found
-
-    def test_include_inherited_on_default_entry(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        _patch_cfg(
-            monkeypatch,
-            gd,
-            "reference",
-            [
-                {
-                    "title": "Classes",
-                    "contents": [
-                        {"name": "MyClass", "include_inherited": True},
-                    ],
-                }
-            ],
-        )
-        monkeypatch.setattr(
-            gd,
-            "_categorize_referenced_objects",
-            lambda pkg, ref: {"classes": [], "functions": []},
-        )
-        result = gd._create_api_sections_from_config("mypkg")
-        found = False
-        for section in result:
-            for item in section.get("contents", []):
-                if isinstance(item, dict) and item.get("include_inherited") is True:
-                    found = True
-        assert found
-
-    def test_plain_string_when_no_include_inherited(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        _patch_cfg(
-            monkeypatch,
-            gd,
-            "reference",
-            [
-                {
-                    "title": "Funcs",
-                    "contents": [
-                        {"name": "my_func"},
-                    ],
-                }
-            ],
-        )
-        monkeypatch.setattr(
-            gd,
-            "_categorize_referenced_objects",
-            lambda pkg, ref: {"classes": [], "functions": []},
-        )
-        result = gd._create_api_sections_from_config("mypkg")
-        for section in result:
-            for item in section.get("contents", []):
-                if item == "my_func":
-                    return
-        raise AssertionError("Expected plain string 'my_func' in contents")
-
-
-# ---------------------------------------------------------------------------
-# _refresh_api_reference_config – early return when already configured
-# ---------------------------------------------------------------------------
-
-
-class TestRefreshApiReferenceConfig:
-    def test_skips_when_already_done(self, tmp_path, monkeypatch):
-        gd = _make_gd(tmp_path)
-        gd._api_discovery_done = True
-        gd._refresh_api_reference_config()
-        assert not (gd.build_dir / "_quarto.yml").exists()
+    run.assert_not_called()
